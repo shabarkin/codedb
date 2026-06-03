@@ -16,7 +16,6 @@ const AnyTrigramIndex = @import("index.zig").AnyTrigramIndex;
 const WordIndex = @import("index.zig").WordIndex;
 const index_mod = @import("index.zig");
 const snapshot_mod = @import("snapshot.zig");
-const telemetry = @import("telemetry.zig");
 const root_policy = @import("root_policy.zig");
 const nuke_mod = @import("nuke.zig");
 const update_mod = @import("update.zig");
@@ -239,8 +238,8 @@ fn mainImpl() !void {
         // was previously consumed silently and the server started anyway,
         // hiding the typo). Whitelist via isValidMcpFlag.
         // Handle `--help` here too — parsePositional only catches it when it
-        // sits immediately after `mcp`; combos like `mcp --no-telemetry --help`
-        // need their own bypass.
+        // sits immediately after `mcp`; combos with other flags need their own
+        // bypass.
         for (args[cmd_args_start..]) |a| {
             if (a.len == 0 or a[0] != '-') continue;
             if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "help")) {
@@ -249,11 +248,10 @@ fn mainImpl() !void {
                 return;
             }
             if (!isValidMcpFlag(a)) {
-                out.p("{s}\xe2\x9c\x97{s} unknown flag for {s}mcp{s}: {s}{s}{s}\n  valid: {s}--no-telemetry{s}, {s}--help{s}, {s}--config-file=<path>{s}\n", .{
+                out.p("{s}\xe2\x9c\x97{s} unknown flag for {s}mcp{s}: {s}{s}{s}\n  valid: {s}--help{s}, {s}--config-file=<path>{s}\n", .{
                     s.red,  s.reset,
                     s.bold, s.reset,
                     s.bold, a,      s.reset,
-                    s.bold, s.reset,
                     s.bold, s.reset,
                     s.bold, s.reset,
                 });
@@ -1066,20 +1064,6 @@ fn mainImpl() !void {
         const query_log = std.fmt.allocPrint(allocator, "{s}/queries.log", .{data_dir}) catch null;
         if (query_log) |ql| mcp_server.setQueryLogPath(ql);
 
-        const startup_t0 = cio.milliTimestamp();
-        var telemetry_disabled = false;
-        for (args[cmd_args_start..]) |arg| {
-            if (std.mem.eql(u8, arg, "--no-telemetry")) {
-                telemetry_disabled = true;
-                break;
-            }
-        }
-
-        var telem = telemetry.Telemetry.init(io, data_dir, allocator, telemetry_disabled);
-        defer telem.deinit();
-        telem.startSyncThread();
-        telem.recordSessionStart();
-
         var shutdown = std.atomic.Value(bool).init(false);
 
         const queue = try allocator.create(watcher.EventQueue);
@@ -1100,9 +1084,7 @@ fn mainImpl() !void {
                 .explorer = &explorer,
                 .scan_done = try allocator.create(std.atomic.Value(bool)),
                 .shutdown = &shutdown,
-                .telem = &telem,
                 .queue = queue,
-                .startup_t0 = startup_t0,
                 .fallback_cwd = abs_root,
                 .triggerFn = triggerScanFromRoots,
             };
@@ -1117,11 +1099,9 @@ fn mainImpl() !void {
             var scan_done = std.atomic.Value(bool).init(snapshot_loaded);
             if (!snapshot_loaded) {
                 mcp_server.setScanState(.walking);
-                scan_thread = try std.Thread.spawn(.{}, scanBg, .{ io, &store, &explorer, root, allocator, &scan_done, &shutdown, data_dir, abs_root, &telem, startup_t0 });
+                scan_thread = try std.Thread.spawn(.{}, scanBg, .{ io, &store, &explorer, root, allocator, &scan_done, &shutdown, data_dir, abs_root });
             } else {
-                const startup_time_ms: u64 = @intCast(@max(cio.milliTimestamp() - startup_t0, 0));
                 loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
-                telem.recordCodebaseStats(&explorer, startup_time_ms);
                 compactMcpReadyMemory(io, &explorer, data_dir, git_head, allocator);
                 mcp_server.setScanState(.ready);
             }
@@ -1132,7 +1112,7 @@ fn mainImpl() !void {
 
         std.log.info("codedb mcp: root={s} files={d} data={s} scan={s}", .{ abs_root, store.currentSeq(), data_dir, mcp_server.getScanState().name() });
 
-        mcp_server.run(io, allocator, &store, &explorer, &agents, abs_root, cfg.max_cached, &telem, maybe_deferred, &shutdown);
+        mcp_server.run(io, allocator, &store, &explorer, &agents, abs_root, cfg.max_cached, maybe_deferred, &shutdown);
 
         shutdown.store(true, .release);
         if (scan_thread) |st| st.join();
@@ -1243,7 +1223,8 @@ pub fn findGitRootFrom(io: std.Io, buf: *[std.fs.max_path_bytes]u8, start_len: u
 /// `--help`/`-h`/`help` are rewritten by parsePositional and also never
 /// reach here as a command arg.
 pub fn isValidMcpFlag(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--no-telemetry");
+    _ = arg;
+    return false;
 }
 
 fn isCommand(arg: []const u8) bool {
@@ -1546,7 +1527,6 @@ fn printUsage(out: *Out, s: sty.Style) void {
     });
     out.p(
         \\  {s}options:{s}
-        \\    {s}--no-telemetry{s}             disable usage telemetry (or set CODEDB_NO_TELEMETRY)
         \\    {s}--config-file <path>{s}       load config overrides from <path> (default: ./.codedbrc)
         \\
         \\  If root is omitted, uses current working directory.
@@ -1555,7 +1535,6 @@ fn printUsage(out: *Out, s: sty.Style) void {
         \\
     , .{
         s.dim,  s.reset,
-        s.cyan, s.reset,
         s.cyan, s.reset,
         s.dim,  s.reset,
     });
@@ -1572,7 +1551,7 @@ fn reapLoop(agents: *AgentRegistry, shutdown: *std.atomic.Value(bool)) void {
     }
 }
 
-fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allocator: std.mem.Allocator, scan_done: *std.atomic.Value(bool), shutdown: *std.atomic.Value(bool), data_dir: []const u8, abs_root: []const u8, telem: *telemetry.Telemetry, startup_t0: i64) void {
+fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allocator: std.mem.Allocator, scan_done: *std.atomic.Value(bool), shutdown: *std.atomic.Value(bool), data_dir: []const u8, abs_root: []const u8) void {
     const git_head = git_mod.getGitHead(root, allocator) catch null;
     const disk_hdr = TrigramIndex.readDiskHeader(io, data_dir, allocator) catch null;
     const heads_match = blk: {
@@ -1606,7 +1585,6 @@ fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allo
                 scan_done.store(true, .release);
                 mcp_server.setScanState(.ready);
                 if (shutdown.load(.acquire)) return;
-                telem.recordCodebaseStats(explorer, @intCast(@max(cio.milliTimestamp() - startup_t0, 0)));
                 const snap_path_1 = std.fmt.allocPrint(allocator, "{s}/codedb.snapshot", .{abs_root}) catch null;
                 defer if (snap_path_1) |p| allocator.free(p);
                 snapshot_mod.writeSnapshotDual(io, explorer, abs_root, snap_path_1 orelse "codedb.snapshot", allocator) catch |err| {
@@ -1630,7 +1608,6 @@ fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allo
                 scan_done.store(true, .release);
                 mcp_server.setScanState(.ready);
                 if (shutdown.load(.acquire)) return;
-                telem.recordCodebaseStats(explorer, @intCast(@max(cio.milliTimestamp() - startup_t0, 0)));
                 const snap_path_2 = std.fmt.allocPrint(allocator, "{s}/codedb.snapshot", .{abs_root}) catch null;
                 defer if (snap_path_2) |p| allocator.free(p);
                 snapshot_mod.writeSnapshotDual(io, explorer, abs_root, snap_path_2 orelse "codedb.snapshot", allocator) catch |err| {
@@ -1683,8 +1660,6 @@ fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allo
 
     if (shutdown.load(.acquire)) return;
 
-    telem.recordCodebaseStats(explorer, @intCast(@max(cio.milliTimestamp() - startup_t0, 0)));
-
     const snap_path_3 = std.fmt.allocPrint(allocator, "{s}/codedb.snapshot", .{abs_root}) catch null;
     defer if (snap_path_3) |p| allocator.free(p);
     snapshot_mod.writeSnapshotDual(io, explorer, abs_root, snap_path_3 orelse "codedb.snapshot", allocator) catch |err| {
@@ -1710,12 +1685,10 @@ fn triggerScanFromRoots(ctx: *mcp_server.DeferredScan, abs_root: []const u8) voi
     ctx.scan_done.store(snapshot_loaded, .release);
     if (!snapshot_loaded) {
         mcp_server.setScanState(.walking);
-        const scan_thread = std.Thread.spawn(.{}, scanBg, .{ ctx.io, ctx.store, ctx.explorer, abs_root, ctx.allocator, ctx.scan_done, ctx.shutdown, data_dir, abs_root, ctx.telem, ctx.startup_t0 }) catch return;
+        const scan_thread = std.Thread.spawn(.{}, scanBg, .{ ctx.io, ctx.store, ctx.explorer, abs_root, ctx.allocator, ctx.scan_done, ctx.shutdown, data_dir, abs_root }) catch return;
         ctx.scan_thread = scan_thread;
     } else {
-        const startup_time_ms: u64 = @intCast(@max(cio.milliTimestamp() - ctx.startup_t0, 0));
         loadTrigramFromDiskIfPresent(ctx.io, ctx.explorer, data_dir, ctx.allocator);
-        ctx.telem.recordCodebaseStats(ctx.explorer, startup_time_ms);
         compactMcpReadyMemory(ctx.io, ctx.explorer, data_dir, git_head, ctx.allocator);
         mcp_server.setScanState(.ready);
     }

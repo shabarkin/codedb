@@ -1515,7 +1515,7 @@ test "issue-negq: negative-query search short-circuits Tier 5 full scan" {
 
 
 test "issue-471a: codedb_find accepts query/name/path/pattern/q aliases" {
-    // Real-user telemetry (24h) showed 71% of codedb_find calls failing with
+    // Historical usage showed 71% of codedb_find calls failing with
     // "missing 'query'" because agents passed the search term under `name`,
     // `path`, `pattern`, or `q` (misled by the "FILE-NAME search" framing in
     // the tool description). Regression: every common alias must succeed.

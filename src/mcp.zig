@@ -19,7 +19,6 @@ const watcher = @import("watcher.zig");
 const edit_mod = @import("edit.zig");
 const idx = @import("index.zig");
 const snapshot_mod = @import("snapshot.zig");
-const telemetry_mod = @import("telemetry.zig");
 const git_mod = @import("git.zig");
 const root_policy = @import("root_policy.zig");
 const release_info = @import("release_info.zig");
@@ -30,9 +29,7 @@ pub const DeferredScan = struct {
     explorer: *Explorer,
     scan_done: *std.atomic.Value(bool),
     shutdown: *std.atomic.Value(bool),
-    telem: *telemetry_mod.Telemetry,
     queue: *watcher.EventQueue,
-    startup_t0: i64,
     triggered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     scan_thread: ?std.Thread = null,
     resolved_root: []const u8 = "",
@@ -503,9 +500,8 @@ pub const BenchContext = struct {
         store: *Store,
         explorer: *Explorer,
         agents: *AgentRegistry,
-        telem: *telemetry_mod.Telemetry,
     ) void {
-        handleCall(io, alloc, root, stdout, id, store, explorer, agents, &self.cache, telem, null);
+        handleCall(io, alloc, root, stdout, id, store, explorer, agents, &self.cache, null);
     }
 
     pub fn runToolCall(
@@ -518,7 +514,6 @@ pub const BenchContext = struct {
         store: *Store,
         explorer: *Explorer,
         agents: *AgentRegistry,
-        telem: *telemetry_mod.Telemetry,
     ) struct { dispatch_ns: u64, response_bytes: usize } {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(alloc);
@@ -528,7 +523,6 @@ pub const BenchContext = struct {
         const elapsed = cio.nanoTimestamp() - t0;
 
         const is_error = std.mem.startsWith(u8, out.items, "error:");
-        telem.recordToolCall(name, elapsed, is_error, out.items.len);
 
         var summary: std.ArrayList(u8) = .empty;
         defer summary.deinit(alloc);
@@ -830,7 +824,6 @@ pub fn run(
     agents: *AgentRegistry,
     default_path: []const u8,
     content_cache_capacity: u32,
-    telem: *telemetry_mod.Telemetry,
     deferred_scan: ?*DeferredScan,
     shutdown: *std.atomic.Value(bool),
 ) void {
@@ -932,7 +925,7 @@ pub fn run(
         } else if (mcpj.eql(method, "tools/list")) {
             if (!is_notification) writeResult(alloc, stdout, id, tools_list_response);
         } else if (mcpj.eql(method, "tools/call")) {
-            handleCall(io, alloc, root, stdout, id, store, explorer, agents, &cache, telem, session.deferred_scan);
+            handleCall(io, alloc, root, stdout, id, store, explorer, agents, &cache, session.deferred_scan);
         } else if (mcpj.eql(method, "ping")) {
             if (!is_notification) writeResult(alloc, stdout, id, "{}");
         } else {
@@ -1092,7 +1085,6 @@ fn handleCall(
     explorer: *Explorer,
     agents: *AgentRegistry,
     cache: *ProjectCache,
-    telem: *telemetry_mod.Telemetry,
     deferred_scan: ?*DeferredScan,
 ) void {
     const is_notification = id == null;
@@ -1136,11 +1128,6 @@ fn handleCall(
     const elapsed = cio.nanoTimestamp() - t0;
 
     const is_error = std.mem.startsWith(u8, out.items, "error:");
-    telem.recordToolCall(name, elapsed, is_error, out.items.len);
-
-    if (std.mem.eql(u8, name, "codedb_search") or std.mem.eql(u8, name, "codedb_find") or std.mem.eql(u8, name, "codedb_word")) {
-        telem.recordSearchBreakdown(explorer.last_search_breakdown);
-    }
 
     // Query + file access tracking WAL
     if (!is_error) {
@@ -2657,7 +2644,7 @@ fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *Store
     const seq = store.seq;
     store.mu.unlock();
 
-    const index_bytes = telemetry_mod.approxIndexSizeBytes(explorer);
+    const index_bytes = explore_mod.approxIndexSizeBytes(explorer);
 
     explorer.mu.lockShared();
     const outline_count = explorer.outlines.count();
@@ -3506,7 +3493,7 @@ fn handleIndex(
 }
 
 fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
-    // Telemetry showed 71% of codedb_find calls were failing with
+    // Historical usage showed 71% of codedb_find calls were failing with
     // "missing 'query'" — agents were passing `name`/`path`/`pattern`/`q`
     // instead, misled by the "FILE-NAME search" framing. Accept aliases.
     const query = getStr(args, "query") orelse getStr(args, "name") orelse getStr(args, "path") orelse getStr(args, "pattern") orelse getStr(args, "q") orelse {

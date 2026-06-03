@@ -176,7 +176,7 @@ printf '%s\t%s\t%s\t%s\n' "$event" "$tool" "$repo" "$action" >> .claude/logs/cod
 Claude Code has more hook events and handler types than Codex. The ones most
 useful for codedb are:
 
-- `PreToolUse`, `PostToolUse`, and `PostToolUseFailure` for MCP tool policy and telemetry.
+- `PreToolUse`, `PostToolUse`, and `PostToolUseFailure` for MCP tool policy and local audit logs.
 - `PostToolBatch` when the next model call needs context from a full batch of tools.
 - `UserPromptSubmit` and `UserPromptExpansion` for prompt-time repo context.
 - `Stop` or `SubagentStop` for validation gates before an agent finishes.

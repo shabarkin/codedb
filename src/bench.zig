@@ -5,15 +5,12 @@ const Explorer = @import("explore.zig").Explorer;
 const AgentRegistry = @import("agent.zig").AgentRegistry;
 const watcher = @import("watcher.zig");
 const mcp = @import("mcp.zig");
-const telemetry = @import("telemetry.zig");
 
 const ToolBench = struct {
     tool: []const u8,
     avg_latency_ns: u64,
     response_bytes: usize,
     ops_per_sec: f64,
-    telemetry_avg_ns: u64,
-    telemetry_delta_pct: f64,
 };
 
 const Case = struct {
@@ -27,8 +24,8 @@ const cases = [_]Case{
     .{ .tool = .codedb_tree, .name = "codedb_tree", .args_json = "{}", .iterations = 100 },
     .{ .tool = .codedb_outline, .name = "codedb_outline", .args_json = "{\"path\":\"src/main.zig\"}", .iterations = 100 },
     .{ .tool = .codedb_symbol, .name = "codedb_symbol", .args_json = "{\"name\":\"main\"}", .iterations = 100 },
-    .{ .tool = .codedb_search, .name = "codedb_search", .args_json = "{\"query\":\"telemetry\",\"max_results\":10}", .iterations = 100 },
-    .{ .tool = .codedb_word, .name = "codedb_word", .args_json = "{\"word\":\"Telemetry\"}", .iterations = 100 },
+    .{ .tool = .codedb_search, .name = "codedb_search", .args_json = "{\"query\":\"config\",\"max_results\":10}", .iterations = 100 },
+    .{ .tool = .codedb_word, .name = "codedb_word", .args_json = "{\"word\":\"Explorer\"}", .iterations = 100 },
     .{ .tool = .codedb_hot, .name = "codedb_hot", .args_json = "{\"limit\":10}", .iterations = 100 },
     .{ .tool = .codedb_deps, .name = "codedb_deps", .args_json = "{\"path\":\"src/main.zig\"}", .iterations = 100 },
     .{ .tool = .codedb_read, .name = "codedb_read", .args_json = "{\"path\":\"src/main.zig\",\"line_start\":1,\"line_end\":20}", .iterations = 100 },
@@ -36,9 +33,9 @@ const cases = [_]Case{
     .{ .tool = .codedb_changes, .name = "codedb_changes", .args_json = "{\"since\":0}", .iterations = 100 },
     .{ .tool = .codedb_status, .name = "codedb_status", .args_json = "{}", .iterations = 100 },
     .{ .tool = .codedb_snapshot, .name = "codedb_snapshot", .args_json = "{}", .iterations = 20 },
-    .{ .tool = .codedb_bundle, .name = "codedb_bundle", .args_json = "{\"ops\":[{\"tool\":\"codedb_outline\",\"arguments\":{\"path\":\"src/main.zig\"}},{\"tool\":\"codedb_search\",\"arguments\":{\"query\":\"telemetry\",\"max_results\":5}},{\"tool\":\"codedb_word\",\"arguments\":{\"word\":\"Telemetry\"}}]}", .iterations = 50 },
+    .{ .tool = .codedb_bundle, .name = "codedb_bundle", .args_json = "{\"ops\":[{\"tool\":\"codedb_outline\",\"arguments\":{\"path\":\"src/main.zig\"}},{\"tool\":\"codedb_search\",\"arguments\":{\"query\":\"config\",\"max_results\":5}},{\"tool\":\"codedb_word\",\"arguments\":{\"word\":\"Explorer\"}}]}", .iterations = 50 },
     .{ .tool = .codedb_find, .name = "codedb_find", .args_json = "{\"query\":\"main\"}", .iterations = 100 },
-    .{ .tool = .codedb_context, .name = "codedb_context", .args_json = "{\"task\":\"trace recordToolCall execution path through writePositionalAll and the SpinLock acquisition in Telemetry — what is the hot path\"}", .iterations = 50 },
+    .{ .tool = .codedb_context, .name = "codedb_context", .args_json = "{\"task\":\"trace codedb_status execution through dispatch and summarize the hot path\"}", .iterations = 50 },
 };
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -89,9 +86,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try std.process.setCurrentPath(io, tmp_root);
     defer std.process.setCurrentPath(io, repo_root) catch {};
 
-    var telem_off = telemetry.Telemetry{ .enabled = false };
-    var telem_on = telemetry.Telemetry{ .enabled = true };
-
     var args_store: [cases.len]std.json.Parsed(std.json.Value) = undefined;
     defer {
         for (&args_store) |*parsed| parsed.deinit();
@@ -104,15 +98,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var results: [cases.len]ToolBench = undefined;
     for (cases, 0..) |case, idx| {
         const args = &args_store[idx].value.object;
-        const base = try runCase(io, allocator, &bench_ctx, &store, &explorer, &agents, case, args, &telem_off);
-        const with_telem = try runCase(io, allocator, &bench_ctx, &store, &explorer, &agents, case, args, &telem_on);
+        const base = try runCase(io, allocator, &bench_ctx, &store, &explorer, &agents, case, args);
         results[idx] = .{
             .tool = case.name,
             .avg_latency_ns = base.avg_latency_ns,
             .response_bytes = base.response_bytes,
             .ops_per_sec = opsPerSec(base.avg_latency_ns),
-            .telemetry_avg_ns = with_telem.avg_latency_ns,
-            .telemetry_delta_pct = deltaPct(base.avg_latency_ns, with_telem.avg_latency_ns),
         };
     }
 
@@ -132,7 +123,6 @@ fn runCase(
     agents: *AgentRegistry,
     case: Case,
     args: *const std.json.ObjectMap,
-    telem: *telemetry.Telemetry,
 ) !struct { avg_latency_ns: u64, response_bytes: usize } {
     var total_ns: u64 = 0;
     var response_bytes: usize = 0;
@@ -142,7 +132,7 @@ fn runCase(
             try resetBenchTarget(explorer, store);
         }
 
-        const r = bench_ctx.runToolCall(io, allocator, case.name, case.tool, args, store, explorer, agents, telem);
+        const r = bench_ctx.runToolCall(io, allocator, case.name, case.tool, args, store, explorer, agents);
         total_ns +|= r.dispatch_ns;
         response_bytes = r.response_bytes;
     }
@@ -173,7 +163,6 @@ fn copyCorpus(io: std.Io, allocator: std.mem.Allocator, repo_root: []const u8, t
         "src/snapshot_json.zig",
         "src/store.zig",
         "src/style.zig",
-        "src/telemetry.zig",
         "src/version.zig",
         "src/watcher.zig",
     };
@@ -236,16 +225,14 @@ fn writeHumanSummary(allocator: std.mem.Allocator, file: cio.File, file_count: u
     defer out.deinit(allocator);
     const writer = cio.listWriter(&out, allocator);
     try writer.print("── E2E MCP Tool Benchmarks ({d} files, {d}KB) ──\n", .{ file_count, total_bytes / 1024 });
-    try writer.writeAll("Tool              Latency    Size     Ops/sec   TelemetryΔ\n");
+    try writer.writeAll("Tool              Latency    Size     Ops/sec\n");
     for (results) |result| {
         var latency_buf: [32]u8 = undefined;
-        var delta_buf: [32]u8 = undefined;
-        try writer.print("{s:<17} {s:<10} {d:<8} {d:>8.0}   {s}\n", .{
+        try writer.print("{s:<17} {s:<10} {d:<8} {d:>8.0}\n", .{
             result.tool,
             formatNs(&latency_buf, result.avg_latency_ns),
             result.response_bytes,
             result.ops_per_sec,
-            formatPct(&delta_buf, result.telemetry_delta_pct),
         });
     }
     try file.writeAll(out.items);
@@ -263,13 +250,11 @@ fn writeJsonSummary(allocator: std.mem.Allocator, file: cio.File, repo_root: []c
     });
     for (results, 0..) |result, idx| {
         if (idx > 0) try writer.writeByte(',');
-        try writer.print("{{\"tool\":\"{s}\",\"avg_latency_ns\":{d},\"response_bytes\":{d},\"ops_per_sec\":{d:.3},\"telemetry_avg_ns\":{d},\"telemetry_delta_pct\":{d:.3}}}", .{
+        try writer.print("{{\"tool\":\"{s}\",\"avg_latency_ns\":{d},\"response_bytes\":{d},\"ops_per_sec\":{d:.3}}}", .{
             result.tool,
             result.avg_latency_ns,
             result.response_bytes,
             result.ops_per_sec,
-            result.telemetry_avg_ns,
-            result.telemetry_delta_pct,
         });
     }
     try writer.writeAll("]}\n");
@@ -279,12 +264,6 @@ fn writeJsonSummary(allocator: std.mem.Allocator, file: cio.File, repo_root: []c
 fn opsPerSec(avg_latency_ns: u64) f64 {
     if (avg_latency_ns == 0) return 0;
     return @as(f64, 1_000_000_000.0) / @as(f64, @floatFromInt(avg_latency_ns));
-}
-
-fn deltaPct(base_ns: u64, with_telem_ns: u64) f64 {
-    if (base_ns == 0) return 0;
-    const delta = @as(f64, @floatFromInt(with_telem_ns)) - @as(f64, @floatFromInt(base_ns));
-    return (delta / @as(f64, @floatFromInt(base_ns))) * 100.0;
 }
 
 fn formatNs(buf: []u8, ns: u64) []const u8 {
@@ -299,9 +278,4 @@ fn formatNs(buf: []u8, ns: u64) []const u8 {
         return std.fmt.bufPrint(buf, "{d}.{d}us", .{ whole, frac }) catch "0us";
     }
     return std.fmt.bufPrint(buf, "{d}ns", .{ns}) catch "0ns";
-}
-
-fn formatPct(buf: []u8, pct: f64) []const u8 {
-    const abs_pct = @abs(pct);
-    return std.fmt.bufPrint(buf, "{d:.2}%", .{abs_pct}) catch "0.00%";
 }

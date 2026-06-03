@@ -55,7 +55,7 @@ for (system_prefixes) |pfx| {
 }
 ```
 
-This fixes the failing test in `src/tests.zig` (`issue-346`).
+This fixes the failing test in `src/test_mcp.zig` (`issue-346`).
 
 ### Part B: defer scan until root is confirmed (safe startup)
 

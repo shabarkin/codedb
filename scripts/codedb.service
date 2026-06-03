@@ -13,7 +13,6 @@ WorkingDirectory=%h/my-project
 ExecStart=%h/.local/bin/codedb . serve
 Restart=on-failure
 RestartSec=3
-Environment=CODEDB_NO_TELEMETRY=1
 
 [Install]
 WantedBy=default.target

@@ -23,8 +23,8 @@ Cross-corpus eval ([code-search-shootout §18](https://github.com/justrach/code-
 
 ## Open issues worth tackling next
 
-- **#44** (pre-existing) — `snapshot stale after working tree changes cause stale query results`. Failing test in `src/tests.zig` (issue-44). 1 of 489 tests fails locally and in CI. Not regressed by any session work, but the only red test on `main`.
-- **misc agents/clients still pass `q` / `pattern`** even after #478 — telemetry will confirm the post-release drop. If still high after v0.2.5815 propagates, consider promoting `q` / `pattern` from "accepted" to "documented" in the tool description.
+- **#44** (pre-existing) — `snapshot stale after working tree changes cause stale query results`. Regression test `issue-44` lives in `src/test_snapshot.zig` and currently passes (suite green, 633/633); revisit if stale-snapshot query results resurface.
+- **misc agents/clients still pass `q` / `pattern`** even after #478 — if support reports show this remains common after v0.2.5815 propagates, consider promoting `q` / `pattern` from "accepted" to "documented" in the tool description.
 - **codedb_context paraphrasing edge cases** — bench eval still shows agents occasionally summarising the snippet field even with fenced multi-line context blocks. Two candidate followups: (1) explicit prompt-side instruction at the tool description level, (2) restructure the answer schema so the "trace" field is split from the "quote" field.
 
 ---
@@ -45,7 +45,7 @@ After v0.2.5815 there are ~179 remote branches. Safe-to-delete buckets:
 
 ---
 
-## Telemetry items to watch (post-release)
+## Post-release checks
 
 - `codedb_find` failure rate (was 71%, expected to drop near 0 once v0.2.5815 propagates)
 - `codedb_context` adoption — how many sessions use it vs the older `codedb_search` + `codedb_symbol` chain

@@ -2,7 +2,7 @@
 
 ## Project
 
-Zig 0.16.x code intelligence server. Tests live in `src/tests.zig`. Build and test with `zig build test`.
+Zig 0.16.x code intelligence server. Tests live in the split `src/test_*.zig` files listed in `build.zig`. Build and test with `zig build test`.
 
 ## Rules
 
@@ -12,8 +12,8 @@ Zig 0.16.x code intelligence server. Tests live in `src/tests.zig`. Build and te
 
 When creating an issue:
 
-1. Write a `test "issue-XX: <description>"` block in `src/tests.zig` that **fails** on the current `main` branch
-2. Verify it fails: `zig build test 2>&1 | grep "issue-XX"`
+1. Write a `test "issue-XX: <description>"` block in the relevant `src/test_*.zig` file from the `test_files` list in `build.zig` (for example: search in `src/test_search.zig`, MCP tools in `src/test_mcp.zig`, indexing in `src/test_index.zig`) that **fails** on the current `main` branch
+2. Verify it fails: `zig build test -Dtest-filter=issue-XX`
 3. File the issue via `gh issue create` with this structure:
    - **Title:** `<module>: <concise description>`
    - **Body sections:** Problem, Failing Test (the zig test block), Expected, Fix

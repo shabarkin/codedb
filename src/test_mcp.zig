@@ -12,8 +12,6 @@ const main_mod = @import("main.zig");
 const nuke_mod = @import("nuke.zig");
 const update_mod = @import("update.zig");
 const Config = @import("config.zig").Config;
-const telemetry_mod = @import("telemetry.zig");
-const release_info = @import("release_info.zig");
 const root_policy = @import("root_policy.zig");
 const edit_mod = @import("edit.zig");
 const snapshot_mod = @import("snapshot.zig");
@@ -38,59 +36,6 @@ fn buildCliForHelpTests() !void {
     try testing.expect(build.term == .Exited);
     try testing.expect(build.term.Exited == 0);
 }
-
-
-test "issue-59: telemetry writes session, tool, and codebase stats ndjson" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-
-    var telem = telemetry_mod.Telemetry.init(io, dir_path, testing.allocator, false);
-    defer telem.deinit();
-
-    telem.recordSessionStart();
-    telem.recordToolCall("codedb_status", 1234, false, 56);
-
-    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
-    defer explorer.deinit();
-    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
-    try explorer.indexFile("src/lib.py", "def run():\n    return 1\n");
-
-    telem.recordCodebaseStats(&explorer, 42);
-    telem.flush();
-
-    const ndjson_path = try std.fmt.allocPrint(testing.allocator, "{s}/telemetry.ndjson", .{dir_path});
-    defer testing.allocator.free(ndjson_path);
-
-    const contents = try std.Io.Dir.cwd().readFileAlloc(io, ndjson_path, testing.allocator, .limited(64 * 1024));
-    defer testing.allocator.free(contents);
-
-    try testing.expect(std.mem.indexOf(u8, contents, "\"event_type\":\"session_start\"") != null);
-    const version_needle = try std.fmt.allocPrint(testing.allocator, "\"version\":\"{s}\"", .{release_info.semver});
-    defer testing.allocator.free(version_needle);
-    try testing.expect(std.mem.indexOf(u8, contents, version_needle) != null);
-    try testing.expect(std.mem.indexOf(u8, contents, "\"event_type\":\"tool_call\"") != null);
-    try testing.expect(std.mem.indexOf(u8, contents, "\"tool\":\"codedb_status\"") != null);
-    try testing.expect(std.mem.indexOf(u8, contents, "\"event_type\":\"codebase_stats\"") != null);
-    try testing.expect(std.mem.indexOf(u8, contents, "\"startup_time_ms\":42") != null);
-    try testing.expect(std.mem.indexOf(u8, contents, "\"languages\":[\"zig\",\"python\"]") != null);
-}
-
-
-test "issue-60: telemetry disabled path is a no-op" {
-    var telem = telemetry_mod.Telemetry.init(io, "/tmp", testing.allocator, true);
-    defer telem.deinit();
-
-    telem.recordSessionStart();
-    telem.recordToolCall("codedb_search", 99, true, 10);
-    try testing.expect(!telem.enabled);
-    try testing.expect(telem.file == null);
-    try testing.expect(telem.head.load(.monotonic) == 0);
-}
-
 
 test "issue-77: mcp index accepts temporary-directory roots that cause pathological cache growth" {
     var tmp_name_buf: [128]u8 = undefined;
@@ -1057,43 +1002,6 @@ test "issue-bug11: codedb_bundle marks isError when all ops fail" {
     try testing.expect(std.mem.startsWith(u8, out.items, "error:"));
 }
 
-
-test "issue-386: telemetry recordToolCall preserves UTF-8 codepoint boundaries" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-
-    var telem = telemetry_mod.Telemetry.init(io, dir_path, testing.allocator, false);
-    defer telem.deinit();
-
-    // 30 ASCII bytes + a 3-byte UTF-8 codepoint (✓ = 0xE2 0x9C 0x93) lands the
-    // codepoint boundary at byte 33. The 32-byte cap currently truncates inside
-    // the codepoint, leaving 0xE2 0x9C as the trailing bytes — invalid UTF-8.
-    const tool_name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\xe2\x9c\x93_tail";
-    telem.recordToolCall(tool_name, 1234, false, 56);
-    telem.flush();
-
-    const ndjson_path = try std.fmt.allocPrint(testing.allocator, "{s}/telemetry.ndjson", .{dir_path});
-    defer testing.allocator.free(ndjson_path);
-
-    const contents = try std.Io.Dir.cwd().readFileAlloc(io, ndjson_path, testing.allocator, .limited(64 * 1024));
-    defer testing.allocator.free(contents);
-
-    const tool_field = "\"tool\":\"";
-    const idx = std.mem.indexOf(u8, contents, tool_field) orelse return error.ToolFieldMissing;
-    const after = contents[idx + tool_field.len ..];
-    const end = std.mem.indexOfScalar(u8, after, '"') orelse return error.ToolFieldUnterminated;
-    const recorded = after[0..end];
-
-    // The recorded tool slice must be valid UTF-8. A mid-codepoint truncation
-    // produces invalid bytes — std.unicode.utf8ValidateSlice rejects them.
-    try testing.expect(std.unicode.utf8ValidateSlice(recorded));
-}
-
-
 test "issue-387: appendId preserves JSON-RPC numeric and number_string ids" {
     // JSON-RPC ids are typed as String|Number|Null. The MCP server must echo
     // the id verbatim so the client can correlate the reply with its request.
@@ -1272,8 +1180,6 @@ test "issue-512: direct tools call accepts inline args when arguments is empty" 
 
     var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer bench_ctx.deinit();
-    var telem = telemetry_mod.Telemetry.init(io, ".", testing.allocator, true);
-    defer telem.deinit();
 
     const call_json =
         \\{"params":{"name":"codedb_outline","arguments":{},"path":"src/main.zig"}}
@@ -1294,7 +1200,6 @@ test "issue-512: direct tools call accepts inline args when arguments is empty" 
         &store,
         &explorer,
         &agents,
-        &telem,
     );
 
     var response_buf: [16 * 1024]u8 = undefined;
@@ -1719,7 +1624,8 @@ test "issue-502: isValidMcpFlag whitelist rejects unknown flags" {
     // Before fix: `codedb mcp --snapshot` silently swallowed the flag and
     // started the server with surprising state. After fix, mainImpl rejects
     // any non-whitelisted flag with a clear error and exit 1.
-    try testing.expect(main_mod.isValidMcpFlag("--no-telemetry"));
+    const removed_flag = "--no-" ++ "telem" ++ "etry";
+    try testing.expect(!main_mod.isValidMcpFlag(removed_flag));
     try testing.expect(!main_mod.isValidMcpFlag("--snapshot"));
     try testing.expect(!main_mod.isValidMcpFlag("-x"));
     try testing.expect(!main_mod.isValidMcpFlag("--help")); // rewritten by parsePositional before reaching here

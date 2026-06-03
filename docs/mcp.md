@@ -263,4 +263,3 @@ The installer does this for you.
   `GEMINI.md`, and the per-project skill hierarchy
 - [RFC #346 — MCP root resolution](rfc-346-mcp-root-resolution.md) —
   full design + safety logic for project-root detection
-- [Telemetry](telemetry.md) — what codedb sends, how to disable

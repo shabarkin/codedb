@@ -10,6 +10,31 @@ const MmapTrigramIndex = idx.MmapTrigramIndex;
 const AnyTrigramIndex = idx.AnyTrigramIndex;
 const SparseNgramIndex = idx.SparseNgramIndex;
 
+pub fn approxIndexSizeBytes(explorer: *const Explorer) u64 {
+    // Aggregate-only estimate. Keep this O(1): status calls this on hot paths,
+    // and exact allocator accounting would require walking all word/trigram
+    // posting lists.
+    var total: u64 = 0;
+
+    total +|= @as(u64, @intCast(explorer.word_index.index.count())) * 40;
+    total +|= explorer.word_index.total_tokens * @sizeOf(idx.WordHit);
+    total +|= @as(u64, @intCast(explorer.word_index.file_words.count())) * 128;
+    total +|= @as(u64, @intCast(explorer.word_index.doc_lengths.count())) * (@sizeOf(u32) + @sizeOf(u32));
+    total +|= @as(u64, @intCast(explorer.word_index.id_to_path.items.len)) * @sizeOf([]const u8);
+
+    switch (explorer.trigram_index) {
+        .heap => |heap| {
+            total +|= @as(u64, @intCast(heap.index.count())) * 48;
+            total +|= @as(u64, @intCast(heap.file_trigrams.count())) * 512;
+            total +|= @as(u64, @intCast(heap.id_to_path.items.len)) * @sizeOf([]const u8);
+            total +|= @as(u64, @intCast(heap.free_ids.items.len)) * @sizeOf(u32);
+        },
+        .mmap, .mmap_overlay => {},
+    }
+
+    return total;
+}
+
 pub const SymbolKind = enum(u8) {
     function,
     struct_def,
@@ -179,20 +204,6 @@ pub const SearchResult = struct {
     line_num: u32,
     line_text: []const u8,
     score: f32 = 0.0,
-};
-
-pub const SearchBreakdown = struct {
-    tier0_ns: i128 = 0,
-    tier05_ns: i128 = 0,
-    tier1_ns: i128 = 0,
-    tier2_ns: i128 = 0,
-    tier3_ns: i128 = 0,
-    tier4_ns: i128 = 0,
-    tier5_ns: i128 = 0,
-    rerank_ns: i128 = 0,
-    tier_reached: u8 = 0,
-    candidate_count: u32 = 0,
-    result_count: u32 = 0,
 };
 
 pub const DependencyGraph = struct {
@@ -600,7 +611,6 @@ pub const Explorer = struct {
     /// assert the short-circuit holds (issue: negative-query slow path).
     /// Production code does not read this field.
     search_tier5_count: u64 = 0,
-    last_search_breakdown: SearchBreakdown = .{},
 
     /// Default file-content cache capacity. Was 16384, but on typical
     /// projects (≤2000 files) the cache only ever holds a few hundred
@@ -1755,9 +1765,6 @@ pub const Explorer = struct {
 
         if (max_results == 0) return try allocator.alloc(SearchResult, 0);
 
-        var breakdown: SearchBreakdown = .{};
-        defer self.last_search_breakdown = breakdown;
-
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer result_list.deinit(allocator);
         try result_list.ensureTotalCapacity(allocator, @min(max_results, 64));
@@ -1772,7 +1779,6 @@ pub const Explorer = struct {
         // docs, and files with more exact word hits are considered first so
         // popular identifiers and skip-trigram canonical files are not hidden
         // behind earlier low-signal posting-list entries.
-        const t0_start = cio.nanoTimestamp();
         const word_hits = self.word_index.search(query);
         if (word_hits.len > 0) {
             const Tier0File = struct {
@@ -1850,21 +1856,13 @@ pub const Explorer = struct {
                 }
             }
             if (result_list.items.len >= max_results) {
-                breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
-                breakdown.tier_reached = 0;
-                breakdown.result_count = @intCast(result_list.items.len);
                 if (use_line_hits) {
                     return result_list.toOwnedSlice(allocator);
                 }
-                const t_rerank = cio.nanoTimestamp();
-                const res = self.rerankAndFinalize(&result_list, query, allocator);
-                breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
-                return res;
+                return self.rerankAndFinalize(&result_list, query, allocator);
             }
         }
-        breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
 
-        const t05_start = cio.nanoTimestamp();
         if (result_list.items.len == 0 and query.len >= 3) {
             const prefix_hits = try self.word_index.searchPrefix(query, allocator, max_results);
             defer allocator.free(prefix_hits);
@@ -1888,21 +1886,12 @@ pub const Explorer = struct {
                 if (result_list.items.len >= max_results) break;
             }
             if (result_list.items.len >= max_results) {
-                breakdown.tier05_ns = cio.nanoTimestamp() - t05_start;
-                breakdown.tier_reached = 1;
-                breakdown.result_count = @intCast(result_list.items.len);
-                const t_rerank = cio.nanoTimestamp();
-                const res = self.rerankAndFinalize(&result_list, query, allocator);
-                breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
-                return res;
+                return self.rerankAndFinalize(&result_list, query, allocator);
             }
         }
-        breakdown.tier05_ns = cio.nanoTimestamp() - t05_start;
 
-        const t1_start = cio.nanoTimestamp();
         const candidate_paths = self.trigram_index.candidates(query, allocator);
         defer if (candidate_paths) |cp| allocator.free(cp);
-        if (candidate_paths) |cp| breakdown.candidate_count = @intCast(cp.len);
 
         if (candidate_paths) |cp| {
             if (cp.len > 0) {
@@ -1943,13 +1932,7 @@ pub const Explorer = struct {
                     defer ref.deinit();
                     try searchInContent(path, ref.data, query, allocator, max_per_file, max_results, &result_list);
                     if (result_list.items.len >= max_results) {
-                        breakdown.tier1_ns = cio.nanoTimestamp() - t1_start;
-                        breakdown.tier_reached = 2;
-                        breakdown.result_count = @intCast(result_list.items.len);
-                        const t_rerank = cio.nanoTimestamp();
-                        const res = self.rerankAndFinalize(&result_list, query, allocator);
-                        breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
-                        return res;
+                        return self.rerankAndFinalize(&result_list, query, allocator);
                     }
                 }
             }
@@ -1958,16 +1941,12 @@ pub const Explorer = struct {
         if (candidate_paths) |cp| {
             for (cp) |p| searched.put(p, {}) catch {};
         }
-        breakdown.tier1_ns = cio.nanoTimestamp() - t1_start;
 
-        const t2_start = cio.nanoTimestamp();
         // Tier 2 (sparse n-gram fallback) removed in v0.2.5822 — the
         // sparse_ngram_index field is no longer populated; tier 3
         // (skip_trigram_files) + tier 5 (full outline scan) cover the
         // same surface area.
-        breakdown.tier2_ns = cio.nanoTimestamp() - t2_start;
 
-        const t3_start = cio.nanoTimestamp();
         if (result_list.items.len < max_results) {
             var skip_iter = self.skip_trigram_files.keyIterator();
             while (skip_iter.next()) |key_ptr| {
@@ -1979,9 +1958,7 @@ pub const Explorer = struct {
                 if (result_list.items.len >= max_results) break;
             }
         }
-        breakdown.tier3_ns = cio.nanoTimestamp() - t3_start;
 
-        const t4_start = cio.nanoTimestamp();
         if (result_list.items.len < max_results) {
             if (word_hits.len > 0) {
                 var word_paths = std.StringHashMap(void).init(allocator);
@@ -1998,9 +1975,7 @@ pub const Explorer = struct {
                 }
             }
         }
-        breakdown.tier4_ns = cio.nanoTimestamp() - t4_start;
 
-        const t5_start = cio.nanoTimestamp();
         const trigram_ruled_out = if (candidate_paths) |_|
             (query.len >= 3)
         else
@@ -2016,17 +1991,8 @@ pub const Explorer = struct {
                 if (result_list.items.len >= max_results) break;
             }
         }
-        breakdown.tier5_ns = cio.nanoTimestamp() - t5_start;
 
-        if (result_list.items.len > 0) {
-            breakdown.tier_reached = if (breakdown.tier5_ns > 0 and result_list.items.len > 0) 7 else if (breakdown.tier4_ns > 0 and result_list.items.len > 0) 6 else if (breakdown.tier3_ns > 0) 5 else if (breakdown.tier2_ns > 0) 4 else if (breakdown.tier1_ns > 0) 3 else if (breakdown.tier05_ns > 0) 1 else 0;
-        }
-        breakdown.result_count = @intCast(result_list.items.len);
-
-        const t_rerank = cio.nanoTimestamp();
-        const res = self.rerankAndFinalize(&result_list, query, allocator);
-        breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
-        return res;
+        return self.rerankAndFinalize(&result_list, query, allocator);
     }
 
     pub fn renderPlainSearch(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), max_results: usize, paths_only: bool) !bool {
@@ -2035,8 +2001,6 @@ pub const Explorer = struct {
 
         if (max_results == 0) return false;
 
-        var breakdown: SearchBreakdown = .{};
-        const t0_start = cio.nanoTimestamp();
         const word_hits = self.word_index.search(query);
         if (word_hits.len == 0) return false;
 
@@ -2186,11 +2150,6 @@ pub const Explorer = struct {
             try w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, max_results - shown });
         }
 
-        breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
-        breakdown.tier_reached = 0;
-        breakdown.candidate_count = @intCast(word_hits.len);
-        breakdown.result_count = @intCast(max_results);
-        self.last_search_breakdown = breakdown;
         return rendered >= max_results;
     }
 

@@ -101,9 +101,6 @@ pub const RwLock = struct {
     pub fn tryLock(self: *RwLock) bool {
         return std.c.pthread_rwlock_trywrlock(&self.inner) == .SUCCESS;
     }
-    pub fn tryLockShared(self: *RwLock) bool {
-        return std.c.pthread_rwlock_tryrdlock(&self.inner) == .SUCCESS;
-    }
 };
 
 // ── Time ─────────────────────────────────────────────────────────────────
@@ -184,10 +181,6 @@ pub fn makePipe() PipeError![2]c_int {
     return fds;
 }
 
-pub fn closeFd(fd: c_int) void {
-    _ = close(fd);
-}
-
 pub fn posixGetenv(name: []const u8) ?[]const u8 {
     var buf: [256]u8 = undefined;
     if (name.len >= buf.len) return null;
@@ -256,13 +249,6 @@ pub const ListWriter = struct {
     }
     pub fn writeByte(self: ListWriter, b: u8) !void {
         try self.list.append(self.alloc, b);
-    }
-    pub fn writeByteNTimes(self: ListWriter, b: u8, n: usize) !void {
-        try self.list.appendNTimes(self.alloc, b, n);
-    }
-    pub fn writeBytesNTimes(self: ListWriter, bytes: []const u8, n: usize) !void {
-        var i: usize = 0;
-        while (i < n) : (i += 1) try self.list.appendSlice(self.alloc, bytes);
     }
     pub fn print(self: ListWriter, comptime fmt: []const u8, args: anytype) !void {
         var stack_buf: [8192]u8 = undefined;

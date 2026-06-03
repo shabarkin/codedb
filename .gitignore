@@ -21,8 +21,8 @@ install/.wrangler/
 # Generated snapshot (machine-specific)
 codedb.snapshot
 release/
-release/
 socials/
+.zigrep_archive
 
 # Benchmark / dev output dirs
 logs/
