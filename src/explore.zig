@@ -9,6 +9,7 @@ const TrigramIndex = idx.TrigramIndex;
 const MmapTrigramIndex = idx.MmapTrigramIndex;
 const AnyTrigramIndex = idx.AnyTrigramIndex;
 const SparseNgramIndex = idx.SparseNgramIndex;
+const path_security = @import("path_security.zig");
 
 pub fn approxIndexSizeBytes(explorer: *const Explorer) u64 {
     // Aggregate-only estimate. Keep this O(1): status calls this on hot paths,
@@ -601,6 +602,7 @@ pub const Explorer = struct {
     word_index_persisted_generation: u64 = 0,
     mu: cio.RwLock = .{},
     root_dir: ?std.Io.Dir = null,
+    root_real: []u8 = &.{},
     io: ?std.Io = null,
     /// When non-null, append one JSON line per searchContent invocation
     /// to this path (v0 rerank-trace experiment). Borrowed; caller owns
@@ -621,8 +623,21 @@ pub const Explorer = struct {
     pub const DEFAULT_CONTENT_CACHE_CAPACITY: u32 = 4096;
 
     pub fn setRoot(self: *Explorer, io: std.Io, root_path: []const u8) void {
+        if (self.root_dir) |d| {
+            if (self.io) |old_io| d.close(old_io);
+            self.root_dir = null;
+        }
+        if (self.root_real.len > 0) {
+            self.allocator.free(self.root_real);
+            self.root_real = &.{};
+        }
         self.io = io;
         self.root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{}) catch null;
+        if (self.root_dir) |dir| {
+            var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const real_len = dir.realPathFile(io, ".", &real_buf) catch return;
+            self.root_real = self.allocator.dupe(u8, real_buf[0..real_len]) catch &.{};
+        }
     }
 
     pub fn init(allocator: std.mem.Allocator, content_cache_capacity: u32) Explorer {
@@ -662,6 +677,7 @@ pub const Explorer = struct {
         if (self.root_dir) |d| {
             if (self.io) |io| d.close(io);
         }
+        if (self.root_real.len > 0) self.allocator.free(self.root_real);
     }
 
     /// Number of slots in the heap trigram index id_to_path array (benchmark helper).
@@ -1231,7 +1247,7 @@ pub const Explorer = struct {
             const io = self.io orelse return error.WordIndexIncomplete;
             const dir = self.root_dir orelse return error.WordIndexIncomplete;
             for (paths) |path| {
-                const content = try dir.readFileAlloc(io, path, self.allocator, .limited(64 * 1024 * 1024));
+                const content = try path_security.readFileAlloc(io, dir, self.root_real, path, self.allocator, .limited(64 * 1024 * 1024));
                 errdefer self.allocator.free(content);
                 try rebuilt.indexFile(path, content);
                 self.allocator.free(content);
@@ -1415,6 +1431,7 @@ pub const Explorer = struct {
         out: *std.ArrayList(u8),
         opts: ReadRenderOptions,
     ) !bool {
+        if (!path_security.isPathSafe(path) or path_security.isSensitivePath(path)) return false;
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -1435,12 +1452,13 @@ pub const Explorer = struct {
 
     /// Get content: zero-copy from cache, or read from disk (caller-owned).
     fn readContentForSearch(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) ?ContentRef {
+        if (!path_security.isPathSafe(path) or path_security.isSensitivePath(path)) return null;
         if (self.contents.get(path)) |cached| {
             return .{ .data = cached, .owned = false, .allocator = allocator };
         }
         const io = self.io orelse return null;
         const dir = self.root_dir orelse std.Io.Dir.cwd();
-        const data = dir.readFileAlloc(io, path, allocator, .limited(512 * 1024)) catch return null;
+        const data = path_security.readFileAlloc(io, dir, self.root_real, path, allocator, .limited(512 * 1024)) catch return null;
         return .{ .data = data, .owned = true, .allocator = allocator };
     }
 

@@ -1689,19 +1689,31 @@ test "integration: Tier 0.5 prefix expansion finds partial identifier" {
 }
 
 
-test "issue-389: FilteredWalker yields symlinked source files" {
+test "security: FilteredWalker skips file symlinks" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
+    var outside_dir = testing.tmpDir(.{});
+    defer outside_dir.cleanup();
 
     try tmp_dir.dir.createDirPath(io, "src");
     try tmp_dir.dir.writeFile(io, .{ .sub_path = "src/target.zig", .data = "pub fn linked() void {}\n// MARKER_LINE\n" });
+    try outside_dir.dir.writeFile(io, .{ .sub_path = "outside_secret.zig", .data = "pub const secret = 1;\n" });
 
-    // Create an in-workspace symlink: src/alias.zig -> target.zig (relative).
+    var outside_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const outside_len = try outside_dir.dir.realPathFile(io, "outside_secret.zig", &outside_buf);
+    const outside_path = outside_buf[0..outside_len];
+
+    // File symlinks are skipped even when the target is in-workspace. This
+    // avoids safe-looking aliases to sensitive or outside-root targets.
     var src_dir = try tmp_dir.dir.openDir(io, "src", .{ .iterate = true });
     defer src_dir.close(io);
     src_dir.symLink(io, "target.zig", "alias.zig", .{}) catch |err| switch (err) {
         // If the OS denies symlinks (e.g. CI without privilege on Windows),
         // skip the test rather than report a false negative.
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    src_dir.symLink(io, outside_path, "outside_alias.zig", .{}) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
@@ -1717,11 +1729,9 @@ test "issue-389: FilteredWalker yields symlinked source files" {
     explorer.setRoot(io, root);
     try watcher.initialScanWithWorkerCount(io, &store, &explorer, root, testing.allocator, false, 1);
 
-    // Both the real file and the symlinked alias must be indexed. The bug at
-    // src/watcher.zig:319 drops every entry whose kind != .file, silently
-    // skipping symlinks even when they point at in-workspace source files.
     try testing.expect(explorer.contents.contains("src/target.zig"));
-    try testing.expect(explorer.contents.contains("src/alias.zig"));
+    try testing.expect(!explorer.contents.contains("src/alias.zig"));
+    try testing.expect(!explorer.contents.contains("src/outside_alias.zig"));
 }
 
 
@@ -1740,6 +1750,8 @@ test "issue-405: FilteredWalker walks directory symlinks safely (cycle + escape)
     // Real directory `pkg/` with one source file.
     try tmp_dir.dir.createDirPath(io, "pkg");
     try tmp_dir.dir.writeFile(io, .{ .sub_path = "pkg/inside.zig", .data = "pub fn inside() void {}\n" });
+    try tmp_dir.dir.createDirPath(io, ".ssh");
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = ".ssh/known_hosts", .data = "secret host\n" });
 
     // A real directory `app/` that holds a directory-symlink `linked_pkg -> ../pkg`.
     // We expect the walker to descend into `linked_pkg` and yield `app/linked_pkg/inside.zig`.
@@ -1755,6 +1767,10 @@ test "issue-405: FilteredWalker walks directory symlinks safely (cycle + escape)
     // Cycle: `app/loop -> ..` points back at the workspace root. Without cycle
     // detection a naive walker recurses forever via app/loop/app/loop/app/...
     app_dir.symLink(io, "..", "loop", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    app_dir.symLink(io, "../.ssh", "ssh_alias", .{}) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
@@ -1777,6 +1793,7 @@ test "issue-405: FilteredWalker walks directory symlinks safely (cycle + escape)
 
     // 2. The real path must also be indexed exactly once.
     try testing.expect(explorer.contents.contains("pkg/inside.zig"));
+    try testing.expect(!explorer.contents.contains("app/ssh_alias/known_hosts"));
 
     // 3. The cycle must not have produced a deeply-nested duplicate entry.
     //    If cycle detection is missing, paths like
@@ -1940,4 +1957,3 @@ test "issue-208: content cache evicts cold entries under pressure" {
     const s = cache.stats();
     try testing.expect(s.evictions > 0);
 }
-

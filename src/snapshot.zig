@@ -32,6 +32,7 @@ const SymbolKind = explore_mod.SymbolKind;
 const Language = explore_mod.Language;
 const Store = @import("store.zig").Store;
 const git_mod = @import("git.zig");
+const path_security = @import("path_security.zig");
 
 const MAGIC = [4]u8{ 'C', 'D', 'B', 0x01 };
 const FORMAT_VERSION: u16 = 2;
@@ -231,6 +232,11 @@ pub fn writeSnapshot(
         const offset = file_writer.logicalPos();
         var root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{}) catch null;
         defer if (root_dir) |*dir| dir.close(io);
+        var real_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const real_root = if (root_dir) |dir| blk: {
+            const real_len = dir.realPathFile(io, ".", &real_root_buf) catch break :blk "";
+            break :blk real_root_buf[0..real_len];
+        } else "";
 
         var path_iter = explorer.outlines.keyIterator();
         while (path_iter.next()) |path_ptr| {
@@ -248,7 +254,7 @@ pub fn writeSnapshot(
                 try fw.writeAll(&cl_buf);
                 try fw.writeAll(content);
             } else if (root_dir) |*dir| {
-                const disk_content = dir.readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024)) catch continue;
+                const disk_content = path_security.readFileAlloc(io, dir.*, real_root, path, allocator, .limited(64 * 1024 * 1024)) catch continue;
                 errdefer allocator.free(disk_content);
 
                 var pl_buf: [2]u8 = undefined;
@@ -528,12 +534,14 @@ pub fn loadSnapshotValidated(
         // Re-index from disk if file was modified after the snapshot
         var disk_content: ?[]u8 = null;
         if (snap_mtime > 0) blk: {
-            const df = std.Io.Dir.cwd().openFile(io, path_buf, .{}) catch break :blk;
+            const root_dir = explorer.root_dir orelse break :blk;
+            if (explorer.root_real.len == 0) break :blk;
+            const df = path_security.openSafeFile(io, root_dir, explorer.root_real, path_buf) catch break :blk;
             defer df.close(io);
             const ds = df.stat(io) catch break :blk;
             const ds_mtime: i128 = @intCast(ds.mtime.nanoseconds);
             if (ds_mtime <= snap_mtime) break :blk;
-            disk_content = std.Io.Dir.cwd().readFileAlloc(io, path_buf, allocator, .limited(16 * 1024 * 1024)) catch break :blk;
+            disk_content = path_security.readFileAlloc(io, root_dir, explorer.root_real, path_buf, allocator, .limited(16 * 1024 * 1024)) catch break :blk;
         }
         defer if (disk_content) |dc| allocator.free(dc);
         const effective = if (disk_content) |dc| dc else content;
@@ -779,12 +787,14 @@ fn loadSnapshotFast(
 
         var disk_content: ?[]u8 = null;
         if (snap_mtime > 0) blk: {
-            const df = std.Io.Dir.cwd().openFile(io, path_buf, .{}) catch break :blk;
+            const root_dir = explorer.root_dir orelse break :blk;
+            if (explorer.root_real.len == 0) break :blk;
+            const df = path_security.openSafeFile(io, root_dir, explorer.root_real, path_buf) catch break :blk;
             defer df.close(io);
             const ds = df.stat(io) catch break :blk;
             const ds_mtime: i128 = @intCast(ds.mtime.nanoseconds);
             if (ds_mtime <= snap_mtime) break :blk;
-            disk_content = std.Io.Dir.cwd().readFileAlloc(io, path_buf, allocator, .limited(16 * 1024 * 1024)) catch break :blk;
+            disk_content = path_security.readFileAlloc(io, root_dir, explorer.root_real, path_buf, allocator, .limited(16 * 1024 * 1024)) catch break :blk;
         }
         defer if (disk_content) |dc| allocator.free(dc);
 
@@ -898,56 +908,7 @@ fn parseJsonU64(json: []const u8, key: []const u8) ?u64 {
 /// Returns true if a file path looks like it may contain secrets.
 /// These files are excluded from snapshots to prevent accidental exposure.
 fn isSensitivePath(path: []const u8) bool {
-    const sensitive_names = [_][]const u8{
-        ".env",
-        ".env.local",
-        ".env.production",
-        ".env.development",
-        ".env.staging",
-        ".env.test",
-        ".dev.vars",
-        "credentials.json",
-        "service-account.json",
-        "secrets.json",
-        "secrets.yaml",
-        "secrets.yml",
-        ".npmrc",
-        ".pypirc",
-        ".netrc",
-        "id_rsa",
-        "id_ed25519",
-        ".pem",
-    };
-
-    // Check exact filename (basename)
-    const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
-
-    for (sensitive_names) |name| {
-        if (std.mem.eql(u8, basename, name)) return true;
-    }
-
-    // Catch .env, .env.anything; do NOT match .envoy, .envrc, .environment, etc.
-    if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env") and
-        (basename.len == 4 or basename[4] == '.' or basename[4] == '-' or basename[4] == '_')) return true;
-
-    // Check extensions
-    if (endsWith(basename, ".pem")) return true;
-    if (endsWith(basename, ".key")) return true;
-    if (endsWith(basename, ".p12")) return true;
-    if (endsWith(basename, ".pfx")) return true;
-    if (endsWith(basename, ".jks")) return true;
-
-    // Check directory patterns
-    if (std.mem.indexOf(u8, path, ".ssh/") != null) return true;
-    if (std.mem.indexOf(u8, path, ".gnupg/") != null) return true;
-    if (std.mem.indexOf(u8, path, ".aws/") != null) return true;
-
-    return false;
-}
-
-fn endsWith(s: []const u8, suffix: []const u8) bool {
-    if (s.len < suffix.len) return false;
-    return std.mem.eql(u8, s[s.len - suffix.len ..], suffix);
+    return path_security.isSensitivePath(path);
 }
 
 fn cleanupStaleTmpFiles(io: std.Io, output_path: []const u8) void {
@@ -969,7 +930,7 @@ fn cleanupStaleTmpFiles(io: std.Io, output_path: []const u8) void {
         // Match: starts with basename, ends with .tmp
         if (name.len > basename.len and
             std.mem.startsWith(u8, name, basename) and
-            endsWith(name, ".tmp"))
+            std.mem.endsWith(u8, name, ".tmp"))
         {
             // Age guard: skip in-flight tmps from concurrent writers.
             // Only delete leftovers crashed processes left behind (>60s old).

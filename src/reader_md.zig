@@ -13,6 +13,7 @@
 // blake2b over sorted source-file contents, no third-party deps.
 
 const std = @import("std");
+const path_security = @import("path_security.zig");
 
 pub const State = enum { ready, stale, missing, malformed };
 
@@ -153,9 +154,14 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, project_root: []const u8) 
     }.lt);
 
     // Compute blake2b(16) over: for each f, f.bytes ++ 0x00 ++ file_contents ++ 0x00 0x00
+    var real_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_root_len = root_dir.realPathFile(io, ".", &real_root_buf) catch {
+        return .{ .state = .stale, .raw = raw, .declared_hash = declared_hash_opt, .body = body };
+    };
+    const real_root = real_root_buf[0..real_root_len];
     var h = std.crypto.hash.blake2.Blake2b128.init(.{});
     for (source_files.items) |rel| {
-        const data = root_dir.readFileAlloc(io, rel, allocator, .limited(8 * 1024 * 1024)) catch {
+        const data = path_security.readFileAlloc(io, root_dir, real_root, rel, allocator, .limited(8 * 1024 * 1024)) catch {
             // Listed file is gone — definitionally stale.
             return .{
                 .state = .stale,

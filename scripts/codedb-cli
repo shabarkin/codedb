@@ -6,8 +6,17 @@ set -euo pipefail
 PORT="${CODEDB_PORT:-7719}"
 BASE="http://localhost:$PORT"
 BINARY="${CODEDB_BINARY:-codedb}"
+TOKEN_FILE="${CODEDB_TOKEN_FILE:-${HOME:-}/.codedb/server-$PORT.token}"
 
 _ping() { curl -sf "$BASE/health" >/dev/null 2>&1; }
+
+_token() {
+    if [ -n "${CODEDB_TOKEN:-}" ]; then
+        printf '%s' "$CODEDB_TOKEN"
+    elif [ -n "$TOKEN_FILE" ] && [ -r "$TOKEN_FILE" ]; then
+        head -n 1 "$TOKEN_FILE"
+    fi
+}
 
 _ensure_server() {
     local root="${1:-.}"
@@ -46,7 +55,15 @@ _ensure_server() {
     return 1
 }
 
-_get() { curl -sf "$BASE$1"; }
+_get() {
+    local token
+    token="$(_token)"
+    if [ -n "$token" ]; then
+        curl -sf -H "X-Codedb-Token: $token" "$BASE$1"
+    else
+        curl -sf "$BASE$1"
+    fi
+}
 
 _urlencode() {
     local s="$1" c i len out=""

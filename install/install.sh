@@ -38,9 +38,9 @@ detect_platform() {
       printf "  ${W}codedb installer${N}\n"
       echo ""
       printf "  ${Y}Windows detected${N} — codedb is a native Linux/macOS binary.\n"
-      printf "  Run this inside ${G}WSL2${N} instead:\n"
+      printf "  Build from source inside ${G}WSL2${N} instead:\n"
       echo ""
-      printf "    ${C}wsl curl -fsSL https://codedb.codegraff.com/install.sh | bash${N}\n"
+      printf "    ${C}wsl git clone https://github.com/justrach/codedb && cd codedb && zig build${N}\n"
       echo ""
       exit 0
       ;;
@@ -303,27 +303,36 @@ main() {
   printf "  ${D}│${N} %-12s " "codedb"
   local tmp="/tmp/codedb.tmp.$$"
   if curl -fsSL -A 'codedb-installer' "$url" -o "$tmp" 2>/dev/null; then
-    # Verify checksum when the release publishes a checksum manifest.
-    local checksum_text expected_hash checksum_notice=""
+    # Verify checksum before installing. Missing manifests or unavailable
+    # sha256 tooling fail closed.
+    local checksum_text expected_hash
     checksum_text="$(curl -fsSL -A 'codedb-installer' "$checksum_url" 2>/dev/null || true)"
     expected_hash="$(printf '%s\n' "$checksum_text" | awk "/codedb-${platform}${ext}\$/ { print \$1 }")"
-    if [ -n "$expected_hash" ]; then
-      local actual_hash
-      if command -v sha256sum >/dev/null 2>&1; then
-        actual_hash="$(sha256sum "$tmp" | awk '{print $1}')"
-      elif command -v shasum >/dev/null 2>&1; then
-        actual_hash="$(shasum -a 256 "$tmp" | awk '{print $1}')"
-      fi
-      if [ -n "$actual_hash" ] && [ "$actual_hash" != "$expected_hash" ]; then
-        rm -f "$tmp"
-        printf "${R}failed${N}\n"
-        printf "\n  ${R}error: checksum mismatch — binary may be corrupted${N}\n" >&2
-        printf "  ${D}expected: $expected_hash${N}\n" >&2
-        printf "  ${D}actual:   $actual_hash${N}\n" >&2
-        exit 1
-      fi
-    else
-      checksum_notice="  ${Y}warning:${N} checksum verification skipped (checksums.sha256 unavailable)\n"
+    if [ -z "$expected_hash" ]; then
+      rm -f "$tmp"
+      printf "${R}failed${N}\n"
+      printf "\n  ${R}error: checksum missing for codedb-${platform}${ext}${N}\n" >&2
+      exit 1
+    fi
+    local actual_hash=""
+    if command -v sha256sum >/dev/null 2>&1; then
+      actual_hash="$(sha256sum "$tmp" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+      actual_hash="$(shasum -a 256 "$tmp" | awk '{print $1}')"
+    fi
+    if [ -z "$actual_hash" ]; then
+      rm -f "$tmp"
+      printf "${R}failed${N}\n"
+      printf "\n  ${R}error: no sha256 tool available for verification${N}\n" >&2
+      exit 1
+    fi
+    if [ "$actual_hash" != "$expected_hash" ]; then
+      rm -f "$tmp"
+      printf "${R}failed${N}\n"
+      printf "\n  ${R}error: checksum mismatch — binary may be corrupted${N}\n" >&2
+      printf "  ${D}expected: $expected_hash${N}\n" >&2
+      printf "  ${D}actual:   $actual_hash${N}\n" >&2
+      exit 1
     fi
     xattr -c "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$dest"
@@ -338,10 +347,6 @@ main() {
 
   echo ""
   printf "  ${G}installed${N} ${D}→ $dest${N}\n"
-  if [ -n "$checksum_notice" ]; then
-    printf "$checksum_notice"
-  fi
-
   # Register MCP server in coding tools
   echo ""
   printf "  ${W}registering integrations${N}\n"

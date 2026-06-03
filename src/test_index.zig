@@ -1082,24 +1082,31 @@ test "trigram index: removeFile prunes empty sets" {
 
 
 test "edit: atomic write leaves no temp files on success" {
-    // Create a temp file to edit
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const path = "test_atomic.zig";
-    const content = "line1\nline2\nline3\n";
-    try tmp_dir.dir.writeFile(io, .{ .sub_path = path, .data = content });
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/test_atomic.zig", .{tmp_dir.sub_path});
+    defer testing.allocator.free(rel_path);
 
-    // The temp file pattern is "{path}.codedb_tmp"
-    const tmp_path = path ++ ".codedb_tmp";
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test_atomic.zig", .data = "line1\nline2\nline3\n" });
 
-    // After a successful edit, no .codedb_tmp file should remain
-    tmp_dir.dir.access(io, tmp_path, .{}) catch {
-        // Expected: temp file doesn't exist (good)
-        return;
-    };
-    // If we get here, the temp file exists — that's a bug
-    return error.TempFileNotCleaned;
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("atomic-test");
+
+    _ = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .range = .{ 2, 2 },
+        .content = "LINE2",
+    });
+
+    const legacy_tmp = try std.fmt.allocPrint(testing.allocator, "{s}.codedb{s}", .{ rel_path, "_tmp" });
+    defer testing.allocator.free(legacy_tmp);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, legacy_tmp, .{}));
 }
 
 
@@ -2926,4 +2933,3 @@ test "issue-447: searchContent surfaces large (>64KB) skip-trigram files for com
     }
     try testing.expect(found_canonical);
 }
-

@@ -17,7 +17,12 @@ jobs:
 
       - name: Install Zig
         run: |
-          curl -L https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig.tar.xz
+          set -euo pipefail
+          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig.tar.xz
+          curl -fsSL https://ziglang.org/download/index.json -o zig-index.json
+          expected_sha="$(python3 -c 'import json; data=json.load(open("zig-index.json", "r", encoding="utf-8")); print(data["0.16.0"]["zig-x86_64-linux-0.16.0.tar.xz"]["shasum"])')"
+          actual_sha="$(shasum -a 256 zig.tar.xz | awk '{print $1}')"
+          test "$actual_sha" = "$expected_sha"
           tar -xf zig.tar.xz
           echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
 

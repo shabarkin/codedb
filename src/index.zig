@@ -1756,6 +1756,7 @@ pub const MmapTrigramIndex = struct {
         if (!std.mem.eql(u8, postings_data[0..4], &TrigramIndex.POSTINGS_MAGIC)) return null;
         const post_version = std.mem.readInt(u16, postings_data[4..6], .little);
         if (post_version < 1 or post_version > TrigramIndex.FORMAT_VERSION) return null;
+        if (post_version >= 3 and postings_data.len < 10) return null;
         const file_count: u32 = if (post_version >= 3)
             std.mem.readInt(u32, postings_data[6..10], .little)
         else
@@ -1801,7 +1802,21 @@ pub const MmapTrigramIndex = struct {
         const lk_version = std.mem.readInt(u16, lookup_data[4..6], .little);
         if (lk_version < 1 or lk_version > TrigramIndex.FORMAT_VERSION) return null;
         const entry_count = std.mem.readInt(u32, lookup_data[8..12], .little);
-        if (lookup_data.len < 12 + entry_count * @sizeOf(TrigramIndex.LookupEntry)) return null;
+        const lookup_entry_size = @sizeOf(TrigramIndex.LookupEntry);
+        if (entry_count > (lookup_data.len - 12) / lookup_entry_size) return null;
+        const posting_size: usize = if (post_version >= 3) @sizeOf(TrigramIndex.DiskPosting) else @sizeOf(TrigramIndex.OldDiskPosting);
+        if (postings_data.len < postings_start) return null;
+        const total_postings = (postings_data.len - postings_start) / posting_size;
+        var prev_tri: u32 = 0;
+        for (0..entry_count) |i| {
+            const entry_off = 12 + i * lookup_entry_size;
+            const tri = std.mem.readInt(u32, lookup_data[entry_off..][0..4], .little);
+            const offset = std.mem.readInt(u32, lookup_data[entry_off + 4 ..][0..4], .little);
+            const count = std.mem.readInt(u32, lookup_data[entry_off + 8 ..][0..4], .little);
+            if (i > 0 and tri <= prev_tri) return null;
+            prev_tri = tri;
+            if (@as(u64, offset) + @as(u64, count) > total_postings) return null;
+        }
 
         return MmapTrigramIndex{
             .postings_data = postings_data,

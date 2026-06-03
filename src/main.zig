@@ -21,6 +21,7 @@ const nuke_mod = @import("nuke.zig");
 const update_mod = @import("update.zig");
 const release_info = @import("release_info.zig");
 const Config = @import("config.zig").Config;
+const path_security = @import("path_security.zig");
 
 /// Buffered stdout wrapper. Formats into a 64KB stack-buffered window and
 /// flushes lazily; an explicit `flush()` runs from mainImpl's deferred cleanup.
@@ -781,7 +782,7 @@ fn mainImpl() !void {
                 std.process.exit(1);
             };
             defer root_dir.close(io);
-            break :blk root_dir.readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024)) catch {
+            break :blk path_security.readFileAlloc(io, root_dir, explorer.root_real, path, allocator, .limited(10 * 1024 * 1024)) catch {
                 out.p("{s}\xe2\x9c\x97{s} not indexed and disk read failed: {s}{s}{s}\n", .{
                     s.red, s.reset, s.bold, path, s.reset,
                 });
@@ -1047,11 +1048,6 @@ fn mainImpl() !void {
         std.log.info("codedb: {d} files indexed, listening on :{d}", .{ store.currentSeq(), port });
         try server.serve(io, allocator, &store, &agents, &explorer, queue, port);
     } else if (std.mem.eql(u8, cmd, "mcp")) {
-        // Background auto-update check (no-op when CODEDB_NO_AUTO_UPDATE is set
-        // or when the last check was within the last 24h). Detached thread, so
-        // this doesn't block server startup.
-        update_mod.maybeAutoUpdate(io, allocator);
-
         var agents = AgentRegistry.init(allocator);
         defer agents.deinit();
         _ = try agents.register("__filesystem__");
@@ -1456,13 +1452,16 @@ fn persistWordIndexFromSource(
 
     var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{});
     defer root_dir.close(io);
+    var real_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_root_len = try root_dir.realPathFile(io, ".", &real_root_buf);
+    const real_root = real_root_buf[0..real_root_len];
 
     var word_index = WordIndex.init(allocator);
     defer word_index.deinit();
     word_index.skip_file_words = true;
 
     for (paths.items) |path| {
-        const content = root_dir.readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024)) catch continue;
+        const content = path_security.readFileAlloc(io, root_dir, real_root, path, allocator, .limited(64 * 1024 * 1024)) catch continue;
         errdefer allocator.free(content);
         try word_index.indexFile(path, content);
         allocator.free(content);
@@ -1515,7 +1514,7 @@ fn printUsage(out: *Out, s: sty.Style) void {
         \\    {s}hot{s}                       recently modified files
         \\    {s}serve{s}                     HTTP daemon on :7719
         \\    {s}mcp{s}                       JSON-RPC/MCP server over stdio
-        \\    {s}update{s}                    self-update to the latest verified release
+        \\    {s}update{s}                    disabled; rebuild from source with zig build
         \\    {s}nuke{s}                      uninstall codedb, clear caches, and deregister integrations
         \\
     , .{

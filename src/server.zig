@@ -15,6 +15,7 @@ const Explorer = @import("explore.zig").Explorer;
 const snapshot_json = @import("snapshot_json.zig");
 const watcher = @import("watcher.zig");
 const edit_mod = @import("edit.zig");
+const path_security = @import("path_security.zig");
 
 pub fn serve(
     io: std.Io,
@@ -26,6 +27,8 @@ pub fn serve(
     port: u16,
 ) !void {
     _ = queue;
+    const auth_token = try loadOrCreateAuthToken(io, allocator, port);
+    defer allocator.free(auth_token);
 
     const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
     var srv = try addr.listen(io, .{
@@ -51,6 +54,7 @@ pub fn serve(
             .agents = agents,
             .explorer = explorer,
             .stream = stream,
+            .auth_token = auth_token,
         };
         const t = std.Thread.spawn(.{}, handleThread, .{ctx}) catch {
             stream.close(io);
@@ -68,7 +72,49 @@ const HandlerCtx = struct {
     agents: *AgentRegistry,
     explorer: *Explorer,
     stream: std.Io.net.Stream,
+    auth_token: []const u8,
 };
+
+fn loadOrCreateAuthToken(io: std.Io, allocator: std.mem.Allocator, port: u16) ![]u8 {
+    if (cio.posixGetenv("CODEDB_TOKEN")) |value| {
+        const token = std.mem.trim(u8, value, " \t\r\n");
+        if (token.len >= 16) return allocator.dupe(u8, token);
+    }
+
+    const home = cio.posixGetenv("HOME") orelse return generateAuthToken(io, allocator);
+    if (home.len == 0) return generateAuthToken(io, allocator);
+
+    const dir_path = try std.fmt.allocPrint(allocator, "{s}/.codedb", .{home});
+    defer allocator.free(dir_path);
+    std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
+
+    const token_path = try std.fmt.allocPrint(allocator, "{s}/server-{d}.token", .{ dir_path, port });
+    defer allocator.free(token_path);
+
+    if (std.Io.Dir.cwd().readFileAlloc(io, token_path, allocator, .limited(256))) |contents| {
+        defer allocator.free(contents);
+        const token = std.mem.trim(u8, contents, " \t\r\n");
+        if (token.len >= 16) return allocator.dupe(u8, token);
+    } else |_| {}
+
+    const token = try generateAuthToken(io, allocator);
+    errdefer allocator.free(token);
+    const file = std.Io.Dir.cwd().createFile(io, token_path, .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    }) catch return token;
+    defer file.close(io);
+    file.writeStreamingAll(io, token) catch return token;
+    file.writeStreamingAll(io, "\n") catch return token;
+    return token;
+}
+
+fn generateAuthToken(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    var random_bytes: [32]u8 = undefined;
+    io.randomSecure(&random_bytes) catch io.random(&random_bytes);
+    const hex = std.fmt.bytesToHex(random_bytes, .lower);
+    return allocator.dupe(u8, &hex);
+}
 
 fn handleThread(ctx: *HandlerCtx) void {
     const io = ctx.io;
@@ -77,7 +123,7 @@ fn handleThread(ctx: *HandlerCtx) void {
         ctx.stream.close(io);
         allocator.destroy(ctx);
     }
-    handleConnection(io, allocator, ctx.store, ctx.agents, ctx.explorer, ctx.stream);
+    handleConnection(io, allocator, ctx.store, ctx.agents, ctx.explorer, ctx.stream, ctx.auth_token);
 }
 
 /// Thin wrapper that owns a TCP stream plus a matching `std.Io.Writer` with a
@@ -116,6 +162,7 @@ fn handleConnection(
     agents: *AgentRegistry,
     explorer: *Explorer,
     stream: std.Io.net.Stream,
+    auth_token: []const u8,
 ) void {
     var buf: [65536]u8 = undefined;
 
@@ -197,6 +244,11 @@ fn handleConnection(
     // ── Health ──
     if (std.mem.startsWith(u8, request, "GET /health")) {
         respondJson(&conn, "200 OK", "{\"status\":\"ok\"}");
+        return;
+    }
+
+    if (!isAuthorized(request, auth_token)) {
+        respondJson(&conn, "401 Unauthorized", "{\"error\":\"missing or invalid codedb token\"}");
         return;
     }
 
@@ -292,6 +344,10 @@ fn handleConnection(
             respondJson(&conn, "403 Forbidden", "{\"error\":\"path traversal not allowed\"}");
             return;
         }
+        if (path_security.isSensitivePath(path)) {
+            respondJson(&conn, "403 Forbidden", "{\"error\":\"access to sensitive file blocked\"}");
+            return;
+        }
 
         const agent_id = jsonU64(body_obj, "agent") orelse {
             respondJson(&conn, "400 Bad Request", "{\"error\":\"missing agent\"}");
@@ -366,13 +422,21 @@ fn handleConnection(
             respondJson(&conn, "403 Forbidden", "{\"error\":\"path traversal not allowed\"}");
             return;
         }
+        if (path_security.isSensitivePath(path)) {
+            respondJson(&conn, "403 Forbidden", "{\"error\":\"access to sensitive file blocked\"}");
+            return;
+        }
         const root_dir = explorer.root_dir orelse {
             respondJson(&conn, "500 Internal Server Error", "{\"error\":\"root not configured\"}");
             return;
         };
-        const content = root_dir.readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024)) catch |err| switch (err) {
+        const content = path_security.readFileAlloc(io, root_dir, explorer.root_real, path, allocator, .limited(10 * 1024 * 1024)) catch |err| switch (err) {
             error.FileNotFound => {
                 respondJson(&conn, "404 Not Found", "{\"error\":\"file not found\"}");
+                return;
+            },
+            error.AccessDenied => {
+                respondJson(&conn, "403 Forbidden", "{\"error\":\"access denied\"}");
                 return;
             },
             else => {
@@ -451,6 +515,10 @@ fn handleConnection(
         defer allocator.free(path);
         if (!isPathSafe(path)) {
             respondJson(&conn, "403 Forbidden", "{\"error\":\"path traversal not allowed\"}");
+            return;
+        }
+        if (path_security.isSensitivePath(path)) {
+            respondJson(&conn, "403 Forbidden", "{\"error\":\"access to sensitive file blocked\"}");
             return;
         }
         var outline = explorer.getOutline(path, allocator) catch {
@@ -699,18 +767,33 @@ fn readSome(io: std.Io, stream: std.Io.net.Stream, dest: []u8) !usize {
 // ── Response helpers ────────────────────────────────────────────
 
 fn isPathSafe(path: []const u8) bool {
-    if (path.len == 0) return false;
-    if (path[0] == '/') return false;
-    // Block null bytes (path truncation attack).
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
-    // Block backslash separators so Windows-style `..\..\x` can't bypass the
-    // forward-slash `..` check below. Matches mcp.isPathSafe.
-    if (std.mem.indexOfScalar(u8, path, '\\') != null) return false;
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |component| {
-        if (std.mem.eql(u8, component, "..")) return false;
+    return path_security.isPathSafe(path);
+}
+
+fn isAuthorized(request: []const u8, token: []const u8) bool {
+    if (token.len == 0) return false;
+    if (headerValue(request, "X-Codedb-Token")) |value| {
+        if (std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), token)) return true;
     }
-    return true;
+    if (headerValue(request, "Authorization")) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        const prefix = "Bearer ";
+        if (std.mem.startsWith(u8, trimmed, prefix) and std.mem.eql(u8, trimmed[prefix.len..], token)) return true;
+    }
+    return false;
+}
+
+fn headerValue(request: []const u8, wanted: []const u8) ?[]const u8 {
+    const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse request.len;
+    var lines = std.mem.splitSequence(u8, request[0..header_end], "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, wanted)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
 }
 
 fn respondJson(conn: *Conn, status: []const u8, body: []const u8) void {

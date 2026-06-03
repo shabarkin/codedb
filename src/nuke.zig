@@ -70,7 +70,7 @@ pub fn run(io: std.Io, stdout: cio.File, s: sty.Style, allocator: std.mem.Alloca
     out.p("  deregistered tools    {d}\n", .{stats.integrations_removed});
     out.p("  removed binaries      {d}\n", .{stats.binaries_removed});
     out.p("  terminated processes  {d}\n", .{stats.killed_processes});
-    out.p("\n  to reinstall: {s}curl -fsSL https://codedb.codegraff.com/install.sh | bash{s}\n", .{ s.cyan, s.reset });
+    out.p("\n  to rebuild: {s}zig build{s}\n", .{ s.cyan, s.reset });
 }
 
 fn killOtherCodedbProcesses(allocator: std.mem.Allocator, self_pid: std.c.pid_t, self_exe: ?[]const u8) usize {

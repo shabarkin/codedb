@@ -83,7 +83,11 @@ test "issue-93: isSensitivePath blocks .env and credentials" {
     try testing.expect(watcher.isSensitivePath("keystore.jks"));
     try testing.expect(watcher.isSensitivePath("identity.pfx"));
     try testing.expect(watcher.isSensitivePath(".ssh/known_hosts"));
+    try testing.expect(watcher.isSensitivePath(".ENV"));
+    try testing.expect(watcher.isSensitivePath("Config/Credentials.json"));
+    try testing.expect(watcher.isSensitivePath(".SSH/known_hosts"));
     // Normal files should NOT be blocked
+    try testing.expect(!watcher.isSensitivePath(".envoy.json"));
     try testing.expect(!watcher.isSensitivePath("main.zig"));
     try testing.expect(!watcher.isSensitivePath("src/server.zig"));
     try testing.expect(!watcher.isSensitivePath("README.md"));
@@ -101,72 +105,33 @@ test "issue-93: isPathSafe blocks traversal" {
 }
 
 
-test "auto-update: shouldRunAutoUpdate gates correctly" {
+test "auto-update: disabled for source-build workflow" {
     const day_ms: i64 = 24 * 60 * 60 * 1000;
 
-    // Disabled by env: never runs
     try testing.expect(!update_mod.shouldRunAutoUpdate(0, null, true));
     try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms * 100, null, true));
     try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms * 100, 0, true));
-
-    // First run (no stamp): always runs when not disabled
-    try testing.expect(update_mod.shouldRunAutoUpdate(0, null, false));
-
-    // Throttled: <24h since last check → skip
+    try testing.expect(!update_mod.shouldRunAutoUpdate(0, null, false));
     try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms - 1, 0, false));
-
-    // Exactly 24h since last check → run
-    try testing.expect(update_mod.shouldRunAutoUpdate(day_ms, 0, false));
-
-    // Long after last check → run
-    try testing.expect(update_mod.shouldRunAutoUpdate(day_ms * 7, 0, false));
+    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms, 0, false));
+    try testing.expect(!update_mod.shouldRunAutoUpdate(day_ms * 7, 0, false));
 }
 
 
-test "issue-394: shouldRunAutoUpdate permanently blocked by future-timestamp stamp file" {
-    // Reproduces the case where the stamp file contains a timestamp in the
-    // future relative to the wall clock — for example, after an NTP clock
-    // correction that rolls the clock back, or after a stamp written by a
-    // host with a fast clock. The current implementation computes
-    // (now - last) and only fires when that delta >= 24h, so a future
-    // `last` produces a negative delta and the check is silently skipped
-    // for as long as the stamp stays in the future — potentially many days.
-    //
-    // Expected: a wildly future stamp should NOT prevent the next check
-    // from firing. The simplest correct behavior is: if last > now, treat
-    // the stamp as invalid and allow the update check to run.
-
+test "issue-394: future auto-update stamps do not trigger runtime updates" {
     const day_ms: i64 = 24 * 60 * 60 * 1000;
     const now_ms: i64 = 1_700_000_000_000;
-    const future_last_ms: i64 = now_ms + day_ms * 30; // 30 days in the future
+    const future_last_ms: i64 = now_ms + day_ms * 30;
 
-    try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, future_last_ms, false));
+    try testing.expect(!update_mod.shouldRunAutoUpdate(now_ms, future_last_ms, false));
 }
 
 
-test "issue-395: shouldRunAutoUpdate panics on i64 underflow when stamp is corrupt" {
-    // Reproduces a panic when ~/.codedb/last_auto_update_check is corrupt
-    // and decodes to a very negative i64. readAutoUpdateStamp does no
-    // sanity check — it reads 8 bytes, calls std.mem.readInt(i64, ...),
-    // and feeds that straight into shouldRunAutoUpdate, which evaluates
-    // `now_ms - last` with checked subtraction. For last = minInt(i64)
-    // and any positive now_ms, the subtraction overflows and triggers an
-    // integer-overflow panic in Debug / ReleaseSafe builds (which is what
-    // `zig build test` and the shipped MCP binary use).
-    //
-    // Result: every `codedb mcp` startup crashes during the auto-update
-    // gate for any user whose stamp file got corrupted to a value with
-    // the high bit set (e.g. truncated write, partial flush, or any byte
-    // sequence starting with 0x80..0xFF in the stamp).
-    //
-    // Expected fix: clamp the delta with a saturating/wrapping subtraction
-    // or treat any last_ms <= 0 (or in the distant past) as invalid and
-    // run the update.
-
+test "issue-395: corrupt auto-update stamps do not trigger runtime updates" {
     const now_ms: i64 = 1_700_000_000_000;
     const last_ms: i64 = std.math.minInt(i64);
 
-    try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, last_ms, false));
+    try testing.expect(!update_mod.shouldRunAutoUpdate(now_ms, last_ms, false));
 }
 
 

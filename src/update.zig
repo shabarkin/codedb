@@ -1,12 +1,8 @@
 const std = @import("std");
-const cio = @import("cio.zig");
 const builtin = @import("builtin");
+const cio = @import("cio.zig");
 const sty = @import("style.zig");
 const release_info = @import("release_info.zig");
-
-const github_repo = "justrach/codedb";
-const default_base_url = "https://codedb.codegraff.com";
-const user_agent = "codedb-update";
 
 const Out = struct {
     file: cio.File,
@@ -19,91 +15,34 @@ const Out = struct {
     }
 };
 
-const VersionSource = enum {
-    env,
-    github,
-    fallback,
-};
-
-const ResolvedVersion = struct {
-    value: []u8,
-    source: VersionSource,
-};
-
 const SupersededRelease = struct {
     current: []const u8,
     minimum_target: []const u8,
 };
 
 const superseded_releases = [_]SupersededRelease{
-    // v0.2.58181 was an accidental release-train typo. Pure SemVer ordering
-    // treats its patch component as newer than v0.2.5823, but operationally it
-    // belongs before v0.2.5823 and should update forward normally.
     .{ .current = "0.2.58181", .minimum_target = "0.2.5823" },
 };
 
 pub fn run(io: std.Io, stdout: cio.File, s: sty.Style, allocator: std.mem.Allocator) void {
+    _ = io;
     const out = Out{ .file = stdout, .alloc = allocator };
+    out.p(
+        "{s}update disabled{s}: codedb is built from source in this tree; rebuild with `zig build` instead of downloading a release binary.\n",
+        .{ s.yellow, s.reset },
+    );
+}
 
-    const resolved = resolveTargetVersion(allocator) catch |err| {
-        out.p("{s}✗{s} failed to resolve update target: {s}\n", .{ s.red, s.reset, @errorName(err) });
-        std.process.exit(1);
-    };
-    defer allocator.free(resolved.value);
+pub fn maybeAutoUpdate(io: std.Io, allocator: std.mem.Allocator) void {
+    _ = io;
+    _ = allocator;
+}
 
-    const version_order = compareVersionsForUpdate(release_info.semver, resolved.value) catch |err| {
-        out.p("{s}✗{s} invalid release version: {s}\n", .{ s.red, s.reset, @errorName(err) });
-        std.process.exit(1);
-    };
-
-    switch (version_order) {
-        .eq => {
-            out.p("codedb {s} is already up to date\n", .{release_info.semver});
-            return;
-        },
-        .gt => {
-            out.p("{s}✗{s} refusing to replace codedb {s} with older release {s}\n", .{ s.red, s.reset, release_info.semver, resolved.value });
-            std.process.exit(1);
-        },
-        .lt => {},
-    }
-
-    const asset_name = assetNameForTarget(builtin.os.tag, builtin.cpu.arch) orelse {
-        out.p("{s}✗{s} self-update is unsupported on this platform\n", .{ s.red, s.reset });
-        std.process.exit(1);
-    };
-
-    out.p("updating codedb {s} -> {s}\n", .{ release_info.semver, resolved.value });
-    out.p("  source: {s}\n", .{switch (resolved.source) {
-        .env => "CODEDB_VERSION",
-        .github => "github releases",
-        .fallback => "codedb.codegraff.com/latest.json",
-    }});
-    out.p("  asset:  {s}\n", .{asset_name});
-
-    const manifest = fetchChecksumsManifest(allocator, resolved.value) catch |err| {
-        out.p("{s}✗{s} failed to download checksums for v{s}: {s}\n", .{ s.red, s.reset, resolved.value, @errorName(err) });
-        std.process.exit(1);
-    };
-    defer allocator.free(manifest);
-
-    const expected_hash = checksumForBinary(manifest, asset_name) orelse {
-        out.p("{s}✗{s} release v{s} is missing a checksum for {s}\n", .{ s.red, s.reset, resolved.value, asset_name });
-        std.process.exit(1);
-    };
-
-    const self_path = std.process.executablePathAlloc(io, allocator) catch |err| {
-        out.p("{s}✗{s} cannot locate current executable: {s}\n", .{ s.red, s.reset, @errorName(err) });
-        std.process.exit(1);
-    };
-    defer allocator.free(self_path);
-
-    downloadAndReplaceBinary(io, allocator, resolved.value, asset_name, self_path, expected_hash) catch |err| {
-        out.p("{s}✗{s} update failed: {s}\n", .{ s.red, s.reset, @errorName(err) });
-        std.process.exit(1);
-    };
-
-    out.p("{s}✓{s} updated to codedb {s}\n", .{ s.green, s.reset, resolved.value });
+pub fn shouldRunAutoUpdate(now_ms: i64, last_check_ms: ?i64, env_disabled: bool) bool {
+    _ = now_ms;
+    _ = last_check_ms;
+    _ = env_disabled;
+    return false;
 }
 
 pub fn assetNameForTarget(os_tag: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) ?[]const u8 {
@@ -120,6 +59,14 @@ pub fn assetNameForTarget(os_tag: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) 
         },
         else => null,
     };
+}
+
+pub fn currentAssetName() ?[]const u8 {
+    return assetNameForTarget(builtin.os.tag, builtin.cpu.arch);
+}
+
+pub fn currentVersion() []const u8 {
+    return release_info.semver;
 }
 
 pub fn compareVersions(current: []const u8, target: []const u8) !std.math.Order {
@@ -172,88 +119,6 @@ pub fn checksumForBinary(manifest: []const u8, binary_name: []const u8) ?[]const
     return null;
 }
 
-fn resolveTargetVersion(allocator: std.mem.Allocator) !ResolvedVersion {
-    if (cio.posixGetenv("CODEDB_VERSION")) |value| {
-        if (value.len != 0) {
-            const dup = try allocator.dupe(u8, value);
-            return .{ .value = dup, .source = .env };
-        }
-    }
-
-    if (fetchLatestVersionFromGitHub(allocator) catch null) |value| {
-        return .{ .value = value, .source = .github };
-    }
-
-    if (fetchLatestVersionFromFallback(allocator) catch null) |value| {
-        return .{ .value = value, .source = .fallback };
-    }
-
-    return error.CouldNotResolveLatestVersion;
-}
-
-fn fetchLatestVersionFromGitHub(allocator: std.mem.Allocator) !?[]u8 {
-    const response = fetchUrlToMemory(allocator, "https://api.github.com/repos/" ++ github_repo ++ "/releases/latest", 1 * 1024 * 1024) catch return null;
-    defer allocator.free(response);
-    return parseJsonStringField(allocator, response, "tag_name", true);
-}
-
-fn fetchLatestVersionFromFallback(allocator: std.mem.Allocator) !?[]u8 {
-    const base_url = try getBaseUrl(allocator);
-    defer if (base_url.owned) allocator.free(base_url.value);
-
-    const url = try std.fmt.allocPrint(allocator, "{s}/latest.json", .{base_url.value});
-    defer allocator.free(url);
-
-    const response = fetchUrlToMemory(allocator, url, 256 * 1024) catch return null;
-    defer allocator.free(response);
-    return parseJsonStringField(allocator, response, "version", false);
-}
-
-fn fetchChecksumsManifest(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
-    const url = try std.fmt.allocPrint(allocator, "https://github.com/{s}/releases/download/v{s}/checksums.sha256", .{ github_repo, version });
-    defer allocator.free(url);
-    return fetchUrlToMemory(allocator, url, 256 * 1024);
-}
-
-fn fetchUrlToMemory(allocator: std.mem.Allocator, url: []const u8, max_output_bytes: usize) ![]u8 {
-    const result = try cio.runCapture(.{
-        .allocator = allocator,
-        .argv = &.{ "curl", "-fsSL", "-A", user_agent, url },
-        .max_output_bytes = max_output_bytes,
-    });
-    defer allocator.free(result.stderr);
-
-    if (result.term != .Exited or result.term.Exited != 0) {
-        allocator.free(result.stdout);
-        return error.CurlFailed;
-    }
-
-    return result.stdout;
-}
-
-fn parseJsonStringField(allocator: std.mem.Allocator, json_text: []const u8, field_name: []const u8, trim_v_prefix: bool) !?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch return null;
-    defer parsed.deinit();
-
-    if (parsed.value != .object) return null;
-    const field = parsed.value.object.get(field_name) orelse return null;
-    if (field != .string) return null;
-
-    const value = if (trim_v_prefix) trimVersionPrefix(field.string) else field.string;
-    if (value.len == 0) return null;
-    return try allocator.dupe(u8, value);
-}
-
-fn getBaseUrl(allocator: std.mem.Allocator) !struct { value: []const u8, owned: bool } {
-    if (cio.posixGetenv("CODEDB_URL")) |value| {
-        if (value.len != 0) {
-            const dup = try allocator.dupe(u8, value);
-            return .{ .value = dup, .owned = true };
-        }
-    }
-    return .{ .value = default_base_url, .owned = false };
-}
-
 fn trimVersionPrefix(value: []const u8) []const u8 {
     return std.mem.trimStart(u8, value, "vV");
 }
@@ -262,144 +127,4 @@ fn parseVersionPart(part: []const u8) !u64 {
     const trimmed = std.mem.trim(u8, part, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidVersion;
     return std.fmt.parseInt(u64, trimmed, 10);
-}
-
-fn downloadAndReplaceBinary(io: std.Io, allocator: std.mem.Allocator, version: []const u8, asset_name: []const u8, dest_path: []const u8, expected_hash: []const u8) !void {
-    const url = try std.fmt.allocPrint(allocator, "https://github.com/{s}/releases/download/v{s}/{s}", .{ github_repo, version, asset_name });
-    defer allocator.free(url);
-
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}", .{ dest_path, cio.nanoTimestamp() });
-    defer allocator.free(tmp_path);
-    errdefer std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
-
-    try downloadToFile(allocator, url, tmp_path);
-
-    const actual_hash = try sha256FileHex(io, allocator, tmp_path);
-    defer allocator.free(actual_hash);
-    if (!std.ascii.eqlIgnoreCase(actual_hash, expected_hash)) {
-        return error.ChecksumMismatch;
-    }
-
-    {
-        var tmp_file = try std.Io.Dir.openFileAbsolute(io, tmp_path, .{ .mode = .read_write });
-        defer tmp_file.close(io);
-        try tmp_file.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));
-    }
-
-    try std.Io.Dir.renameAbsolute(tmp_path, dest_path, io);
-}
-
-fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
-    const result = try cio.runCapture(.{
-        .allocator = allocator,
-        .argv = &.{ "curl", "-fsSL", "-A", user_agent, url, "-o", dest_path },
-        .max_output_bytes = 16 * 1024,
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    if (result.term != .Exited or result.term.Exited != 0) {
-        return error.DownloadFailed;
-    }
-}
-
-fn sha256FileHex(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
-
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    var buf: [16 * 1024]u8 = undefined;
-    var offset: u64 = 0;
-    while (true) {
-        const read_len = try file.readPositionalAll(io, &buf, offset);
-        if (read_len == 0) break;
-        hasher.update(buf[0..read_len]);
-        offset += read_len;
-        if (read_len < buf.len) break;
-    }
-
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    const digest_hex = std.fmt.bytesToHex(digest, .lower);
-    return allocator.dupe(u8, &digest_hex);
-}
-
-// ── Auto-update ──────────────────────────────────────────────────────────────
-//
-// On startup we kick off a detached check that shells out to the public
-// install.sh. The check is:
-//   • disabled when CODEDB_NO_AUTO_UPDATE is set in the environment
-//   • throttled to at most once every 24 hours, tracked in
-//     ~/.codedb/last_auto_update_check (a u64 little-endian unix-ms timestamp)
-// The update itself runs in a background thread so it never blocks server
-// startup. If the binary on disk gets replaced mid-session, the kernel keeps
-// the old inode mapped for the running process; subsequent invocations get the
-// new binary.
-
-const auto_update_install_url = "https://codedb.codegraff.com/install.sh";
-const auto_update_throttle_ms: i64 = 24 * 60 * 60 * 1000;
-const auto_update_stamp_filename = "last_auto_update_check";
-
-/// Pure decision function — useful for tests. Returns true when the next
-/// auto-update attempt should fire.
-pub fn shouldRunAutoUpdate(now_ms: i64, last_check_ms: ?i64, env_disabled: bool) bool {
-    if (env_disabled) return false;
-    const last = last_check_ms orelse return true;
-    if (last > now_ms) return true;
-    const delta: i128 = @as(i128, now_ms) - @as(i128, last);
-    return delta >= auto_update_throttle_ms;
-}
-
-pub fn maybeAutoUpdate(io: std.Io, allocator: std.mem.Allocator) void {
-    const env_disabled = cio.posixGetenv("CODEDB_NO_AUTO_UPDATE") != null;
-    const home = cio.posixGetenv("HOME") orelse return;
-    if (home.len == 0) return;
-
-    const dir_path = std.fmt.allocPrint(allocator, "{s}/.codedb", .{home}) catch return;
-    defer allocator.free(dir_path);
-    std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
-
-    const stamp_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, auto_update_stamp_filename }) catch return;
-    defer allocator.free(stamp_path);
-
-    const last_ms = readAutoUpdateStamp(io, stamp_path);
-    const now_ms = cio.milliTimestamp();
-    if (!shouldRunAutoUpdate(now_ms, last_ms, env_disabled)) return;
-
-    // Persist the new timestamp before launching so concurrent invocations
-    // don't all race the same check.
-    writeAutoUpdateStamp(io, stamp_path, now_ms);
-
-    const thread = std.Thread.spawn(.{}, autoUpdateWorker, .{}) catch return;
-    thread.detach();
-}
-
-fn autoUpdateWorker() void {
-    // sh -c handles the curl-into-bash pipeline. We keep stdout/stderr captured
-    // and immediately discard so the install script's progress output doesn't
-    // leak into the parent's stdio (which is the MCP transport).
-    const result = cio.runCapture(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &.{ "sh", "-c", "curl -fsSL " ++ auto_update_install_url ++ " | bash" },
-        .max_output_bytes = 64 * 1024,
-    }) catch return;
-    std.heap.page_allocator.free(result.stdout);
-    std.heap.page_allocator.free(result.stderr);
-}
-
-fn readAutoUpdateStamp(io: std.Io, path: []const u8) ?i64 {
-    var buf: [8]u8 = undefined;
-    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
-    defer f.close(io);
-    const n = f.readPositionalAll(io, &buf, 0) catch return null;
-    if (n < 8) return null;
-    return std.mem.readInt(i64, buf[0..8], .little);
-}
-
-fn writeAutoUpdateStamp(io: std.Io, path: []const u8, ms: i64) void {
-    var buf: [8]u8 = undefined;
-    std.mem.writeInt(i64, &buf, ms, .little);
-    const f = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch return;
-    defer f.close(io);
-    f.writePositionalAll(io, &buf, 0) catch {};
 }

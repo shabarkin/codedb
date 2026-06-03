@@ -22,6 +22,7 @@ const snapshot_mod = @import("snapshot.zig");
 const git_mod = @import("git.zig");
 const root_policy = @import("root_policy.zig");
 const release_info = @import("release_info.zig");
+const path_security = @import("path_security.zig");
 pub const DeferredScan = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -2456,7 +2457,8 @@ fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         owned_content
     else blk: {
         // Fall back to disk read
-        break :blk std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(10 * 1024 * 1024)) catch {
+        const root_dir = explorer.root_dir orelse std.Io.Dir.cwd();
+        break :blk path_security.readFileAlloc(io, root_dir, explorer.root_real, path, alloc, .limited(10 * 1024 * 1024)) catch {
             out.appendSlice(alloc, "error: failed to read file: ") catch {};
             out.appendSlice(alloc, path) catch {};
             // Issue #356-p3: fuzzy fallback so a mistyped path is recoverable
@@ -2574,7 +2576,7 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
             // Include the file's current hex hash so the agent can re-read with if_hash
             // to verify it has the latest content, then retry the edit.
             const edit_dir = explorer.root_dir orelse std.Io.Dir.cwd();
-            if (edit_dir.readFileAlloc(io, path, alloc, .limited(10 * 1024 * 1024))) |bytes| {
+            if (path_security.readFileAlloc(io, edit_dir, explorer.root_real, path, alloc, .limited(10 * 1024 * 1024))) |bytes| {
                 defer alloc.free(bytes);
                 const w = cio.listWriter(out, alloc);
                 w.print(" (current hash: {x})", .{std.hash.Wyhash.hash(0, bytes)}) catch {};
@@ -4230,17 +4232,7 @@ pub fn globMatch(pattern: []const u8, path: []const u8) bool {
 }
 
 pub fn isPathSafe(path: []const u8) bool {
-    if (path.len == 0) return false;
-    if (path[0] == '/') return false;
-    // Block null bytes (path truncation attack)
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
-    // Block backslash separators
-    if (std.mem.indexOfScalar(u8, path, '\\') != null) return false;
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |component| {
-        if (std.mem.eql(u8, component, "..")) return false;
-    }
-    return true;
+    return path_security.isPathSafe(path);
 }
 
 fn writeResult(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, result: []const u8) void {

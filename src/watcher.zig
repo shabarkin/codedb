@@ -6,6 +6,7 @@ const Explorer = @import("explore.zig").Explorer;
 const TrigramIndex = @import("index.zig").TrigramIndex;
 const explore_mod = @import("explore.zig");
 const git_mod = @import("git.zig");
+const path_security = @import("path_security.zig");
 pub const EventKind = enum(u8) {
     created,
     modified,
@@ -177,8 +178,9 @@ fn shouldSkip(path: []const u8) bool {
 }
 
 fn shouldSkipDir(name: []const u8) bool {
+    if (path_security.isSensitivePath(name)) return true;
     for (skip_dirs) |skip| {
-        if (std.mem.eql(u8, name, skip)) return true;
+        if (std.ascii.eqlIgnoreCase(name, skip)) return true;
     }
     return false;
 }
@@ -346,13 +348,23 @@ const FilteredWalker = struct {
                             else
                                 entry.name;
                             if (self.isIgnored(entry.name, check_path)) continue;
+                            if (path_security.isSensitivePath(check_path)) continue;
                         }
+                        var link_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                        const link_path = if (self.dir_prefix_len > 0)
+                            std.fmt.bufPrint(&link_path_buf, "{s}/{s}", .{ self.name_buffer.items[0..self.dir_prefix_len], entry.name }) catch entry.name
+                        else
+                            entry.name;
+                        if (path_security.isSensitivePath(link_path)) continue;
                         var rt_buf: [std.fs.max_path_bytes]u8 = undefined;
                         const rt_len = top.dir_handle.realPathFile(self.io, entry.name, &rt_buf) catch continue;
                         const real_target = rt_buf[0..rt_len];
                         if (self.real_root.len == 0) continue;
                         if (!std.mem.startsWith(u8, real_target, self.real_root)) continue;
                         if (real_target.len != self.real_root.len and real_target[self.real_root.len] != '/') continue;
+                        if (path_security.relativeFromRealRoot(real_target, self.real_root)) |real_rel| {
+                            if (path_security.isSensitivePath(real_rel)) continue;
+                        } else continue;
                         const gop = self.visited_real_paths.getOrPut(self.allocator, real_target) catch continue;
                         if (gop.found_existing) continue;
                         const dup = self.allocator.dupe(u8, real_target) catch {
@@ -374,7 +386,8 @@ const FilteredWalker = struct {
                         });
                         continue;
                     }
-                    if (target_stat.kind != .file) continue;
+                    if (target_stat.kind == .file) continue;
+                    continue;
                 }
 
                 // Build full relative path by appending filename
@@ -422,7 +435,7 @@ fn collectInitialScanEntries(io: std.Io, store: *Store, dir: std.Io.Dir, allocat
     const max_trigram_files: usize = 15_000;
     var file_count: usize = 0;
     while (try walker.next()) |entry| {
-        const stat = dir.statFile(io, entry.path, .{}) catch continue;
+        const stat = path_security.statSafeFile(io, dir, walker.real_root, entry.path) catch continue;
         _ = try store.recordSnapshot(entry.path, stat.size, 0);
         file_count += 1;
         try entries.append(allocator, .{
@@ -437,9 +450,12 @@ fn parseInitialScanEntry(io: std.Io, root: []const u8, entry: InitialScanEntry, 
     if (shouldSkipFile(entry.path)) return null;
     const dir = try std.Io.Dir.cwd().openDir(io, root, .{});
     defer dir.close(io);
-    const stat = try dir.statFile(io, entry.path, .{});
+    var real_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_root_len = try dir.realPathFile(io, ".", &real_root_buf);
+    const real_root = real_root_buf[0..real_root_len];
+    const stat = try path_security.statSafeFile(io, dir, real_root, entry.path);
     if (stat.size > 512 * 1024) return null;
-    const content = try dir.readFileAlloc(io, entry.path, arena_alloc, .limited(512 * 1024));
+    const content = try path_security.readFileAlloc(io, dir, real_root, entry.path, arena_alloc, .limited(512 * 1024));
     const check_len = @min(content.len, 512);
     for (content[0..check_len]) |c| {
         if (c == 0) return null;
@@ -536,9 +552,12 @@ fn readFileEntry(io: std.Io, root: []const u8, entry: InitialScanEntry, arena_al
     if (shouldSkipFile(entry.path)) return null;
     const dir = std.Io.Dir.cwd().openDir(io, root, .{}) catch return null;
     defer dir.close(io);
-    const stat = dir.statFile(io, entry.path, .{}) catch return null;
+    var real_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_root_len = dir.realPathFile(io, ".", &real_root_buf) catch return null;
+    const real_root = real_root_buf[0..real_root_len];
+    const stat = path_security.statSafeFile(io, dir, real_root, entry.path) catch return null;
     if (stat.size > 512 * 1024) return null;
-    const c = dir.readFileAlloc(io, entry.path, arena_alloc, .limited(512 * 1024)) catch return null;
+    const c = path_security.readFileAlloc(io, dir, real_root, entry.path, arena_alloc, .limited(512 * 1024)) catch return null;
     const check_len = @min(c.len, 512);
     for (c[0..check_len]) |ch| {
         if (ch == 0) return null;
@@ -860,9 +879,12 @@ pub fn initialScan(io: std.Io, store: *Store, explorer: *Explorer, root: []const
 /// Fast index: parse symbols/outline only, skip expensive word+trigram indexes.
 fn indexFileOutline(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: []const u8, allocator: std.mem.Allocator) !void {
     if (shouldSkipFile(path)) return;
-    const stat = try dir.statFile(io, path, .{});
+    var real_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_root_len = try dir.realPathFile(io, ".", &real_root_buf);
+    const real_root = real_root_buf[0..real_root_len];
+    const stat = try path_security.statSafeFile(io, dir, real_root, path);
     if (stat.size > 512 * 1024) return;
-    const content = try dir.readFileAlloc(io, path, allocator, .limited(512 * 1024));
+    const content = try path_security.readFileAlloc(io, dir, real_root, path, allocator, .limited(512 * 1024));
     defer allocator.free(content);
     const check_len = @min(content.len, 512);
     for (content[0..check_len]) |c| {
@@ -903,7 +925,7 @@ pub fn incrementalLoop(io: std.Io, store: *Store, explorer: *Explorer, queue: *E
         var walker = FilteredWalker.init(io, dir, tmp) catch return;
         defer walker.deinit();
         while (walker.next() catch null) |entry| {
-            const stat = dir.statFile(io, entry.path, .{}) catch continue;
+            const stat = path_security.statSafeFile(io, dir, walker.real_root, entry.path) catch continue;
             const mtime: i64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_ms));
             const duped = backing.dupe(u8, entry.path) catch continue;
             known.put(duped, .{ .mtime = mtime, .size = stat.size, .hash = 0, .seen = false }) catch backing.free(duped);
@@ -976,7 +998,7 @@ pub fn incrementalLoop(io: std.Io, store: *Store, explorer: *Explorer, queue: *E
             const max_trigram_files: usize = 15_000;
             var file_count: usize = 0;
             while (walker.next() catch null) |entry| {
-                const stat = dir.statFile(io, entry.path, .{}) catch continue;
+                const stat = path_security.statSafeFile(io, dir, walker.real_root, entry.path) catch continue;
                 _ = store.recordSnapshot(entry.path, stat.size, 0) catch {};
                 file_count += 1;
                 const effective_skip = file_count > max_trigram_files;
@@ -1004,7 +1026,10 @@ fn hashFile(io: std.Io, dir: std.Io.Dir, path: []const u8, size: u64) !u64 {
     // previously stored hash of 0, preventing a false "content unchanged" conclusion.
     if (shouldSkipFile(path)) return 0;
     if (size > 512 * 1024) return 0;
-    const file = dir.openFile(io, path, .{}) catch return std.math.maxInt(u64);
+    var real_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_root_len = dir.realPathFile(io, ".", &real_root_buf) catch return std.math.maxInt(u64);
+    const real_root = real_root_buf[0..real_root_len];
+    const file = path_security.openSafeFile(io, dir, real_root, path) catch return std.math.maxInt(u64);
     defer file.close(io);
 
     var hasher = std.hash.Wyhash.init(0);
@@ -1039,7 +1064,7 @@ fn incrementalDiff(io: std.Io, store: *Store, explorer: *Explorer, queue: *Event
     defer walker.deinit();
 
     while (try walker.next()) |entry| {
-        const stat = dir.statFile(io, entry.path, .{}) catch continue;
+        const stat = path_security.statSafeFile(io, dir, walker.real_root, entry.path) catch continue;
         const mtime: i64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_ms));
 
         if (known.getEntry(entry.path)) |known_entry| {
@@ -1111,11 +1136,12 @@ const skip_extensions = [_][]const u8{
 };
 
 fn shouldSkipFile(path: []const u8) bool {
+    if (!path_security.isPathSafe(path)) return true;
     for (skip_extensions) |ext| {
-        if (std.mem.endsWith(u8, path, ext)) return true;
+        if (path_security.endsWithIgnoreCase(path, ext)) return true;
     }
     // Skip dotfiles like .DS_Store, .gitignore etc at any depth
-    if (std.mem.endsWith(u8, path, ".DS_Store")) return true;
+    if (path_security.endsWithIgnoreCase(path, ".DS_Store")) return true;
     // Skip sensitive files (.env, credentials, keys) — same rules as snapshot filtering
     if (isSensitivePath(path)) return true;
     return false;
@@ -1125,58 +1151,23 @@ fn shouldSkipFile(path: []const u8) bool {
 /// Replicates the filter from snapshot.zig so live indexing and snapshots
 /// apply the same exclusion rules. Optimized: basename check + early exit.
 pub fn isSensitivePath(path: []const u8) bool {
-    const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
-    // Fast path: most source files have extensions like .zig, .ts, .py — none start with '.'
-    // or match sensitive patterns. Skip the full check for common cases.
-    if (basename.len == 0) return false;
-    const first = basename[0];
-    // Only check sensitive names if basename starts with '.', 'c', 's', 'i' or has key/cert extension
-    if (first != '.' and first != 'c' and first != 's' and first != 'i') {
-        // Still need to check extensions and directory patterns
-        if (std.mem.endsWith(u8, basename, ".pem") or
-            std.mem.endsWith(u8, basename, ".key") or
-            std.mem.endsWith(u8, basename, ".p12") or
-            std.mem.endsWith(u8, basename, ".pfx") or
-            std.mem.endsWith(u8, basename, ".jks")) return true;
-        if (std.mem.indexOf(u8, path, ".ssh/") != null or
-            std.mem.indexOf(u8, path, ".gnupg/") != null or
-            std.mem.indexOf(u8, path, ".aws/") != null) return true;
-        return false;
-    }
-    // .env, .env.<token>; do NOT match .envoy, .envrc, .environment, etc.
-    if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env") and
-        (basename.len == 4 or basename[4] == '.' or basename[4] == '-' or basename[4] == '_')) return true;
-    // Exact matches
-    const sensitive_names = [_][]const u8{
-        ".dev.vars",        ".npmrc",               ".pypirc",      ".netrc",
-        "credentials.json", "service-account.json", "secrets.json", "secrets.yaml",
-        "secrets.yml",      "id_rsa",               "id_ed25519",
-    };
-    for (sensitive_names) |name| {
-        if (std.mem.eql(u8, basename, name)) return true;
-    }
-    if (std.mem.endsWith(u8, basename, ".pem") or
-        std.mem.endsWith(u8, basename, ".key") or
-        std.mem.endsWith(u8, basename, ".p12") or
-        std.mem.endsWith(u8, basename, ".pfx") or
-        std.mem.endsWith(u8, basename, ".jks")) return true;
-    if (std.mem.indexOf(u8, path, ".ssh/") != null or
-        std.mem.indexOf(u8, path, ".gnupg/") != null or
-        std.mem.indexOf(u8, path, ".aws/") != null) return true;
-    return false;
+    return path_security.isSensitivePath(path);
 }
 
 fn indexFileContent(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: []const u8, allocator: std.mem.Allocator, skip_trigram: bool) !void {
     _ = allocator;
     if (shouldSkipFile(path)) return;
-    const stat = try dir.statFile(io, path, .{});
+    var real_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_root_len = try dir.realPathFile(io, ".", &real_root_buf);
+    const real_root = real_root_buf[0..real_root_len];
+    const stat = try path_security.statSafeFile(io, dir, real_root, path);
     // Skip files over 512KB (likely minified bundles or generated)
     if (stat.size > 512 * 1024) return;
     // Use page_allocator arena for content — pages returned to OS immediately
     // via munmap on deinit, eliminating GPA page retention from content churn.
     var content_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer content_arena.deinit();
-    const content = try dir.readFileAlloc(io, path, content_arena.allocator(), .limited(512 * 1024));
+    const content = try path_security.readFileAlloc(io, dir, real_root, path, content_arena.allocator(), .limited(512 * 1024));
     // Skip binary content (check first 512 bytes for null bytes)
     const check_len = @min(content.len, 512);
     for (content[0..check_len]) |c| {
@@ -1219,20 +1210,26 @@ fn drainNotifyFile(io: std.Io, store: *Store, explorer: *Explorer, queue: *Event
     // Re-index each notified path
     const dir = std.Io.Dir.cwd().openDir(io, root, .{}) catch return;
     defer dir.close(io);
+    var real_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_root_len = dir.realPathFile(io, ".", &real_root_buf) catch return;
+    const real_root = real_root_buf[0..real_root_len];
 
     var lines = std.mem.splitScalar(u8, data_slice, '\n');
     while (lines.next()) |line| {
         const path = std.mem.trim(u8, line, " \t\r");
         if (path.len == 0) continue;
 
-        // Make path relative to root if it's absolute
-        const rel = if (std.mem.startsWith(u8, path, root))
-            std.mem.trimStart(u8, path[root.len..], "/")
-        else
-            path;
+        // Make path relative to the canonical root if it is absolute.
+        const rel = if (path[0] == '/') blk: {
+            var real_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const real_path_len = std.Io.Dir.realPathFileAbsolute(io, path, &real_path_buf) catch continue;
+            const real_path = real_path_buf[0..real_path_len];
+            break :blk path_security.relativeFromRealRoot(real_path, real_root) orelse continue;
+        } else path;
+        if (!path_security.isPathSafe(rel) or path_security.isSensitivePath(rel)) continue;
 
         // Skip re-indexing if file hasn't changed since last known state (#228)
-        const stat = dir.statFile(io, rel, .{}) catch continue;
+        const stat = path_security.statSafeFile(io, dir, real_root, rel) catch continue;
         const mtime: i64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_ms));
         if (known.getPtr(rel)) |existing| {
             if (existing.mtime == mtime and existing.size == stat.size) continue;

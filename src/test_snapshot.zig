@@ -128,17 +128,16 @@ test "issue-44: snapshot stale after working tree changes cause stale query resu
 
     const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/test.snapshot", .{dir_path});
     defer testing.allocator.free(snap_path);
-    const file_abs = try std.fmt.allocPrint(testing.allocator, "{s}/stale.zig", .{dir_path});
-    defer testing.allocator.free(file_abs);
-
     // Step 1: write file with old content, index it, write snapshot.
     try tmp.dir.writeFile(io, .{ .sub_path = "stale.zig", .data = "pub fn oldFunc() void {}" });
     {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         var exp = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
-        try exp.indexFile(file_abs, "pub fn oldFunc() void {}");
-        try snapshot_mod.writeSnapshot(io, &exp, ".", snap_path, arena.allocator());
+        defer exp.deinit();
+        exp.setRoot(io, dir_path);
+        try exp.indexFile("stale.zig", "pub fn oldFunc() void {}");
+        try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, arena.allocator());
     }
 
     // Step 2: modify file AFTER snapshot creation (simulating uncommitted working tree change).
@@ -153,6 +152,8 @@ test "issue-44: snapshot stale after working tree changes cause stale query resu
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     var exp2 = Explorer.init(arena2.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    exp2.setRoot(io, dir_path);
     var store2 = Store.init(testing.allocator);
     defer store2.deinit();
 
@@ -711,4 +712,3 @@ test "issue-379: snapshot loader returns true with zero outlines for empty-explo
         try testing.expect(exp2.outlines.count() > 0);
     }
 }
-

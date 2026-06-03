@@ -4,6 +4,7 @@ const AgentRegistry = @import("agent.zig").AgentRegistry;
 const AgentId = @import("agent.zig").AgentId;
 const Explorer = @import("explore.zig").Explorer;
 const Op = @import("version.zig").Op;
+const path_security = @import("path_security.zig");
 
 pub const EditRequest = struct {
     path: []const u8,
@@ -38,6 +39,8 @@ pub fn applyEdit(
     if (!has_lock) return error.FileLocked;
     errdefer agents.releaseLock(req.agent_id, req.path);
 
+    if (!path_security.isPathSafe(req.path) or path_security.isSensitivePath(req.path)) return error.AccessDenied;
+
     // Validate required op-specific args BEFORE doing any work that
     // mutates Store.seq or rewrites the file (#401).
     switch (req.op) {
@@ -46,8 +49,12 @@ pub fn applyEdit(
         else => {},
     }
     const edit_dir = if (explorer) |exp| exp.root_dir orelse std.Io.Dir.cwd() else std.Io.Dir.cwd();
+    const root_real: []const u8 = if (explorer) |exp| exp.root_real else &.{};
 
-    const source = try edit_dir.readFileAlloc(io, req.path, allocator, .limited(10 * 1024 * 1024));
+    const source = if (root_real.len > 0)
+        try path_security.readFileAlloc(io, edit_dir, root_real, req.path, allocator, .limited(10 * 1024 * 1024))
+    else
+        try edit_dir.readFileAlloc(io, req.path, allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(source);
 
     if (req.if_hash) |expected_hex| {
@@ -92,19 +99,7 @@ pub fn applyEdit(
                 };
             }
 
-            const tmp_path = try std.fmt.allocPrint(allocator, "{s}.codedb_tmp", .{req.path});
-            defer allocator.free(tmp_path);
-
-            {
-                const tmp_file = try edit_dir.createFile(io, tmp_path, .{});
-                defer tmp_file.close(io);
-                try tmp_file.writeStreamingAll(io, fast_result);
-            }
-
-            std.Io.Dir.rename(edit_dir, tmp_path, edit_dir, req.path, io) catch |err| {
-                edit_dir.deleteFile(io, tmp_path) catch {};
-                return err;
-            };
+            try writeAtomic(io, edit_dir, req.path, fast_result);
 
             const seq = try store.recordEdit(req.path, req.agent_id, req.op, hash, fast_result.len, req.content);
             if (explorer) |exp| {
@@ -212,21 +207,7 @@ pub fn applyEdit(
         };
     }
 
-    // Atomic write: write to temp file then rename to prevent corruption on crash
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.codedb_tmp", .{req.path});
-    defer allocator.free(tmp_path);
-
-    {
-        const tmp_file = try edit_dir.createFile(io, tmp_path, .{});
-        defer tmp_file.close(io);
-        try tmp_file.writeStreamingAll(io, result);
-    }
-
-    std.Io.Dir.rename(edit_dir, tmp_path, edit_dir, req.path, io) catch |err| {
-        // Clean up temp file on rename failure
-        edit_dir.deleteFile(io, tmp_path) catch {};
-        return err;
-    };
+    try writeAtomic(io, edit_dir, req.path, result);
 
     // KNOWN LIMITATION: if recordEdit fails here, the file is already on disk but not
     // in the store. This leaves the disk and store inconsistent. Recovery would require
@@ -243,6 +224,15 @@ pub fn applyEdit(
         .new_hash = hash,
         .new_size = result.len,
     };
+}
+
+fn writeAtomic(io: std.Io, dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
+    var atomic_file = try dir.createFileAtomic(io, path, .{
+        .replace = true,
+    });
+    defer atomic_file.deinit(io);
+    try atomic_file.file.writeStreamingAll(io, content);
+    try atomic_file.replace(io);
 }
 
 fn fileLineCount(source: []const u8) usize {
