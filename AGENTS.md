@@ -8,7 +8,7 @@
 - Flag any regression in benchmark-critical paths (threshold: 10%)
 - Treat P1 issues as merge-blocking
 - Verify new language parsers handle malformed input gracefully (braces in strings, unterminated comments)
-- Check that installer scripts don't execute untrusted code or skip verification
+- Keep codedb source-build only. Do not add curl, npm/npx, release-binary, or remote installer flows.
 
 ## Pre-merge verification
 
@@ -31,4 +31,4 @@ python3 scripts/e2e_mcp_test.py \
 - `src/watcher.zig` — file indexing skip lists (secrets must be excluded)
 - `src/mcp.zig` — file read/search (path traversal, scope boundaries)
 - `src/snapshot.zig` — sensitive file filtering
-- `install/install.sh` — binary download and config modification
+- `src/update.zig` — update command must stay disabled for source-build workflow

@@ -71,7 +71,7 @@ Already supported by the arg parser (`main.zig` L100–103):
 `codedb /path/to/project mcp` sets `root = args[1]`.
 
 Action: document this as the required invocation for Cursor/Windsurf and
-update the MCP registration examples in README and installer output.
+update the MCP registration examples in README and docs.
 
 MCP config example:
 ```json

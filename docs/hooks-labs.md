@@ -1,12 +1,12 @@
 # codedb Hooks Labs
 
-codedb does not have its own hook runtime. It installs an MCP server, and Codex
-or Claude Code can run hooks around MCP tool calls. Use hooks for local policy,
-logging, and guardrails around calls such as `codedb_remote`; do not use them as
-the only security boundary.
+codedb does not have its own hook runtime. It runs as a locally built MCP
+server, and Codex or Claude Code can run hooks around MCP tool calls. Use hooks
+for local policy, logging, and guardrails around calls such as `codedb_remote`;
+do not use them as the only security boundary.
 
-The installer registers the MCP server. Hook configuration is separate because
-hooks execute arbitrary commands with your user permissions.
+Register the locally built MCP server yourself. Hook configuration is separate
+because hooks execute arbitrary commands with your user permissions.
 
 ## Lab 1: Codex Hooks
 

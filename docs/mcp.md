@@ -10,32 +10,37 @@ scan, and the most common failure modes.
 
 ---
 
-## 1. Quick install (auto-configures all detected clients)
+## 1. Build codedb
 
 ```bash
-curl -fsSL https://codedb.codegraff.com/install.sh | bash
+git clone https://github.com/justrach/codedb.git
+cd codedb
+zig build -Doptimize=ReleaseFast
 ```
 
-The installer downloads the binary for your platform, drops it in
-`~/.local/bin/` (or `/usr/local/bin/` on root installs), and auto-registers
-codedb as an MCP server in every client it can find — Claude Code, Codex,
-Gemini CLI, Cursor, opencode. It prints the exact `codedb mcp` command it
-registered.
+Use the built binary at `zig-out/bin/codedb`, or create a local symlink/copy:
 
-If you prefer to wire it up by hand, the client-specific snippets below
-all work directly.
+```bash
+mkdir -p ~/.local/bin
+ln -sf "$PWD/zig-out/bin/codedb" ~/.local/bin/codedb
+```
+
+codedb is source-build only. There is no hosted installer, package-manager
+launcher, prebuilt artifact fetch, or client auto-registration flow. Wire each
+client to the local binary you built.
 
 ---
 
 ## 2. Client-specific configuration
 
 All clients launch `codedb mcp` as a stdio child process. Replace
-`/usr/local/bin/codedb` with `which codedb` output on your system.
+`/Users/me/code/codedb/zig-out/bin/codedb` with your built binary path or
+with `which codedb` if you created a local symlink/copy.
 
 ### Claude Code
 
 ```bash
-claude mcp add codedb -s user -- /usr/local/bin/codedb mcp
+claude mcp add codedb -s user -- /Users/me/code/codedb/zig-out/bin/codedb mcp
 ```
 
 Or edit `~/.claude.json` directly:
@@ -44,7 +49,7 @@ Or edit `~/.claude.json` directly:
 {
   "mcpServers": {
     "codedb": {
-      "command": "/usr/local/bin/codedb",
+      "command": "/Users/me/code/codedb/zig-out/bin/codedb",
       "args": ["mcp"]
     }
   }
@@ -62,7 +67,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`
 {
   "mcpServers": {
     "codedb": {
-      "command": "/usr/local/bin/codedb",
+      "command": "/Users/me/code/codedb/zig-out/bin/codedb",
       "args": ["mcp"]
     }
   }
@@ -80,7 +85,7 @@ Edit `~/.cursor/mcp.json` (per-user) or `<project>/.cursor/mcp.json`
 {
   "mcpServers": {
     "codedb": {
-      "command": "/usr/local/bin/codedb",
+      "command": "/Users/me/code/codedb/zig-out/bin/codedb",
       "args": ["mcp"]
     }
   }
@@ -98,7 +103,7 @@ Same `mcpServers` block as Cursor, scoped to whichever extension you use.
 ### Codex CLI
 
 ```bash
-codex mcp add codedb -- /usr/local/bin/codedb mcp
+codex mcp add codedb -- /Users/me/code/codedb/zig-out/bin/codedb mcp
 ```
 
 ### Gemini CLI / opencode
@@ -110,7 +115,7 @@ Both read MCP configuration from `~/.gemini/mcp.json` (Gemini) and
 {
   "mcpServers": {
     "codedb": {
-      "command": "/usr/local/bin/codedb",
+      "command": "/Users/me/code/codedb/zig-out/bin/codedb",
       "args": ["mcp"]
     }
   }
@@ -174,11 +179,11 @@ testing.
 
 ---
 
-## 5. Verifying the install
+## 5. Verifying the build
 
 ```bash
-codedb --version          # codedb 0.2.5815 (or later)
-codedb status             # one-line: indexed file count + scan phase
+zig-out/bin/codedb --version
+zig-out/bin/codedb status
 ```
 
 In a client, the simplest tool to smoke-test is `codedb_status` — it
@@ -200,15 +205,15 @@ call, or restart the client from inside the project directory.
 
 ### `codedb_find` returns `missing 'query'`
 
-Fixed in v0.2.5815 — `codedb_find` now accepts `query`, `name`, `path`,
-`pattern`, and `q` as aliases. If you're still seeing this error,
-`codedb --version` will show < 0.2.5815; rerun the installer.
+`codedb_find` accepts `query`, `name`, `path`, `pattern`, and `q` as aliases.
+If you're still seeing this error, rebuild from the latest source and verify
+the client points at the rebuilt binary.
 
 ### Tools list looks short / `codedb_context` is missing
 
-`codedb_context` was added in **v0.2.5815**. Older binaries expose only
-20 tools. Upgrade with `codedb update` (or the installer one-liner above)
-and verify with `codedb --version`.
+`codedb_context` requires a current source build. Rebuild with
+`zig build -Doptimize=ReleaseFast` and verify the client points at the rebuilt
+binary.
 
 ### Snapshot indexer keeps re-scanning
 
@@ -219,24 +224,11 @@ back-to-back saves can extend the scan phase. Check `codedb status` —
 
 ### Permission errors on macOS
 
-The first time you run a fresh codedb binary on macOS, Gatekeeper may
-quarantine it. Apple Silicon release binaries from v0.2.5811+ are signed
-with a Developer ID and notarized via Apple — verify with:
+The first time you run a locally built codedb binary on macOS, Gatekeeper may
+quarantine it. If needed, codesign the binary locally:
 
 ```bash
-spctl -a -vv -t install /usr/local/bin/codedb
-# expected: accepted, source=Notarized Developer ID
-```
-
-The Intel `codedb-darwin-x86_64` release slice is temporarily unsigned.
-Signed Zig 0.16 x86_64-macos binaries can segfault on macOS 26 and under
-Rosetta after codesign, so the release workflow leaves that artifact
-unsigned and relies on the published SHA256 checksum instead.
-
-If you built from source on Apple Silicon, codesign the binary locally:
-
-```bash
-codesign --force --sign - /usr/local/bin/codedb
+codesign --force --sign - zig-out/bin/codedb
 ```
 
 Avoid codesigning locally built x86_64-macos binaries on macOS 26 until
@@ -248,10 +240,8 @@ macOS caches codesignatures by path. After replacing the binary,
 re-codesign Apple Silicon builds or the MCP server may fail to launch:
 
 ```bash
-codesign --force --sign - /usr/local/bin/codedb
+codesign --force --sign - zig-out/bin/codedb
 ```
-
-The installer does this for you.
 
 ---
 

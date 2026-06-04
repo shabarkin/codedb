@@ -250,11 +250,12 @@ fn mainImpl() !void {
             }
             if (!isValidMcpFlag(a)) {
                 out.p("{s}\xe2\x9c\x97{s} unknown flag for {s}mcp{s}: {s}{s}{s}\n  valid: {s}--help{s}, {s}--config-file=<path>{s}\n", .{
-                    s.red,  s.reset,
-                    s.bold, s.reset,
-                    s.bold, a,      s.reset,
-                    s.bold, s.reset,
-                    s.bold, s.reset,
+                    s.red,   s.reset,
+                    s.bold,  s.reset,
+                    s.bold,  a,
+                    s.reset, s.bold,
+                    s.reset, s.bold,
+                    s.reset,
                 });
                 out.exitWithFlush(1);
             }
@@ -666,7 +667,7 @@ fn mainImpl() !void {
             for (results) |r| {
                 if (paths_only) {
                     out.p("  {s}{s}{s}:{s}{d}{s}\n", .{
-                        s.cyan, r.path, s.reset,
+                        s.cyan, r.path,     s.reset,
                         s.dim,  r.line_num, s.reset,
                     });
                 } else {
@@ -812,11 +813,11 @@ fn mainImpl() !void {
             const unbounded = end == std.math.maxInt(u32);
             if (unbounded) {
                 out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  L{d}-EOF  {s}{s}{s}\n", .{
-                    s.green,                       s.reset,
-                    s.bold,                        path,
-                    s.reset,                       s.langColor(@tagName(lang)),
-                    @tagName(lang),                s.reset,
-                    start,                         sty.durationColor(s, elapsed),
+                    s.green,                               s.reset,
+                    s.bold,                                path,
+                    s.reset,                               s.langColor(@tagName(lang)),
+                    @tagName(lang),                        s.reset,
+                    start,                                 sty.durationColor(s, elapsed),
                     sty.formatDuration(&dur_buf, elapsed), s.reset,
                 });
             } else {
@@ -897,7 +898,10 @@ fn mainImpl() !void {
         } else if (std.mem.eql(u8, op, "search") or std.mem.eql(u8, op, "search-fmt")) {
             const warm = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
             defer {
-                for (warm) |r| { allocator.free(r.path); allocator.free(r.line_text); }
+                for (warm) |r| {
+                    allocator.free(r.path);
+                    allocator.free(r.line_text);
+                }
                 allocator.free(warm);
             }
         }
@@ -937,13 +941,19 @@ fn mainImpl() !void {
             } else if (std.mem.eql(u8, op, "search")) {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
-                for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                for (r) |item| {
+                    allocator.free(item.path);
+                    allocator.free(item.line_text);
+                }
                 allocator.free(r);
             } else if (std.mem.eql(u8, op, "search-fmt")) {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
                 defer {
-                    for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                    for (r) |item| {
+                        allocator.free(item.path);
+                        allocator.free(item.line_text);
+                    }
                     allocator.free(r);
                 }
                 var scratch: std.ArrayList(u8) = .empty;
@@ -961,7 +971,10 @@ fn mainImpl() !void {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
                 defer {
-                    for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                    for (r) |item| {
+                        allocator.free(item.path);
+                        allocator.free(item.line_text);
+                    }
                     allocator.free(r);
                 }
                 var seen = std.StringHashMap(void).init(allocator);
@@ -1515,7 +1528,7 @@ fn printUsage(out: *Out, s: sty.Style) void {
         \\    {s}serve{s}                     HTTP daemon on :7719
         \\    {s}mcp{s}                       JSON-RPC/MCP server over stdio
         \\    {s}update{s}                    disabled; rebuild from source with zig build
-        \\    {s}nuke{s}                      uninstall codedb, clear caches, and deregister integrations
+        \\    {s}nuke{s}                      clear caches/snapshots and deregister integrations
         \\
     , .{
         s.cyan, s.reset,

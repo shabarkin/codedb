@@ -3,7 +3,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/justrach/codedb/releases/latest"><img src="https://img.shields.io/github/v/release/justrach/codedb?style=flat-square&label=version" alt="Release" /></a>
   <a href="https://github.com/justrach/codedb/blob/main/LICENSE"><img src="https://img.shields.io/github/license/justrach/codedb?style=flat-square" alt="License" /></a>
   <img src="https://img.shields.io/badge/zig-0.16-f7a41d?style=flat-square" alt="Zig 0.16" />
   <img src="https://img.shields.io/badge/status-alpha-orange?style=flat-square" alt="Alpha" />
@@ -22,7 +21,7 @@
 
 <p align="center">
   <a href="#-status">Status</a> ·
-  <a href="#-install">Install</a> ·
+  <a href="#-build">Build</a> ·
   <a href="#-quick-start">Quick Start</a> ·
   <a href="#-mcp-tools">MCP Tools</a> ·
   <a href="#-benchmarks">Benchmarks</a> ·
@@ -53,62 +52,41 @@
 | Structural outlines (functions, structs, imports)      | mmap-backed trigram index                |
 | Reverse dependency graph                               |                                          |
 | Atomic line-range edits with version tracking          |                                          |
-| Auto-registration in Claude, Codex, Gemini, Cursor     |                                          |
 | Polling file watcher with filtered directory walker    |                                          |
 | Portable snapshot for instant MCP startup              |                                          |
 | Singleton MCP with PID lock + 1h idle timeout          |                                          |
 | Sensitive file blocking (.env, credentials, keys)      |                                          |
-| Codesigned macOS ARM64 binary; Intel slice temporarily unsigned |                                          |
-| SHA256 checksum verification in installer              |                                          |
 | Cross-platform: macOS (ARM/x86), Linux (ARM/x86)      |                                          |
 
 ---
 
-## ⚡ Install
+## ⚡ Build
+
+codedb is source-build only. There is no curl, npm, npx, or release-binary installer path.
+
+**Requirements:** Zig 0.16+
 
 ```bash
-curl -fsSL https://codedb.codegraff.com/install.sh | bash
+git clone https://github.com/justrach/codedb.git
+cd codedb
+zig build -Doptimize=ReleaseFast
 ```
 
-Downloads the binary for your platform and auto-registers codedb as an MCP server in **Claude Code**, **Codex**, **Gemini CLI**, and **Cursor**. The installer prints the exact `codedb mcp` command it registered plus hook setup pointers for Codex and Claude Code.
+Binary: `zig-out/bin/codedb`
 
-### Or via npm/npx (zero-install for MCP clients)
+Optionally copy or symlink the built binary into a directory on your `PATH`:
 
 ```bash
-npx -y codedeebee mcp
+mkdir -p ~/.local/bin
+ln -sf "$PWD/zig-out/bin/codedb" ~/.local/bin/codedb
 ```
 
-Or install globally:
+When updating codedb, pull the source tree and rebuild:
 
 ```bash
-npm install -g codedeebee
-codedb mcp
+git pull
+zig build -Doptimize=ReleaseFast
 ```
-
-The npm package is named [`codedeebee`](https://www.npmjs.com/package/codedeebee) (the bare `codedb` name is restricted on npm); it ships a thin launcher that downloads the matching native binary from GitHub Releases on `postinstall` and verifies the SHA256 checksum. The installed CLI is still called `codedb`.
-
-Useful for MCP clients (Claude Code, Cursor, opencode, Claude Desktop) that already use `npx`:
-
-```json
-{
-  "codedb": {
-    "type": "local",
-    "command": ["npx", "-y", "codedeebee"],
-    "args": ["mcp"],
-    "enabled": true
-  }
-}
-```
-
-### Updating or repairing an older install
-
-If `codedb update` fails on an older release, rerun the installer:
-
-```bash
-curl -fsSL https://codedb.codegraff.com/install.sh | bash
-```
-
-This replaces the `codedb` binary with the latest GitHub Release and keeps your existing MCP registrations, config, caches, and snapshots. Use this path for any release whose built-in updater cannot fetch release checksums.
 
 ## Documentation
 
@@ -118,44 +96,32 @@ This replaces the `codedb` binary with the latest GitHub Release and keeps your 
 - **[Architecture](docs/architecture.md)** — engine internals, index layout
 - **[Benchmarks](docs/benchmarks.md)** — micro-benchmarks + agentic-eval results vs codegraph, FTS5, lean-ctx
 
-| Platform | Binary | Signed |
-|----------|--------|--------|
-| macOS ARM64 (Apple Silicon) | `codedb-darwin-arm64` | ✅ codesigned + notarized |
-| macOS x86_64 (Intel) | `codedb-darwin-x86_64` | temporarily unsigned |
-| Linux ARM64 | `codedb-linux-arm64` | — |
-| Linux x86_64 | `codedb-linux-x86_64` | — |
-
-Or install manually from [GitHub Releases](https://github.com/justrach/codedb/releases/latest).
-
----
-
 ## ⚡ Quick Start
 
 ### As an MCP server (recommended)
 
-After installing, codedb is automatically registered. Just open a project and the 21 MCP tools are available to your AI agent.
+Build codedb, then point your MCP client at the local binary.
 
 ```bash
-# Manual MCP start (auto-configured by install script)
-codedb mcp /path/to/your/project
+zig-out/bin/codedb mcp /path/to/your/project
 ```
 
 ### As an HTTP server
 
 ```bash
-codedb serve /path/to/your/project
+zig-out/bin/codedb serve /path/to/your/project
 # listening on localhost:7719
 ```
 
 ### CLI
 
 ```bash
-codedb tree /path/to/project          # file tree with symbol counts
-codedb outline src/main.zig           # symbols in a file
-codedb find AgentRegistry             # find symbol definitions
-codedb search "handleAuth"            # full-text search (trigram-accelerated)
-codedb word Store                     # exact word lookup (inverted index, O(1))
-codedb hot                            # recently modified files
+zig-out/bin/codedb tree /path/to/project          # file tree with symbol counts
+zig-out/bin/codedb outline src/main.zig           # symbols in a file
+zig-out/bin/codedb find AgentRegistry             # find symbol definitions
+zig-out/bin/codedb search "handleAuth"            # full-text search (trigram-accelerated)
+zig-out/bin/codedb word Store                     # exact word lookup (inverted index, O(1))
+zig-out/bin/codedb hot                            # recently modified files
 ```
 
 ---
@@ -239,8 +205,8 @@ For Codex and Claude Code hook examples around `codedb_remote`, see [`docs/hooks
 | `codedb snapshot` | Write codedb.snapshot to project root |
 | `codedb serve` | HTTP daemon on :7719 |
 | `codedb mcp [path]` | JSON-RPC/MCP server over stdio |
-| `codedb update` | Self-update to the latest release; if it fails on an older build, rerun the curl installer above |
-| `codedb nuke` | Uninstall codedb, remove caches/snapshots, and deregister MCP integrations |
+| `codedb update` | Disabled for source-build workflow; rebuild with `zig build` |
+| `codedb nuke` | Remove caches/snapshots and deregister MCP integrations |
 | `codedb --version` | Print version |
 
 ### Example: agent explores a codebase
@@ -434,8 +400,8 @@ codedb does not collect usage analytics or send source code, file contents, file
 **Not stored:** Sensitive files are auto-excluded (`.env*`, `credentials.json`, `secrets.*`, `.pem`, `.key`, SSH keys, AWS configs).
 
 ```bash
-codedb nuke                # uninstall binary, clear caches/snapshots, remove MCP registrations
-rm -rf ~/.codedb/          # cache-only cleanup if you want to keep the binary installed
+codedb nuke                # clear caches/snapshots and remove MCP registrations
+rm -rf ~/.codedb/          # cache-only cleanup
 rm -f codedb.snapshot      # remove snapshot from current project only
 ```
 
@@ -466,10 +432,7 @@ zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos
 
 ### Releasing
 
-```bash
-./release.sh 0.2.0              # build, codesign, notarize, upload to GitHub Releases
-./release.sh 0.2.0 --dry-run    # preview without executing
-```
+There is no release-binary publishing flow. Consumers build from source.
 
 ---
 

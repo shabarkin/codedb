@@ -17,7 +17,6 @@ const NukeStats = struct {
     killed_processes: usize = 0,
     snapshots_removed: usize = 0,
     integrations_removed: usize = 0,
-    binaries_removed: usize = 0,
     removed_data_dir: bool = false,
 };
 
@@ -46,10 +45,8 @@ pub fn run(io: std.Io, stdout: cio.File, s: sty.Style, allocator: std.mem.Alloca
         stats.snapshots_removed += 1;
     }
 
-    stats.binaries_removed = removeInstalledBinaries(io, home, self_exe);
-
     const codedb_dir = std.fmt.allocPrint(allocator, "{s}/.codedb", .{home}) catch {
-        out.p("{s}\xe2\x9c\x97{s} failed to allocate uninstall paths\n", .{ s.red, s.reset });
+        out.p("{s}\xe2\x9c\x97{s} failed to allocate cleanup paths\n", .{ s.red, s.reset });
         std.process.exit(1);
     };
     defer allocator.free(codedb_dir);
@@ -64,11 +61,10 @@ pub fn run(io: std.Io, stdout: cio.File, s: sty.Style, allocator: std.mem.Alloca
         stats.removed_data_dir = true;
     } else |_| {}
 
-    out.p("{s}\xe2\x9c\x93{s} nuked codedb installation\n", .{ s.green, s.reset });
+    out.p("{s}\xe2\x9c\x93{s} nuked codedb local state\n", .{ s.green, s.reset });
     out.p("  removed data dir      {s}{s}{s}\n", .{ s.dim, codedb_dir, s.reset });
     out.p("  removed snapshots     {d}\n", .{stats.snapshots_removed});
     out.p("  deregistered tools    {d}\n", .{stats.integrations_removed});
-    out.p("  removed binaries      {d}\n", .{stats.binaries_removed});
     out.p("  terminated processes  {d}\n", .{stats.killed_processes});
     out.p("\n  to rebuild: {s}zig build{s}\n", .{ s.cyan, s.reset });
 }
@@ -196,28 +192,6 @@ fn deregisterInstalledIntegrations(io: std.Io, allocator: std.mem.Allocator, hom
     return removed;
 }
 
-fn removeInstalledBinaries(io: std.Io, home: []const u8, self_exe: ?[]const u8) usize {
-    var removed: usize = 0;
-
-    if (self_exe) |path| {
-        if (deleteFileIfExists(io, path)) removed += 1;
-    }
-
-    var home_bin_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const home_bin = std.fmt.bufPrint(&home_bin_buf, "{s}/bin/codedb", .{home}) catch return removed;
-    if (self_exe == null or !std.mem.eql(u8, self_exe.?, home_bin)) {
-        if (deleteFileIfExists(io, home_bin)) removed += 1;
-    }
-
-    var home_bin_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const home_bin_exe = std.fmt.bufPrint(&home_bin_exe_buf, "{s}/bin/codedb.exe", .{home}) catch return removed;
-    if ((self_exe == null or !std.mem.eql(u8, self_exe.?, home_bin_exe)) and !std.mem.eql(u8, home_bin, home_bin_exe)) {
-        if (deleteFileIfExists(io, home_bin_exe)) removed += 1;
-    }
-
-    return removed;
-}
-
 fn deleteFileIfExists(io: std.Io, path: []const u8) bool {
     std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
         error.FileNotFound => return false,
@@ -274,7 +248,6 @@ fn rewriteConfigFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
     }
     try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
 }
-
 
 pub fn removeJsonMcpServerEntry(allocator: std.mem.Allocator, content: []const u8, server_name: []const u8) !?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;

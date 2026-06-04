@@ -41,8 +41,7 @@ releases catch this exact client-wrapper failure mode.
 
 ### Release metadata
 
-- `src/release_info.zig`, `build.zig.zon`, and `npm/package.json` are aligned
-  on `0.2.5823`.
+- `src/release_info.zig` and `build.zig.zon` are aligned on `0.2.5823`.
 
 ### Validation
 
@@ -122,8 +121,7 @@ unsigned until the Zig/Mach-O signing issue is resolved.
 
 ### Release metadata
 
-- `src/release_info.zig`, `build.zig.zon`, and `npm/package.json` are aligned
-  on `0.2.5822`, so the native binary and `codedeebee` package metadata agree.
+- `src/release_info.zig` and `build.zig.zon` are aligned on `0.2.5822`.
 
 ### Validation
 
@@ -172,11 +170,7 @@ Bundle of seven fixes from the open-issue triage on 2026-05-28.
 
 ### Distribution
 
-- **#501 — npm/npx distribution.** Published [`codedeebee`](https://www.npmjs.com/package/codedeebee) as the npx-friendly sibling of `codedb`. `npx -y codedeebee mcp` does a one-shot install: thin Node launcher + `postinstall` that downloads the matching native binary from this GitHub release and SHA256-verifies against `checksums.sha256`. The bare `codedb` name is restricted on npm; the package is `codedeebee` but the CLI it installs is still called `codedb`.
-
-### Installer
-
-- **Hook-priority race.** `install/install.sh` now detects competing legacy-tools hooks (`block-legacy-tools.sh`, muonry, zigrep, zigread) and inserts codedb's hook at index 0 instead of appending. Re-runs reshuffle an already-registered codedb hook to the front if a competitor has appeared since the previous install.
+- Historical remote distribution notes were removed after codedb became source-build only.
 
 
 ## 0.2.5813 - 2026-05-12
@@ -488,13 +482,7 @@ The `received keys: [...]` diagnostic that landed in [#357](https://github.com/j
 
 ## 0.2.56 - 2026-04-09
 
-`0.2.56` is a release hotfix for the installer and self-update path after the manual `0.2.55` release.
-
-### Hotfixes
-
-- The install script now resolves the latest version from GitHub Releases first, then falls back to `codedb.codegraff.com/latest.json` only if GitHub is unavailable.
-- `codedb update` now uses the same GitHub-first version lookup, avoiding stale release metadata during post-release propagation windows.
-- The install worker lowers `/latest.json` cache lifetime from 5 minutes to 1 minute and updates its fallback version to `0.2.56`.
+`0.2.56` was a distribution hotfix from the pre-source-build-only era. The remote installer and self-update details are no longer applicable.
 
 ## 0.2.55 - 2026-04-09
 
@@ -564,12 +552,9 @@ Warm RSS is materially lower because reopen no longer reconstructs the same larg
 - WAL profiling now records latency and file-access patterns locally, and hashed telemetry upload preserves aggregation value without sending raw queries or file paths off-machine.
 - `codedb_status` now reports client identity and index-memory diagnostics so MCP clients can see which kind of index is active and how much memory it is retaining.
 
-### Installer, Update, And Release Reliability
+### Distribution Reliability
 
-- `codedb update` now downloads binaries directly from GitHub Releases instead of depending on the old CDN path.
-- The install script now downloads release binaries from GitHub Releases as well.
-- The `nuke` output now points at the correct install URL.
-- Installer shell docs and checksum fallback behavior were tightened so release/install flows fail more predictably.
+- Historical remote installer and self-update notes were removed after codedb became source-build only.
 
 ### Parser And Correctness Fixes
 

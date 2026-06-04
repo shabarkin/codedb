@@ -78,8 +78,8 @@ formatting from a Zig `backend/`).
 
 Claude Code and Gemini CLI both support **skills** — named bundles of
 instructions that the agent can invoke explicitly (`/skill <name>`) or
-that fire on matching prompts. codedb provides `/codedb-troubleshooting`
-and `/codedb-bench` skills when installed via the official installer.
+that fire on matching prompts. codedb does not install skills automatically;
+copy any local skill files into the agent-specific skills directory yourself.
 
 A skill lives under `~/.claude/skills/<name>/SKILL.md` (Claude Code) or
 `~/.gemini/skills/<name>/SKILL.md` (Gemini). Same shape as a profile

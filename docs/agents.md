@@ -2,7 +2,9 @@
 
 ## Project
 
-Zig 0.16.x code intelligence server. Tests live in the split `src/test_*.zig` files listed in `build.zig`. Build and test with `zig build test`.
+Zig 0.16.x code intelligence server. codedb is source-build only: contributors and users build the local binary with `zig build`; do not add remote binary installers, curl installers, npm/npx launchers, or release-download update paths.
+
+Tests live in the split `src/test_*.zig` files listed in `build.zig`. Build and test with `zig build test`.
 
 ## Rules
 
@@ -36,3 +38,10 @@ If you cannot write a failing test, the issue is not well-defined enough to file
 - No comments or documentation changes unless explicitly asked
 - Prefer minimal, targeted fixes over refactors
 - Follow existing patterns in the module you're editing
+
+### Distribution
+
+- Build locally with `zig build` or `zig build -Doptimize=ReleaseFast`
+- MCP docs should point clients at `zig-out/bin/codedb` or a user-created local symlink/copy
+- `codedb update` must remain disabled and tell users to rebuild from source
+- Do not restore deleted installer or npm package surfaces
