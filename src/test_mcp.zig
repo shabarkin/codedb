@@ -1792,3 +1792,34 @@ test "issue-516: codedb_search response discloses when max_results was clamped" 
         std.mem.indexOf(u8, out.items, "clamp") != null or
         std.mem.indexOf(u8, out.items, "more match") != null);
 }
+
+test "issue-XX: codedb_glob list cut at max_results carries a truncation marker" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn a() void {}\n");
+    try explorer.indexFile("src/b.zig", "pub fn b() void {}\n");
+    try explorer.indexFile("src/c.zig", "pub fn c() void {}\n");
+    try explorer.indexFile("src/d.zig", "pub fn d() void {}\n");
+    try explorer.indexFile("src/e.zig", "pub fn e() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"pattern":"src/*.zig","max_results":3}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_glob, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "more") != null);
+}
