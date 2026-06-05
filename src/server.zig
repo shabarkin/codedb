@@ -126,17 +126,29 @@ const HandlerCtx = struct {
 };
 
 fn loadOrCreateAuthToken(io: std.Io, allocator: std.mem.Allocator, port: u16) ![]u8 {
+    return loadOrCreateAuthTokenFromHome(io, allocator, port, cio.posixGetenv("HOME"));
+}
+
+fn loadOrCreateAuthTokenFromHome(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    port: u16,
+    maybe_home: ?[]const u8,
+) ![]u8 {
     if (cio.posixGetenv("CODEDB_TOKEN")) |value| {
         const token = std.mem.trim(u8, value, " \t\r\n");
         if (token.len >= 16) return allocator.dupe(u8, token);
     }
 
-    const home = cio.posixGetenv("HOME") orelse return generateAuthToken(io, allocator);
-    if (home.len == 0) return generateAuthToken(io, allocator);
+    const home = maybe_home orelse return error.MissingHome;
+    if (home.len == 0) return error.MissingHome;
 
     const dir_path = try std.fmt.allocPrint(allocator, "{s}/.codedb", .{home});
     defer allocator.free(dir_path);
-    std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
+    std.Io.Dir.cwd().createDirPath(io, dir_path) catch |err| {
+        std.log.warn("codedb: failed to create auth token directory {s}: {}", .{ dir_path, err });
+        return error.CannotPersistAuthToken;
+    };
 
     const token_path = try std.fmt.allocPrint(allocator, "{s}/server-{d}.token", .{ dir_path, port });
     defer allocator.free(token_path);
@@ -149,13 +161,22 @@ fn loadOrCreateAuthToken(io: std.Io, allocator: std.mem.Allocator, port: u16) ![
 
     const token = try generateAuthToken(io, allocator);
     errdefer allocator.free(token);
-    const file = std.Io.Dir.cwd().createFile(io, token_path, .{
+    var file = std.Io.Dir.cwd().createFile(io, token_path, .{
         .truncate = true,
         .permissions = std.Io.File.Permissions.fromMode(0o600),
-    }) catch return token;
+    }) catch |err| {
+        std.log.warn("codedb: failed to create auth token file {s}: {}", .{ token_path, err });
+        return error.CannotPersistAuthToken;
+    };
     defer file.close(io);
-    file.writeStreamingAll(io, token) catch return token;
-    file.writeStreamingAll(io, "\n") catch return token;
+    file.writeStreamingAll(io, token) catch |err| {
+        std.log.warn("codedb: failed to write auth token file {s}: {}", .{ token_path, err });
+        return error.CannotPersistAuthToken;
+    };
+    file.writeStreamingAll(io, "\n") catch |err| {
+        std.log.warn("codedb: failed to finalize auth token file {s}: {}", .{ token_path, err });
+        return error.CannotPersistAuthToken;
+    };
     return token;
 }
 
@@ -1016,4 +1037,30 @@ fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
         pos = key_end + 1;
     }
     return null;
+}
+
+test "loadOrCreateAuthToken requires HOME when CODEDB_TOKEN is absent" {
+    try std.testing.expectError(
+        error.MissingHome,
+        loadOrCreateAuthTokenFromHome(std.testing.io, std.testing.allocator, 7719, null),
+    );
+}
+
+test "loadOrCreateAuthToken fails when HOME cannot hold the token file" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "not-a-dir",
+        .data = "blocking HOME path\n",
+    });
+
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home_len = try tmp_dir.dir.realPathFile(std.testing.io, "not-a-dir", &home_buf);
+    const home = home_buf[0..home_len];
+
+    try std.testing.expectError(
+        error.CannotPersistAuthToken,
+        loadOrCreateAuthTokenFromHome(std.testing.io, std.testing.allocator, 7719, home),
+    );
 }

@@ -1841,22 +1841,22 @@ test "integration: Tier 0.5 prefix expansion finds partial identifier" {
     try testing.expect(results.len >= 1);
 }
 
-test "security: FilteredWalker skips file symlinks" {
+test "security: FilteredWalker keeps safe file symlinks and rejects escaped targets" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     var outside_dir = testing.tmpDir(.{});
     defer outside_dir.cleanup();
 
     try tmp_dir.dir.createDirPath(io, "src");
+    try tmp_dir.dir.createDirPath(io, ".ssh");
     try tmp_dir.dir.writeFile(io, .{ .sub_path = "src/target.zig", .data = "pub fn linked() void {}\n// MARKER_LINE\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = ".ssh/known_hosts", .data = "secret host\n" });
     try outside_dir.dir.writeFile(io, .{ .sub_path = "outside_secret.zig", .data = "pub const secret = 1;\n" });
 
     var outside_buf: [std.fs.max_path_bytes]u8 = undefined;
     const outside_len = try outside_dir.dir.realPathFile(io, "outside_secret.zig", &outside_buf);
     const outside_path = outside_buf[0..outside_len];
 
-    // File symlinks are skipped even when the target is in-workspace. This
-    // avoids safe-looking aliases to sensitive or outside-root targets.
     var src_dir = try tmp_dir.dir.openDir(io, "src", .{ .iterate = true });
     defer src_dir.close(io);
     src_dir.symLink(io, "target.zig", "alias.zig", .{}) catch |err| switch (err) {
@@ -1866,6 +1866,10 @@ test "security: FilteredWalker skips file symlinks" {
         else => return err,
     };
     src_dir.symLink(io, outside_path, "outside_alias.zig", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    src_dir.symLink(io, "../.ssh/known_hosts", "secret_alias", .{}) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
@@ -1882,8 +1886,9 @@ test "security: FilteredWalker skips file symlinks" {
     try watcher.initialScanWithWorkerCount(io, &store, &explorer, root, testing.allocator, false, 1);
 
     try testing.expect(explorer.contents.contains("src/target.zig"));
-    try testing.expect(!explorer.contents.contains("src/alias.zig"));
+    try testing.expect(explorer.contents.contains("src/alias.zig"));
     try testing.expect(!explorer.contents.contains("src/outside_alias.zig"));
+    try testing.expect(!explorer.contents.contains("src/secret_alias"));
 }
 
 test "issue-405: FilteredWalker walks directory symlinks safely (cycle + escape)" {

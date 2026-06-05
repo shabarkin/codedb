@@ -121,8 +121,10 @@ pub fn openSafeFile(
     path: []const u8,
 ) !std.Io.File {
     var real_buf: [max_path_bytes]u8 = undefined;
-    _ = try realPathWithinRoot(io, dir, real_root, path, &real_buf);
-    return dir.openFile(io, path, .{
+    const real_path = try realPathWithinRoot(io, dir, real_root, path, &real_buf);
+    const real_rel = relativeFromRealRoot(real_path, real_root) orelse return error.AccessDenied;
+    if (real_rel.len == 0) return error.AccessDenied;
+    return dir.openFile(io, real_rel, .{
         .allow_directory = false,
         .follow_symlinks = false,
         .resolve_beneath = true,
@@ -174,4 +176,70 @@ test "sensitive path matching is case-insensitive and precise" {
     try std.testing.expect(isSensitivePath(".SSH/known_hosts"));
     try std.testing.expect(!isSensitivePath(".envoy.json"));
     try std.testing.expect(!isSensitivePath("src/main.zig"));
+}
+
+test "openSafeFile resolves safe in-root file symlinks but still rejects escaped and sensitive targets" {
+    const io = std.testing.io;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var outside_dir = std.testing.tmpDir(.{});
+    defer outside_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(io, "src");
+    try tmp_dir.dir.createDirPath(io, ".ssh");
+    try tmp_dir.dir.writeFile(io, .{
+        .sub_path = "src/target.zig",
+        .data = "pub fn linked() void {}\n",
+    });
+    try tmp_dir.dir.writeFile(io, .{
+        .sub_path = ".ssh/known_hosts",
+        .data = "secret host\n",
+    });
+    try outside_dir.dir.writeFile(io, .{
+        .sub_path = "outside_secret.zig",
+        .data = "pub const secret = 1;\n",
+    });
+
+    var outside_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const outside_len = try outside_dir.dir.realPathFile(io, "outside_secret.zig", &outside_buf);
+    const outside_path = outside_buf[0..outside_len];
+
+    var src_dir = try tmp_dir.dir.openDir(io, "src", .{ .iterate = true });
+    defer src_dir.close(io);
+    src_dir.symLink(io, "target.zig", "alias.zig", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    src_dir.symLink(io, outside_path, "outside_alias.zig", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    src_dir.symLink(io, "../.ssh/known_hosts", "secret_alias", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPathFile(io, ".", &root_buf);
+    const root = root_buf[0..root_len];
+
+    const content = try readFileAlloc(
+        io,
+        tmp_dir.dir,
+        root,
+        "src/alias.zig",
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("pub fn linked() void {}\n", content);
+
+    try std.testing.expectError(
+        error.AccessDenied,
+        readFileAlloc(io, tmp_dir.dir, root, "src/outside_alias.zig", std.testing.allocator, .limited(1024)),
+    );
+    try std.testing.expectError(
+        error.AccessDenied,
+        readFileAlloc(io, tmp_dir.dir, root, "src/secret_alias", std.testing.allocator, .limited(1024)),
+    );
 }

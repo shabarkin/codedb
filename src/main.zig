@@ -1099,6 +1099,11 @@ fn mainImpl() !void {
             out.p("{s}\xe2\x9c\x97{s} HTTP server stopped on 127.0.0.1:{d}: {s}\n", .{
                 s.red, s.reset, port, @errorName(err),
             });
+            switch (err) {
+                error.MissingHome => out.p("  hint: set HOME or CODEDB_TOKEN before running `codedb serve`\n", .{}),
+                error.CannotPersistAuthToken => out.p("  hint: fix $HOME/.codedb permissions or set CODEDB_TOKEN explicitly\n", .{}),
+                else => {},
+            }
             out.exitWithFlush(1);
         };
     } else if (std.mem.eql(u8, cmd, "mcp")) {

@@ -447,8 +447,7 @@ const FilteredWalker = struct {
                         });
                         continue;
                     }
-                    if (target_stat.kind == .file) continue;
-                    continue;
+                    if (target_stat.kind != .file) continue;
                 }
 
                 // Build full relative path by appending filename
