@@ -2,7 +2,7 @@
 
 `codedb mcp` runs as a stdio JSON-RPC server speaking the
 [Model Context Protocol](https://spec.modelcontextprotocol.io/). It exposes
-21 tools for code intelligence — search, outline, callers, deps, edit,
+22 tools for code intelligence — search, outline, callers, deps, edit,
 context, etc. — backed by the indexes in `~/.codedb/projects/<hash>/`.
 
 This guide covers per-client setup, how codedb decides which project to
@@ -191,7 +191,18 @@ takes no arguments and returns `files: N, seq: N, scan: ready` in <50 ms.
 
 ---
 
-## 6. Troubleshooting
+## 6. Lean MCP output
+
+Set `CODEDB_MCP_LEAN=1` before launching `codedb mcp` to strip the rich
+summary header and trailing guidance hints from tool responses. In lean mode
+the server emits only the raw data block, which is useful for agents that do
+not render ANSI escapes or when you want to minimize token usage.
+
+Any non-empty value enables lean mode except `0` and `false`.
+
+---
+
+## 7. Troubleshooting
 
 ### "No project root yet" / empty tree
 
@@ -245,7 +256,7 @@ codesign --force --sign - zig-out/bin/codedb
 
 ---
 
-## 7. Going deeper
+## 8. Going deeper
 
 - [Architecture](architecture.md) — engine internals, index layout
 - [CLI reference](cli.md) — every command, every flag

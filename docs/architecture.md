@@ -1,6 +1,6 @@
 # codedb — Architecture & Design
 
-A lightweight, zero-dependency code intelligence server written in Zig. Indexes a codebase at startup, watches for changes, and serves structural queries over HTTP and MCP (Model Context Protocol).
+A lightweight code intelligence server written in Zig. Indexes a codebase at startup, watches for changes, and serves structural queries over HTTP and MCP (Model Context Protocol).
 
 ## Overview
 
@@ -23,7 +23,7 @@ Parses args, resolves the project root, runs an initial scan, then dispatches to
 | `outline <path>` | Show symbols in a file |
 | `find <name>` | Find a symbol definition |
 | `search <query>` | Full-text search (trigram-accelerated) |
-| `word <id>` | Exact word lookup (inverted index, O(1)) |
+| `word <id>` | Identifier/sub-token lookup (inverted index, O(1)) |
 | `hot` | Recently modified files |
 | `serve` | Start HTTP daemon on :7719 |
 | `mcp` | Start MCP server (JSON-RPC over stdio) |
@@ -89,37 +89,41 @@ Polling-based file watcher (2-second interval). Uses mtime + content hash to det
 2. `incrementalLoop` — poll every 2s, detect added/modified/deleted files
 3. `incrementalDiff` — compare current filesystem state against cached `FileMap`, push `FsEvent`s to `EventQueue`
 
-**EventQueue** — bounded ring buffer (256 entries) for filesystem events. Non-blocking push, blocking pop. Used to feed events to the HTTP server's SSE endpoint.
+**EventQueue** — bounded ring buffer (256 entries) for filesystem events. Non-blocking push, blocking pop.
 
 ### `server.zig` — HTTP Server
 
-Thread-per-connection HTTP server on `:7719`. Parses raw HTTP/1.1 requests.
+Thread-per-connection HTTP server on `:7719`. Parses raw HTTP/1.1 requests, requires a per-port token on every route except `/health`, and caps concurrent handlers.
 
 **Endpoints:**
 
 | Route | Method | Description |
 |-------|--------|-------------|
-| `/tree` | GET | File tree |
-| `/outline?path=` | GET | File outline |
-| `/symbol?name=` | GET | Find symbol definitions |
-| `/search?q=&max=` | GET | Full-text search |
-| `/word?w=` | GET | Inverted index word lookup |
-| `/hot?limit=` | GET | Recently modified files |
-| `/deps?path=` | GET | Reverse dependencies |
-| `/read?path=` | GET | Read file content |
+| `/health` | GET | Health check (no auth required) |
+| `/agent/register` | POST | Register an editing agent |
+| `/agent/heartbeat?id=` | POST | Refresh agent liveness |
+| `/lock?agent=&path=` | POST | Acquire a file lock |
+| `/unlock?agent=&path=` | POST | Release a file lock |
 | `/edit` | POST | Apply a line-range edit |
+| `/file/read?path=` | GET | Read file content |
 | `/changes?since=` | GET | Changed files since sequence N |
-| `/status` | GET | File count + current sequence |
+| `/explore/tree` | GET | File tree |
+| `/explore/outline?path=` | GET | File outline |
+| `/explore/symbol?name=` | GET | Find symbol definitions |
+| `/explore/hot` | GET | Recently modified files |
+| `/explore/deps?path=` | GET | Reverse dependencies |
+| `/explore/word?q=` | GET | Inverted index word lookup |
+| `/explore/search?q=` | GET | Full-text search |
 | `/snapshot` | GET | Full pre-rendered JSON snapshot |
-| `/events` | GET | SSE stream of file change events |
+| `/seq` | GET | Current sequence number |
 
-**Safety:** path traversal prevention (`isPathSafe`), JSON string escaping for user input, POST body size cap, FD leak protection on thread spawn failure.
+**Safety:** token auth (`X-Codedb-Token` or `Authorization: Bearer ...`), path traversal prevention (`isPathSafe`), sensitive-file blocking, POST body size cap, request read timeout, and bounded concurrent handlers.
 
 ### `mcp.zig` — MCP Server
 
 JSON-RPC 2.0 over stdio with Content-Length framing. Implements the Model Context Protocol for LLM tool use.
 
-**Tools exposed (16):**
+**Tools exposed include:**
 
 | Tool | Description |
 |------|-------------|
@@ -159,7 +163,7 @@ Multi-agent support. Agents register with names, get assigned integer IDs. Suppo
 
 ### `build.zig` — Build Configuration
 
-Zig 0.15.x build system. Produces:
+Zig 0.16 build system. Produces:
 - `codedb` CLI executable
 - Test runner (`zig build test`)
 - Benchmarks (`zig build bench`)

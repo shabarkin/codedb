@@ -1,0 +1,20 @@
+# Very wide `ColumnLimit` is useful for the big if/else in `scan()`
+ColumnLimit: 120
+IndentWidth: 2
+ContinuationIndentWidth: 2
+AlignAfterOpenBracket: BlockIndent
+AllowAllParametersOfDeclarationOnNextLine: false
+BinPackArguments: false
+BinPackParameters: false
+BreakAfterReturnType: Automatic
+InsertBraces: true
+PenaltyReturnTypeOnItsOwnLine: 10000
+PointerAlignment: Left
+SortIncludes: Never
+SpaceAfterCStyleCast: true
+AllowShortFunctionsOnASingleLine: None
+Cpp11BracedListStyle: true
+AllowAllArgumentsOnNextLine: false
+AllowShortEnumsOnASingleLine: false
+AlignOperands: DontAlign
+BreakBeforeTernaryOperators: true

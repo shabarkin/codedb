@@ -1,4 +1,23 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const Counter = if (builtin.cpu.arch == .wasm32) struct {
+    value: u64,
+
+    fn init(value: u64) @This() {
+        return .{ .value = value };
+    }
+
+    fn fetchAdd(self: *@This(), operand: u64, _: std.builtin.AtomicOrder) u64 {
+        const old = self.value;
+        self.value +%= operand;
+        return old;
+    }
+
+    fn load(self: *const @This(), _: std.builtin.AtomicOrder) u64 {
+        return self.value;
+    }
+} else std.atomic.Value(u64);
 
 /// Fixed-capacity CLOCK eviction cache for file contents.
 /// Keys are owned (duped on put, freed on eviction/remove/clear).
@@ -10,9 +29,9 @@ pub const ContentCache = struct {
     hand: u32,
     count_: u32,
     allocator: std.mem.Allocator,
-    hits_: std.atomic.Value(u64),
-    misses_: std.atomic.Value(u64),
-    evictions_: std.atomic.Value(u64),
+    hits_: Counter,
+    misses_: Counter,
+    evictions_: Counter,
 
     const PROBE_LIMIT: u32 = 4;
 
@@ -52,9 +71,9 @@ pub const ContentCache = struct {
             .hand = 0,
             .count_ = 0,
             .allocator = allocator,
-            .hits_ = std.atomic.Value(u64).init(0),
-            .misses_ = std.atomic.Value(u64).init(0),
-            .evictions_ = std.atomic.Value(u64).init(0),
+            .hits_ = Counter.init(0),
+            .misses_ = Counter.init(0),
+            .evictions_ = Counter.init(0),
         };
     }
 
@@ -68,9 +87,9 @@ pub const ContentCache = struct {
             .hand = 0,
             .count_ = 0,
             .allocator = allocator,
-            .hits_ = std.atomic.Value(u64).init(0),
-            .misses_ = std.atomic.Value(u64).init(0),
-            .evictions_ = std.atomic.Value(u64).init(0),
+            .hits_ = Counter.init(0),
+            .misses_ = Counter.init(0),
+            .evictions_ = Counter.init(0),
         };
     }
 

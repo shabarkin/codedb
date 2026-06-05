@@ -17,6 +17,45 @@ const watcher = @import("watcher.zig");
 const edit_mod = @import("edit.zig");
 const path_security = @import("path_security.zig");
 
+pub const Listener = std.Io.net.Server;
+
+const max_http_connections: usize = 128;
+const read_timeout_ms: u64 = 5_000;
+
+pub const ConnectionLimiter = struct {
+    active: std.atomic.Value(usize) = .init(0),
+    max: usize,
+
+    pub fn init(max: usize) ConnectionLimiter {
+        return .{ .max = max };
+    }
+
+    pub fn tryAcquire(self: *ConnectionLimiter) bool {
+        const prev = self.active.fetchAdd(1, .acq_rel);
+        if (prev < self.max) return true;
+        _ = self.active.fetchSub(1, .acq_rel);
+        return false;
+    }
+
+    pub fn release(self: *ConnectionLimiter) void {
+        const prev = self.active.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+    }
+
+    pub fn activeCount(self: *const ConnectionLimiter) usize {
+        return self.active.load(.acquire);
+    }
+};
+
+pub fn bindListener(io: std.Io, port: u16) std.Io.net.IpAddress.ListenError!Listener {
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    return addr.listen(io, .{
+        .reuse_address = true,
+        .mode = .stream,
+        .protocol = .tcp,
+    });
+}
+
 pub fn serve(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -24,26 +63,34 @@ pub fn serve(
     agents: *AgentRegistry,
     explorer: *Explorer,
     queue: *watcher.EventQueue,
-    port: u16,
+    srv: Listener,
 ) !void {
     _ = queue;
+    const port = srv.socket.address.getPort();
     const auth_token = try loadOrCreateAuthToken(io, allocator, port);
     defer allocator.free(auth_token);
 
-    const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-    var srv = try addr.listen(io, .{
-        .reuse_address = true,
-        .mode = .stream,
-        .protocol = .tcp,
-    });
-    defer srv.deinit(io);
+    var listener = srv;
+    defer listener.deinit(io);
+    var limiter = ConnectionLimiter.init(max_http_connections);
+
+    std.log.info("codedb: {d} files indexed, listening on :{d}", .{ store.currentSeq(), port });
 
     while (true) {
-        const stream = srv.accept(io) catch |err| switch (err) {
+        const stream = listener.accept(io) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionAborted => continue,
             else => return err,
         };
+        if (!limiter.tryAcquire()) {
+            respondServiceUnavailable(io, stream);
+            stream.close(io);
+            continue;
+        }
+        configureReadTimeout(stream) catch |err| {
+            std.log.warn("codedb: failed to set HTTP read timeout: {}", .{err});
+        };
         const ctx = allocator.create(HandlerCtx) catch {
+            limiter.release();
             stream.close(io);
             continue;
         };
@@ -55,10 +102,12 @@ pub fn serve(
             .explorer = explorer,
             .stream = stream,
             .auth_token = auth_token,
+            .limiter = &limiter,
         };
         const t = std.Thread.spawn(.{}, handleThread, .{ctx}) catch {
             stream.close(io);
             allocator.destroy(ctx);
+            limiter.release();
             continue;
         };
         t.detach();
@@ -73,6 +122,7 @@ const HandlerCtx = struct {
     explorer: *Explorer,
     stream: std.Io.net.Stream,
     auth_token: []const u8,
+    limiter: *ConnectionLimiter,
 };
 
 fn loadOrCreateAuthToken(io: std.Io, allocator: std.mem.Allocator, port: u16) ![]u8 {
@@ -121,6 +171,7 @@ fn handleThread(ctx: *HandlerCtx) void {
     const allocator = ctx.allocator;
     defer {
         ctx.stream.close(io);
+        ctx.limiter.release();
         allocator.destroy(ctx);
     }
     handleConnection(io, allocator, ctx.store, ctx.agents, ctx.explorer, ctx.stream, ctx.auth_token);
@@ -165,22 +216,24 @@ fn handleConnection(
     auth_token: []const u8,
 ) void {
     var buf: [65536]u8 = undefined;
-
-    var total: usize = 0;
-    const first_n = readSome(io, stream, buf[0..]) catch return;
-    if (first_n == 0) return;
-    total = first_n;
-
     var write_buf: [4096]u8 = undefined;
     var conn = Conn.init(io, stream, &write_buf);
+
+    var total: usize = 0;
+    const first_n = readSome(io, stream, buf[0..]) catch |err| {
+        respondReadError(&conn, err, "400 Bad Request", "{\"error\":\"invalid request\"}");
+        return;
+    };
+    if (first_n == 0) return;
+    total = first_n;
 
     // If this is a POST, we may need to drain more bytes until we have the
     // full header block + declared Content-Length body.
     if (std.mem.startsWith(u8, buf[0..total], "POST")) {
         var header_end_opt = std.mem.indexOf(u8, buf[0..total], "\r\n\r\n");
         while (header_end_opt == null and total < buf.len) {
-            const extra = readSome(io, stream, buf[total..]) catch {
-                respondJson(&conn, "400 Bad Request", "{\"error\":\"invalid request\"}");
+            const extra = readSome(io, stream, buf[total..]) catch |err| {
+                respondReadError(&conn, err, "400 Bad Request", "{\"error\":\"invalid request\"}");
                 return;
             };
             if (extra == 0) break;
@@ -226,8 +279,8 @@ fn handleConnection(
 
         const expected_total = body_start + body_len;
         while (total < expected_total) {
-            const extra = readSome(io, stream, buf[total..expected_total]) catch {
-                respondJson(&conn, "400 Bad Request", "{\"error\":\"invalid request body\"}");
+            const extra = readSome(io, stream, buf[total..expected_total]) catch |err| {
+                respondReadError(&conn, err, "400 Bad Request", "{\"error\":\"invalid request body\"}");
                 return;
             };
             if (extra == 0) {
@@ -764,10 +817,36 @@ fn readSome(io: std.Io, stream: std.Io.net.Stream, dest: []u8) !usize {
     return n;
 }
 
+fn configureReadTimeout(stream: std.Io.net.Stream) !void {
+    var timeout = std.posix.timeval{
+        .sec = @intCast(read_timeout_ms / 1000),
+        .usec = @intCast((read_timeout_ms % 1000) * 1000),
+    };
+    try std.posix.setsockopt(
+        stream.socket.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&timeout),
+    );
+}
+
 // ── Response helpers ────────────────────────────────────────────
 
 fn isPathSafe(path: []const u8) bool {
     return path_security.isPathSafe(path);
+}
+
+fn respondServiceUnavailable(io: std.Io, stream: std.Io.net.Stream) void {
+    var write_buf: [256]u8 = undefined;
+    var conn = Conn.init(io, stream, &write_buf);
+    respondJson(&conn, "503 Service Unavailable", "{\"error\":\"too many concurrent HTTP connections\"}");
+}
+
+fn respondReadError(conn: *Conn, err: anyerror, fallback_status: []const u8, fallback_body: []const u8) void {
+    switch (err) {
+        error.Timeout => respondJson(conn, "408 Request Timeout", "{\"error\":\"request timeout\"}"),
+        else => respondJson(conn, fallback_status, fallback_body),
+    }
 }
 
 fn isAuthorized(request: []const u8, token: []const u8) bool {

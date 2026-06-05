@@ -365,6 +365,13 @@ fn mainImpl() !void {
         if (snapshot_loaded) {
             if (std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "bench-engine")) {
                 loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
+                explorer.mu.lockShared();
+                const have_trigrams = explorer.trigram_index.fileCount() > 0;
+                explorer.mu.unlockShared();
+                if (!have_trigrams) {
+                    explorer.rebuildTrigrams() catch {};
+                    explorer.trigram_index.writeToDisk(io, data_dir, git_head) catch {};
+                }
             }
             if (std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine")) {
                 loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
@@ -633,7 +640,15 @@ fn mainImpl() !void {
         };
         const t0 = cio.nanoTimestamp();
         const results = if (use_regex)
-            try explorer.searchContentRegex(query, allocator, 50)
+            explorer.searchContentRegex(query, allocator, 50) catch |err| switch (err) {
+                error.InvalidPattern => {
+                    out.p("{s}\xe2\x9c\x97{s} invalid regex pattern: {s}{s}{s}\n", .{
+                        s.red, s.reset, s.cyan, query, s.reset,
+                    });
+                    std.process.exit(1);
+                },
+                else => return err,
+            }
         else
             try explorer.searchContent(query, allocator, 50);
         defer {
@@ -1037,10 +1052,22 @@ fn mainImpl() !void {
             s.reset,
         });
     } else if (std.mem.eql(u8, cmd, "serve")) {
-        const port: u16 = blk: {
-            const raw = cio.posixGetenv("CODEDB_PORT") orelse break :blk 6767;
-            break :blk std.fmt.parseInt(u16, raw, 10) catch 6767;
-        };
+        const port = defaultServePort(cio.posixGetenv("CODEDB_PORT"));
+        const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
+        loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
+        explorer.mu.lockShared();
+        const have_trigrams = explorer.trigram_index.fileCount() > 0;
+        explorer.mu.unlockShared();
+        if (!have_trigrams) {
+            explorer.rebuildTrigrams() catch {};
+            explorer.trigram_index.writeToDisk(io, data_dir, git_head) catch {};
+        }
+        loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
+        if (!wordIndexMatchesOutlines(&explorer)) {
+            explorer.rebuildWordIndex() catch {};
+            persistWordIndexToDisk(io, &explorer, data_dir, git_head);
+        }
+
         var agents = AgentRegistry.init(allocator);
         defer agents.deinit();
         _ = try agents.register("__filesystem__");
@@ -1058,8 +1085,22 @@ fn mainImpl() !void {
         const reap_thread = try std.Thread.spawn(.{}, reapLoop, .{ &agents, &shutdown });
         defer reap_thread.join();
 
-        std.log.info("codedb: {d} files indexed, listening on :{d}", .{ store.currentSeq(), port });
-        try server.serve(io, allocator, &store, &agents, &explorer, queue, port);
+        const listener = server.bindListener(io, port) catch |err| {
+            out.flush();
+            out.file = cio.File.stderr();
+            out.p("{s}\xe2\x9c\x97{s} failed to bind HTTP server on 127.0.0.1:{d}: {s}\n", .{
+                s.red, s.reset, port, @errorName(err),
+            });
+            out.exitWithFlush(1);
+        };
+        server.serve(io, allocator, &store, &agents, &explorer, queue, listener) catch |err| {
+            out.flush();
+            out.file = cio.File.stderr();
+            out.p("{s}\xe2\x9c\x97{s} HTTP server stopped on 127.0.0.1:{d}: {s}\n", .{
+                s.red, s.reset, port, @errorName(err),
+            });
+            out.exitWithFlush(1);
+        };
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         var agents = AgentRegistry.init(allocator);
         defer agents.deinit();
@@ -1190,6 +1231,11 @@ pub fn parsePositional(args: []const []const u8) ParsedPositional {
         return .{ .root = a1, .cmd = args[2], .cmd_args_start = 3, .root_is_explicit = true };
     }
     return .{ .root = "", .cmd = "", .cmd_args_start = 0, .root_is_explicit = false, .usage_exit = true };
+}
+
+pub fn defaultServePort(env_value: ?[]const u8) u16 {
+    const raw = env_value orelse return 7719;
+    return std.fmt.parseInt(u16, raw, 10) catch 7719;
 }
 
 /// Walk up from cwd looking for a `.git` directory or file (git worktree).

@@ -8,6 +8,7 @@ const std = @import("std");
 const testing = std.testing;
 const mcp_lib = @import("mcp");
 const mcpj = mcp_lib.json;
+const nanoregex = @import("nanoregex");
 pub const Root = mcp_lib.mcp.Root;
 const Store = @import("store.zig").Store;
 const explore_mod = @import("explore.zig");
@@ -596,9 +597,9 @@ pub const tools_list =
     \\{"name":"codedb_tree","description":"Whole-repo file tree with per-file language, line counts, and symbol counts. Use to orient in an unfamiliar project.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_outline","description":"Symbol outline of one file: functions, structs, enums, imports, consts with line numbers. 4-15x smaller than reading the raw file. Run before codedb_read to find the lines you actually need.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_symbol","description":"Find where a named symbol is defined across the index. Returns file, line, and kind. Pass body=true for source. Pick this over codedb_search when you have an exact identifier.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
-    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 20, raise to 50 for broad surveys)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig', 'src/**/*.zig', or '**/*.{yaml,yml}'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
-    \\{"name":"codedb_word","description":"Exact-identifier lookup via inverted index — every occurrence of one word, O(1). Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
-    \\{"name":"codedb_callers","description":"Find every call site of a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum call sites to return (default: 30, raise for hot symbols)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
+    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 20, raise to 50 for broad surveys)"},"max_per_file":{"type":"integer","description":"Optional per-file result cap override. Default widens automatically when only one file matches."},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig', 'src/**/*.zig', or '**/*.{yaml,yml}'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
+    \\{"name":"codedb_word","description":"Identifier/sub-token lookup via inverted index — O(1) access to one token and its occurrences. Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Identifier or sub-token to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
+    \\{"name":"codedb_callers","description":"Heuristic call-site finder for a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum likely call sites to return (default: 30, raise for hot symbols)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
     \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
     \\{"name":"codedb_hot","description":"Most recently modified files in the project, newest first.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Dependency graph: who imports a file (default) or what a file imports (direction=depends_on). Set transitive=true for the full BFS blast radius.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"direction":{"type":"string","enum":["imported_by","depends_on"],"description":"imported_by (default): who imports this file. depends_on: what this file imports."},"transitive":{"type":"boolean","description":"Follow dependency chain transitively (default: false)"},"max_depth":{"type":"integer","description":"Max traversal depth for transitive queries (default: unlimited)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
@@ -612,7 +613,7 @@ pub const tools_list =
     \\{"name":"codedb_projects","description":"List every locally indexed project on this machine: path, data-dir hash, snapshot presence.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"codedb_index","description":"Index a local FOLDER (not a file). Builds outlines, trigrams, word index, and writes codedb.snapshot. After indexing, query it via the project= param on any other tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the FOLDER (not a file) to index, e.g. /Users/you/myproject"}},"required":["path"]}},
     \\{"name":"codedb_find","description":"Fuzzy FILE-NAME search ONLY — typo-tolerant subsequence match against indexed file paths. NOT a content/symbol search: 'rerank' will NOT find files containing rerankSignalScore unless the filename itself contains 'rerank'. For symbol lookups use codedb_word/codedb_symbol; for content use codedb_search.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Fuzzy filename query (e.g. 'authmidlware' for auth_middleware.go, 'test_auth', 'main.zig'). Matched against path basenames, not file contents."},"max_results":{"type":"integer","description":"Maximum results to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
-    \\{"name":"codedb_query","description":"Composable pipeline — chain ops where each step feeds the next. Ops: find, search, filter, deps, outline, read, sort, limit. Replaces multi-call workflows with one request.","inputSchema":{"type":"object","properties":{"pipeline":{"type":"array","items":{"type":"object"},"description":"Array of pipeline steps. Each step has 'op' (find/search/filter/deps/outline/read/sort/limit) and op-specific params. Steps execute in order, each filtering/transforming the file set from the previous step. deps op: {\"op\":\"deps\",\"direction\":\"imported_by|depends_on\",\"transitive\":true,\"max_depth\":3}"},"project":{"type":"string","description":"Optional absolute path to a different project"}},"required":["pipeline"]}},
+    \\{"name":"codedb_query","description":"Composable pipeline — chain ops where each step feeds the next. Ops: find, glob, search, word, symbol, filter, deps, outline, read, sort, limit. search supports regex/scope/path_glob, filter supports ext/glob/regex, read supports line_start/line_end/compact. Replaces multi-call workflows with one request.","inputSchema":{"type":"object","properties":{"pipeline":{"type":"array","items":{"type":"object"},"description":"Array of pipeline steps. Each step has 'op' (find/glob/search/word/symbol/filter/deps/outline/read/sort/limit) and op-specific params. Steps execute in order, each filtering/transforming the file set from the previous step. deps op: {\"op\":\"deps\",\"direction\":\"imported_by|depends_on\",\"transitive\":true,\"max_depth\":3}"},"project":{"type":"string","description":"Optional absolute path to a different project"}},"required":["pipeline"]}},
     \\{"name":"codedb_glob","description":"Match indexed paths against a glob: * (no /), ** (across /), ? (one char), {a,b} alternatives. Sorted lexicographically. Use when you know the path shape; codedb_find for fuzzy names.","inputSchema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. 'src/**/*.zig', '**/*.{yaml,yml}', 'tests/test_*.py')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 200)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["pattern"]}},
     \\{"name":"codedb_ls","description":"List immediate children of a directory: dirs first (alphabetical), then files with language and line/symbol counts. Drill down level-by-level when codedb_tree is too verbose.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Directory prefix relative to project root. Omit or pass empty string for root."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}}
     \\]}
@@ -734,7 +735,6 @@ pub fn buildAugmentedToolsList(alloc: std.mem.Allocator) ![]u8 {
     const augmented_in_arena = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
     return try alloc.dupe(u8, augmented_in_arena);
 }
-
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
@@ -874,9 +874,14 @@ pub fn run(
     var stdin_reader = stdin.reader(io, &read_buf);
 
     while (!stdout_broken.load(.acquire) and !shutdown.load(.acquire)) {
-        const msg = mcpj.readLineBuf(alloc, &stdin_reader.interface) orelse break;
+        var oversize = false;
+        const msg = mcpj.readLineBufOversize(alloc, &stdin_reader.interface, &oversize) orelse break;
         last_activity.store(cio.milliTimestamp(), .release);
         defer alloc.free(msg);
+        if (oversize) {
+            writeError(alloc, stdout, null, -32700, "Parse error");
+            continue;
+        }
 
         const input = std.mem.trim(u8, msg, " \t\r");
         if (input.len == 0) continue;
@@ -1451,15 +1456,24 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             return;
         }
     }
+    if (getInt(args, "max_per_file")) |n| {
+        if (n <= 0) {
+            const w_err = cio.listWriter(out, alloc);
+            w_err.print("error: max_per_file ({d}) must be >= 1", .{n}) catch {};
+            return;
+        }
+    }
     // Default trimmed from 50 -> 20 (Nov 2026). Bench data showed the
     // median answer needed <10 results; the extra 40 were paid in tokens
     // every call. Agents that want more can pass max_results explicitly.
     const max_results: usize = if (getInt(args, "max_results")) |n| @intCast(@max(1, @min(n, 10000))) else 20;
+    const requested_max_per_file: ?usize = if (getInt(args, "max_per_file")) |n| @intCast(@max(1, @min(n, 10000))) else null;
     const scope = getBool(args, "scope");
     const compact = getBool(args, "compact");
     const paths_only = getBool(args, "paths_only");
     const is_regex = getBool(args, "regex");
     const path_glob_raw = getStr(args, "path_glob");
+    const regex_engine_max_per_file = requested_max_per_file orelse max_results;
     // Auto-promote basename-only patterns ('*.zig') to '**/*.zig' so they match
     // nested files. Without this the matcher rejects 'src/main.zig' because
     // '*' doesn't cross '/' (see explore.zig:matchGlob). Issue surfaced by the
@@ -1474,8 +1488,11 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     } else null;
 
     if (scope and is_regex) {
-        const results = explorer.searchContentRegexWithScope(query, alloc, max_results) catch {
-            out.appendSlice(alloc, "error: scoped regex search failed") catch {};
+        const results = explorer.searchContentRegexWithScopeCapped(query, alloc, max_results, regex_engine_max_per_file) catch |err| {
+            switch (err) {
+                error.InvalidPattern => out.appendSlice(alloc, "error: invalid regex pattern") catch {},
+                else => out.appendSlice(alloc, "error: scoped regex search failed") catch {},
+            }
             return;
         };
         defer {
@@ -1490,17 +1507,33 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         // Issue #422: count post-filter results so the header reflects what
         // the user actually sees, not the pre-filter explorer count.
         var visible_total: usize = 0;
+        var visible_files = std.StringHashMap(void).init(alloc);
+        defer visible_files.deinit();
         for (results) |r| {
             if (path_glob) |g| if (!globMatch(g, r.path)) continue;
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
             visible_total += 1;
+            visible_files.put(r.path, {}) catch {};
         }
+        const max_per_file = deriveSearchMaxPerFile(max_results, visible_files.count(), requested_max_per_file);
 
         const w = cio.listWriter(out, alloc);
         w.print("{d} results for '{s}':\n", .{ visible_total, query }) catch {};
+        var file_counts = std.StringHashMap(usize).init(alloc);
+        defer file_counts.deinit();
+        var shown: usize = 0;
         for (results) |r| {
             if (path_glob) |g| if (!globMatch(g, r.path)) continue;
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+            const gop = file_counts.getOrPut(r.path) catch continue;
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+            if (gop.value_ptr.* > max_per_file) {
+                if (gop.value_ptr.* == max_per_file + 1) {
+                    w.print("  {s}: ... (more matches truncated)\n", .{r.path}) catch {};
+                }
+                continue;
+            }
             if (paths_only) {
                 w.print("  {s}:{d}\n", .{ r.path, r.line_num }) catch {};
             } else if (r.scope_name) |sn| {
@@ -1514,6 +1547,10 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
                     w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
                 }
             }
+            shown += 1;
+        }
+        if (shown < visible_total) {
+            w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     } else if (scope) {
         const results = explorer.searchContentWithScope(query, alloc, max_results) catch {
@@ -1533,17 +1570,20 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         // the user actually sees, and so the "truncated" footer only fires
         // for per-file-cap truncation — not for glob/compact filtering.
         var visible_total: usize = 0;
+        var visible_files = std.StringHashMap(void).init(alloc);
+        defer visible_files.deinit();
         for (results) |r| {
             if (path_glob) |g| if (!globMatch(g, r.path)) continue;
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
             visible_total += 1;
+            visible_files.put(r.path, {}) catch {};
         }
 
         const w = cio.listWriter(out, alloc);
         w.print("{d} results for '{s}':\n", .{ visible_total, query }) catch {};
-        var file_counts = std.StringHashMap(u8).init(alloc);
+        var file_counts = std.StringHashMap(usize).init(alloc);
         defer file_counts.deinit();
-        const max_per_file: u8 = 5;
+        const max_per_file = deriveSearchMaxPerFile(max_results, visible_files.count(), requested_max_per_file);
         var shown: usize = 0;
         for (results) |r| {
             if (path_glob) |g| if (!globMatch(g, r.path)) continue;
@@ -1576,8 +1616,11 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     } else if (is_regex) {
-        const results = explorer.searchContentRegex(query, alloc, max_results) catch {
-            out.appendSlice(alloc, "error: regex search failed") catch {};
+        const results = explorer.searchContentRegexCapped(query, alloc, max_results, regex_engine_max_per_file) catch |err| {
+            switch (err) {
+                error.InvalidPattern => out.appendSlice(alloc, "error: invalid regex pattern") catch {},
+                else => out.appendSlice(alloc, "error: regex search failed") catch {},
+            }
             return;
         };
         defer {
@@ -1591,17 +1634,20 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         // Issue #422: header reflects post-filter count; "truncated" footer
         // only fires for per-file-cap, not for glob/compact filtering.
         var visible_total: usize = 0;
+        var visible_files = std.StringHashMap(void).init(alloc);
+        defer visible_files.deinit();
         for (results) |r| {
             if (path_glob) |g| if (!globMatch(g, r.path)) continue;
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
             visible_total += 1;
+            visible_files.put(r.path, {}) catch {};
         }
 
         const w = cio.listWriter(out, alloc);
         w.print("{d} results for '{s}':\n", .{ visible_total, query }) catch {};
-        var file_counts = std.StringHashMap(u8).init(alloc);
+        var file_counts = std.StringHashMap(usize).init(alloc);
         defer file_counts.deinit();
-        const max_per_file: u8 = 5;
+        const max_per_file = deriveSearchMaxPerFile(max_results, visible_files.count(), requested_max_per_file);
         var shown: usize = 0;
         for (results) |r| {
             if (path_glob) |g| if (!globMatch(g, r.path)) continue;
@@ -1627,7 +1673,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         }
     } else {
         if (path_glob == null and !compact) {
-            const rendered = explorer.renderPlainSearch(query, alloc, out, max_results, paths_only) catch {
+            const rendered = explorer.renderPlainSearch(query, alloc, out, max_results, paths_only, requested_max_per_file) catch {
                 out.appendSlice(alloc, "error: search failed") catch {};
                 return;
             };
@@ -1662,10 +1708,13 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         const w = cio.listWriter(out, alloc);
         w.print("{d} results for '{s}':\n", .{ visible_total, query }) catch {};
         if (simple_unfiltered and results.len <= 64) {
-            const CountEntry = struct { path: []const u8, count: u8 };
+            const CountEntry = struct { path: []const u8, count: usize };
             var counts: [64]CountEntry = undefined;
             var counts_len: usize = 0;
-            const max_per_file: u8 = 5;
+            var visible_files = std.StringHashMap(void).init(alloc);
+            defer visible_files.deinit();
+            for (results) |r| visible_files.put(r.path, {}) catch {};
+            const max_per_file = deriveSearchMaxPerFile(max_results, visible_files.count(), requested_max_per_file);
             var shown: usize = 0;
             for (results) |r| {
                 var idx_opt: ?usize = null;
@@ -1699,9 +1748,16 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             }
             return;
         }
-        var file_counts = std.StringHashMap(u8).init(alloc);
+        var visible_files = std.StringHashMap(void).init(alloc);
+        defer visible_files.deinit();
+        for (results) |r| {
+            if (path_glob) |g| if (!globMatch(g, r.path)) continue;
+            if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+            visible_files.put(r.path, {}) catch {};
+        }
+        var file_counts = std.StringHashMap(usize).init(alloc);
         defer file_counts.deinit();
-        const max_per_file: u8 = 5;
+        const max_per_file = deriveSearchMaxPerFile(max_results, visible_files.count(), requested_max_per_file);
         var shown: usize = 0;
         for (results) |r| {
             if (path_glob) |g| if (!globMatch(g, r.path)) continue;
@@ -2267,7 +2323,6 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     }
 }
 
-
 fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
     const limit: usize = if (getInt(args, "limit")) |n| @intCast(@min(@max(1, n), 1000)) else 10;
     explorer.renderHot(store, alloc, out, limit) catch {
@@ -2694,7 +2749,6 @@ fn handleSnapshot(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *
     cache.putAndAppend(alloc, out, seq, snap);
 }
 
-
 /// When a bundled op produces a missing-arg error, append a `received keys`
 /// line listing the keys actually present in the op's args. Helps callers
 /// tell whether codedb dropped a field or the client sent it under the
@@ -2766,6 +2820,70 @@ fn finishQueryWithFailure(
     }
     const w = cio.listWriter(out, alloc);
     w.print("\n--- partial ---\nfailed_at: {d}\nreason: {s}\n", .{ step_i, reason }) catch {};
+}
+
+fn appendOwnedPath(
+    alloc: std.mem.Allocator,
+    paths: *std.ArrayList([]const u8),
+    path: []const u8,
+) !void {
+    const duped = try alloc.dupe(u8, path);
+    errdefer alloc.free(duped);
+    try paths.append(alloc, duped);
+}
+
+fn freeOwnedPaths(alloc: std.mem.Allocator, paths: *std.ArrayList([]const u8)) void {
+    for (paths.items) |path| alloc.free(path);
+    paths.deinit(alloc);
+}
+
+fn retainOwnedPathsPresent(
+    alloc: std.mem.Allocator,
+    paths: *std.ArrayList([]const u8),
+    keep_set: *const std.StringHashMap(void),
+) void {
+    var wr: usize = 0;
+    for (paths.items) |path| {
+        if (keep_set.contains(path)) {
+            paths.items[wr] = path;
+            wr += 1;
+        } else {
+            alloc.free(path);
+        }
+    }
+    paths.items.len = wr;
+}
+
+fn truncateOwnedPaths(alloc: std.mem.Allocator, paths: *std.ArrayList([]const u8), n: usize) void {
+    if (paths.items.len <= n) return;
+    for (paths.items[n..]) |path| alloc.free(path);
+    paths.items.len = n;
+}
+
+fn appendQueryTerminalFileSet(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    file_set: *const std.ArrayList([]const u8),
+) void {
+    const w = cio.listWriter(out, alloc);
+    if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') {
+        w.writeAll("\n") catch {};
+    }
+    w.writeAll("\n--- files ---\n") catch {};
+    w.print("{d} files:\n", .{file_set.items.len}) catch {};
+    const shown = @min(file_set.items.len, 200);
+    for (file_set.items[0..shown]) |path| {
+        w.print("  {s}\n", .{path}) catch {};
+    }
+    if (shown < file_set.items.len) {
+        w.print("  ... ({d} more)\n", .{file_set.items.len - shown}) catch {};
+    }
+}
+
+fn deriveSearchMaxPerFile(max_results: usize, visible_files: usize, requested: ?usize) usize {
+    if (requested) |n| return @max(@as(usize, 1), @min(n, max_results));
+    if (visible_files <= 1) return max_results;
+    return @min(max_results, 5);
 }
 
 fn handleBundle(
@@ -3734,7 +3852,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
     }
 
     var file_set: std.ArrayList([]const u8) = .empty;
-    defer file_set.deinit(alloc);
+    defer freeOwnedPaths(alloc, &file_set);
     var have_set = false;
     const w = cio.listWriter(out, alloc);
 
@@ -3743,139 +3861,323 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
     const StageInfo = struct { op: []const u8, files_out: usize };
     var stages: std.ArrayList(StageInfo) = .empty;
     defer stages.deinit(alloc);
+    var had_failure = false;
+    var failure_step: usize = 0;
+    var failure_reason: []const u8 = "";
+    var failure_step_args: ?*const std.json.ObjectMap = null;
 
     for (pipeline, 0..) |step_val, step_i| {
         if (step_val != .object) {
             w.print("error: step {d} must be object\n", .{step_i}) catch {};
-            return;
+            had_failure = true;
+            failure_step = step_i;
+            failure_reason = "step must be object";
+            break;
         }
         const step = &step_val.object;
-        const op = getStr(step, "op") orelse blk: {
-            // Auto-detect op when 'op' key is missing.
-            // query → search, word → word, name → symbol
-            if (getStr(step, "query") != null) break :blk "search";
-            if (getStr(step, "word") != null)   break :blk "word";
-            if (getStr(step, "name") != null)   break :blk "symbol";
-            w.print("error: step {d} missing 'op'\n", .{step_i}) catch {};
-            finishQueryWithFailure(alloc, out, step_i, "missing 'op'", step);
-            return;
-        };
+
+        var op_opt = getStr(step, "op");
+        if (op_opt == null) {
+            if (getStr(step, "query") != null) {
+                op_opt = "search";
+            } else if (getStr(step, "word") != null) {
+                op_opt = "word";
+            } else if (getStr(step, "name") != null) {
+                op_opt = "symbol";
+            } else {
+                w.print("error: step {d} missing 'op'\n", .{step_i}) catch {};
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "missing 'op'";
+                failure_step_args = step;
+                break;
+            }
+        }
+        const op = op_opt.?;
 
         if (std.mem.eql(u8, op, "find")) {
             const query = getStr(step, "query") orelse {
                 w.print("error: find needs 'query'\n", .{}) catch {};
-                finishQueryWithFailure(alloc, out, step_i, "find needs 'query'", step);
-                return;
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "find needs 'query'";
+                failure_step_args = step;
+                break;
             };
             const max: usize = if (getInt(step, "max_results")) |n| @intCast(@max(1, @min(n, 200))) else 50;
             const matches = explorer.fuzzyFindFiles(query, alloc, max) catch {
                 w.print("error: find failed\n", .{}) catch {};
-                return;
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "find failed";
+                failure_step_args = step;
+                break;
             };
             defer alloc.free(matches);
             if (have_set) {
-                // Intersect: keep only files from current set that also appear in find results
                 var match_set = std.StringHashMap(void).init(alloc);
                 defer match_set.deinit();
                 for (matches) |m| match_set.put(m.path, {}) catch {};
-                var wr: usize = 0;
-                for (file_set.items) |p| {
-                    if (match_set.contains(p)) {
-                        file_set.items[wr] = p;
-                        wr += 1;
-                    }
-                }
-                file_set.items.len = wr;
+                retainOwnedPathsPresent(alloc, &file_set, &match_set);
                 w.print("{d} files after find intersect\n", .{file_set.items.len}) catch {};
             } else {
                 file_set.clearRetainingCapacity();
                 w.print("{d} files matched:\n", .{matches.len}) catch {};
                 for (matches) |m| {
                     w.print("  {s}\n", .{m.path}) catch {};
-                    file_set.append(alloc, m.path) catch {};
+                    appendOwnedPath(alloc, &file_set, m.path) catch {};
+                }
+                have_set = true;
+            }
+        } else if (std.mem.eql(u8, op, "glob")) {
+            const pattern = getStr(step, "pattern") orelse getStr(step, "glob") orelse {
+                w.print("error: glob needs 'pattern'\n", .{}) catch {};
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "glob needs 'pattern'";
+                failure_step_args = step;
+                break;
+            };
+            if (pattern.len == 0) {
+                w.print("error: empty glob pattern\n", .{}) catch {};
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "empty glob pattern";
+                failure_step_args = step;
+                break;
+            }
+            if (have_set) {
+                var wr: usize = 0;
+                for (file_set.items) |path| {
+                    if (globMatch(pattern, path)) {
+                        file_set.items[wr] = path;
+                        wr += 1;
+                    } else {
+                        alloc.free(path);
+                    }
+                }
+                file_set.items.len = wr;
+            } else {
+                const max: usize = if (getInt(step, "max_results")) |n| @intCast(@max(1, @min(n, 5000))) else 200;
+                const matches = explorer.globPaths(alloc, pattern, max) catch {
+                    w.print("error: glob failed\n", .{}) catch {};
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = "glob failed";
+                    failure_step_args = step;
+                    break;
+                };
+                defer alloc.free(matches);
+
+                file_set.clearRetainingCapacity();
+                w.print("{d} files matched:\n", .{matches.len}) catch {};
+                for (matches) |path| {
+                    w.print("  {s}\n", .{path}) catch {};
+                    appendOwnedPath(alloc, &file_set, path) catch {};
                 }
                 have_set = true;
             }
         } else if (std.mem.eql(u8, op, "search")) {
             const query = getStr(step, "query") orelse {
                 w.print("error: search needs 'query'\n", .{}) catch {};
-                finishQueryWithFailure(alloc, out, step_i, "search needs 'query'", step);
-                return;
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "search needs 'query'";
+                failure_step_args = step;
+                break;
             };
             const max: usize = if (getInt(step, "max_results")) |n| @intCast(@max(1, @min(n, 200))) else 50;
-            const results = explorer.searchContent(query, alloc, max) catch {
-                w.print("error: search failed\n", .{}) catch {};
-                return;
-            };
-            defer {
-                for (results) |r| {
-                    alloc.free(r.line_text);
-                    alloc.free(r.path);
-                }
-                alloc.free(results);
-            }
+            const requested_max_per_file: ?usize = if (getInt(step, "max_per_file")) |n| @intCast(@max(1, @min(n, 200))) else null;
+            const scope = getBool(step, "scope");
+            const is_regex = getBool(step, "regex");
+            const compact = getBool(step, "compact");
+            const paths_only = getBool(step, "paths_only");
+            const path_glob = getStr(step, "path_glob");
+            const regex_engine_max_per_file = requested_max_per_file orelse max;
+
+            var path_set = std.StringHashMap(void).init(alloc);
+            defer path_set.deinit();
             if (have_set) {
-                // Intersect: only keep files from current set that have search hits
-                var hit_set = std.StringHashMap(void).init(alloc);
-                defer hit_set.deinit();
-                var path_set = std.StringHashMap(void).init(alloc);
-                defer path_set.deinit();
                 for (file_set.items) |p| path_set.put(p, {}) catch {};
+            }
+            var hit_set = std.StringHashMap(void).init(alloc);
+            defer hit_set.deinit();
+            var seen = std.StringHashMap(void).init(alloc);
+            defer seen.deinit();
+            if (!have_set) file_set.clearRetainingCapacity();
+
+            if (scope and is_regex) {
+                const results = explorer.searchContentRegexWithScopeCapped(query, alloc, max, regex_engine_max_per_file) catch |err| {
+                    const reason = switch (err) {
+                        error.InvalidPattern => "invalid regex pattern",
+                        else => "scoped regex search failed",
+                    };
+                    w.print("error: {s}\n", .{reason}) catch {};
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = reason;
+                    failure_step_args = step;
+                    break;
+                };
+                defer {
+                    for (results) |r| {
+                        alloc.free(r.line_text);
+                        alloc.free(r.path);
+                        if (r.scope_name) |n| alloc.free(n);
+                    }
+                    alloc.free(results);
+                }
+
                 for (results) |r| {
-                    if (path_set.contains(r.path)) {
+                    if (have_set and !path_set.contains(r.path)) continue;
+                    if (path_glob) |g| if (!globMatch(g, r.path)) continue;
+                    if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+                    if (paths_only) {
+                        w.print("{s}:{d}\n", .{ r.path, r.line_num }) catch {};
+                    } else if (r.scope_name) |sn| {
+                        w.print("{s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
+                            r.path, r.line_num, r.line_text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
+                        }) catch {};
+                    } else {
                         w.print("{s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
-                        hit_set.put(r.path, {}) catch {};
+                    }
+                    hit_set.put(r.path, {}) catch {};
+                    if (!have_set and !seen.contains(r.path)) {
+                        seen.put(r.path, {}) catch continue;
+                        appendOwnedPath(alloc, &file_set, r.path) catch continue;
                     }
                 }
-                // Narrow file_set to only files that had hits
-                var wr: usize = 0;
-                for (file_set.items) |p| {
-                    if (hit_set.contains(p)) {
-                        file_set.items[wr] = p;
-                        wr += 1;
+            } else if (scope) {
+                const results = explorer.searchContentWithScope(query, alloc, max) catch {
+                    w.print("error: search failed\n", .{}) catch {};
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = "search failed";
+                    failure_step_args = step;
+                    break;
+                };
+                defer {
+                    for (results) |r| {
+                        alloc.free(r.line_text);
+                        alloc.free(r.path);
+                        if (r.scope_name) |n| alloc.free(n);
                     }
+                    alloc.free(results);
                 }
-                file_set.items.len = wr;
-            } else {
-                var seen = std.StringHashMap(void).init(alloc);
-                defer seen.deinit();
-                file_set.clearRetainingCapacity();
+
                 for (results) |r| {
-                    w.print("{s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
-                    if (!seen.contains(r.path)) {
-                        // Dupe path — search results are freed by the defer above,
-                        // but file_set must outlive this step for downstream ops
-                        const duped = alloc.dupe(u8, r.path) catch continue;
-                        seen.put(duped, {}) catch {
-                            alloc.free(duped);
-                            continue;
-                        };
-                        file_set.append(alloc, duped) catch {
-                            alloc.free(duped);
-                            continue;
-                        };
+                    if (have_set and !path_set.contains(r.path)) continue;
+                    if (path_glob) |g| if (!globMatch(g, r.path)) continue;
+                    if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+                    if (paths_only) {
+                        w.print("{s}:{d}\n", .{ r.path, r.line_num }) catch {};
+                    } else if (r.scope_name) |sn| {
+                        w.print("{s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
+                            r.path, r.line_num, r.line_text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
+                        }) catch {};
+                    } else {
+                        w.print("{s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                    }
+                    hit_set.put(r.path, {}) catch {};
+                    if (!have_set and !seen.contains(r.path)) {
+                        seen.put(r.path, {}) catch continue;
+                        appendOwnedPath(alloc, &file_set, r.path) catch continue;
                     }
                 }
+            } else if (is_regex) {
+                const results = explorer.searchContentRegexCapped(query, alloc, max, regex_engine_max_per_file) catch |err| {
+                    const reason = switch (err) {
+                        error.InvalidPattern => "invalid regex pattern",
+                        else => "regex search failed",
+                    };
+                    w.print("error: {s}\n", .{reason}) catch {};
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = reason;
+                    failure_step_args = step;
+                    break;
+                };
+                defer {
+                    for (results) |r| {
+                        alloc.free(r.line_text);
+                        alloc.free(r.path);
+                    }
+                    alloc.free(results);
+                }
+
+                for (results) |r| {
+                    if (have_set and !path_set.contains(r.path)) continue;
+                    if (path_glob) |g| if (!globMatch(g, r.path)) continue;
+                    if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+                    if (paths_only) {
+                        w.print("{s}:{d}\n", .{ r.path, r.line_num }) catch {};
+                    } else {
+                        w.print("{s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                    }
+                    hit_set.put(r.path, {}) catch {};
+                    if (!have_set and !seen.contains(r.path)) {
+                        seen.put(r.path, {}) catch continue;
+                        appendOwnedPath(alloc, &file_set, r.path) catch continue;
+                    }
+                }
+            } else {
+                const results = explorer.searchContent(query, alloc, max) catch {
+                    w.print("error: search failed\n", .{}) catch {};
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = "search failed";
+                    failure_step_args = step;
+                    break;
+                };
+                defer {
+                    for (results) |r| {
+                        alloc.free(r.line_text);
+                        alloc.free(r.path);
+                    }
+                    alloc.free(results);
+                }
+
+                for (results) |r| {
+                    if (have_set and !path_set.contains(r.path)) continue;
+                    if (path_glob) |g| if (!globMatch(g, r.path)) continue;
+                    if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+                    if (paths_only) {
+                        w.print("{s}:{d}\n", .{ r.path, r.line_num }) catch {};
+                    } else {
+                        w.print("{s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                    }
+                    hit_set.put(r.path, {}) catch {};
+                    if (!have_set and !seen.contains(r.path)) {
+                        seen.put(r.path, {}) catch continue;
+                        appendOwnedPath(alloc, &file_set, r.path) catch continue;
+                    }
+                }
+            }
+
+            if (have_set) {
+                retainOwnedPathsPresent(alloc, &file_set, &hit_set);
+            } else {
                 have_set = true;
             }
         } else if (std.mem.eql(u8, op, "deps")) {
-            // Expand file set by adding dependents/dependencies of current files.
-            // Accepts optional 'path' for standalone use without a prior seeding step.
             if (!have_set) {
                 if (getStr(step, "path")) |p| {
-                    const duped = alloc.dupe(u8, p) catch {
+                    appendOwnedPath(alloc, &file_set, p) catch {
                         w.print("error: out of memory\n", .{}) catch {};
-                        return;
-                    };
-                    file_set.append(alloc, duped) catch {
-                        alloc.free(duped);
-                        w.print("error: out of memory\n", .{}) catch {};
-                        return;
+                        had_failure = true;
+                        failure_step = step_i;
+                        failure_reason = "out of memory";
+                        failure_step_args = step;
+                        break;
                     };
                     have_set = true;
                 } else {
                     w.print("error: deps needs prior step or 'path' param\n", .{}) catch {};
-                    return;
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = "deps needs prior step or 'path' param";
+                    failure_step_args = step;
+                    break;
                 }
             }
             const direction = getStr(step, "direction") orelse "imported_by";
@@ -3887,7 +4189,6 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             defer expanded.deinit();
             for (file_set.items) |path| expanded.put(path, {}) catch {};
 
-            // Snapshot current file set since we'll append to it
             const current_len = file_set.items.len;
             for (file_set.items[0..current_len]) |path| {
                 var deps_result: []const []const u8 = &.{};
@@ -3930,21 +4231,54 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
 
                 for (deps_result) |dep| {
                     if (!expanded.contains(dep)) {
-                        expanded.put(dep, {}) catch {};
-                        file_set.append(alloc, dep) catch {};
+                        const duped = alloc.dupe(u8, dep) catch continue;
+                        file_set.append(alloc, duped) catch {
+                            alloc.free(duped);
+                            continue;
+                        };
+                        expanded.put(duped, {}) catch {
+                            file_set.items.len -= 1;
+                            alloc.free(duped);
+                            continue;
+                        };
                     }
                 }
             }
         } else if (std.mem.eql(u8, op, "filter")) {
+            const ext = getStr(step, "ext");
+            const glob_pat = getStr(step, "glob");
+            const regex_pat = getStr(step, "regex");
+            var compiled_regex: ?nanoregex.Regex = null;
+            defer if (compiled_regex) |*rx| rx.deinit();
+            if (regex_pat) |pat| {
+                if (pat.len == 0) {
+                    w.print("error: empty regex pattern\n", .{}) catch {};
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = "empty regex pattern";
+                    failure_step_args = step;
+                    break;
+                }
+                compiled_regex = nanoregex.Regex.compile(alloc, pat) catch |err| {
+                    const reason = switch (err) {
+                        error.OutOfMemory => "out of memory",
+                        else => "invalid regex pattern",
+                    };
+                    w.print("error: {s}\n", .{reason}) catch {};
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = reason;
+                    failure_step_args = step;
+                    break;
+                };
+            }
             if (!have_set) {
                 explorer.mu.lockShared();
                 var iter = explorer.outlines.keyIterator();
-                while (iter.next()) |k| file_set.append(alloc, k.*) catch {};
+                while (iter.next()) |k| appendOwnedPath(alloc, &file_set, k.*) catch {};
                 explorer.mu.unlockShared();
                 have_set = true;
             }
-            const ext = getStr(step, "ext");
-            const glob_pat = getStr(step, "glob");
             var wr: usize = 0;
             for (file_set.items) |path| {
                 var keep = true;
@@ -3954,29 +4288,41 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 if (keep) if (glob_pat) |g| {
                     if (!globMatch(g, path)) keep = false;
                 };
+                if (keep) if (compiled_regex) |*rx| {
+                    if (rx.search(alloc, path) catch null) |m| {
+                        var match = m;
+                        match.deinit(alloc);
+                    } else {
+                        keep = false;
+                    }
+                };
                 if (keep) {
                     file_set.items[wr] = path;
                     wr += 1;
+                } else {
+                    alloc.free(path);
                 }
             }
             file_set.items.len = wr;
         } else if (std.mem.eql(u8, op, "outline")) {
-            // Accepts optional 'path' for standalone single-file outline.
             if (!have_set) {
                 if (getStr(step, "path")) |p| {
-                    const duped = alloc.dupe(u8, p) catch {
+                    appendOwnedPath(alloc, &file_set, p) catch {
                         w.print("error: out of memory\n", .{}) catch {};
-                        return;
-                    };
-                    file_set.append(alloc, duped) catch {
-                        alloc.free(duped);
-                        w.print("error: out of memory\n", .{}) catch {};
-                        return;
+                        had_failure = true;
+                        failure_step = step_i;
+                        failure_reason = "out of memory";
+                        failure_step_args = step;
+                        break;
                     };
                     have_set = true;
                 } else {
                     w.print("error: outline needs prior step or 'path' param\n", .{}) catch {};
-                    return;
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = "outline needs prior step or 'path' param";
+                    failure_step_args = step;
+                    break;
                 }
             }
             for (file_set.items) |path| {
@@ -3992,50 +4338,107 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 }
             }
         } else if (std.mem.eql(u8, op, "read")) {
-            // Accepts optional 'path' for standalone single-file read.
             if (!have_set) {
                 if (getStr(step, "path")) |p| {
-                    const duped = alloc.dupe(u8, p) catch {
+                    appendOwnedPath(alloc, &file_set, p) catch {
                         w.print("error: out of memory\n", .{}) catch {};
-                        return;
-                    };
-                    file_set.append(alloc, duped) catch {
-                        alloc.free(duped);
-                        w.print("error: out of memory\n", .{}) catch {};
-                        return;
+                        had_failure = true;
+                        failure_step = step_i;
+                        failure_reason = "out of memory";
+                        failure_step_args = step;
+                        break;
                     };
                     have_set = true;
                 } else {
                     w.print("error: read needs prior step or 'path' param\n", .{}) catch {};
-                    return;
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = "read needs prior step or 'path' param";
+                    failure_step_args = step;
+                    break;
                 }
             }
+
+            const line_start_raw = getInt(step, "line_start");
+            const line_end_raw = getInt(step, "line_end");
             const max_lines: usize = if (getInt(step, "lines")) |n| @intCast(@max(1, @min(n, 200))) else 50;
+            const compact = getBool(step, "compact");
+
+            if (line_start_raw) |ls| {
+                if (ls < 1) {
+                    w.print("error: line_start must be >= 1\n", .{}) catch {};
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = "line_start must be >= 1";
+                    failure_step_args = step;
+                    break;
+                }
+            }
+            if (line_end_raw) |le| {
+                if (le < 1) {
+                    w.print("error: line_end must be >= 1\n", .{}) catch {};
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = "line_end must be >= 1";
+                    failure_step_args = step;
+                    break;
+                }
+            }
+            if (line_start_raw != null and line_end_raw != null and line_start_raw.? > line_end_raw.?) {
+                w.print("error: line_start ({d}) > line_end ({d})\n", .{ line_start_raw.?, line_end_raw.? }) catch {};
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "line_start greater than line_end";
+                failure_step_args = step;
+                break;
+            }
+
+            const start_line: u32 = if (line_start_raw) |n| @intCast(@min(@max(1, n), std.math.maxInt(u32))) else 1;
+            const end_line: u32 = if (line_end_raw) |n|
+                @intCast(@min(@max(1, n), std.math.maxInt(u32)))
+            else if (line_start_raw != null or compact)
+                std.math.maxInt(u32)
+            else
+                @intCast(max_lines);
+
             for (file_set.items) |path| {
                 const content = explorer.getContent(path, alloc) catch continue;
                 if (content) |data| {
                     defer alloc.free(data);
                     w.print("--- {s} ---\n", .{path}) catch {};
-                    var ln: usize = 1;
-                    var it = std.mem.splitScalar(u8, data, '\n');
-                    while (it.next()) |line| {
-                        if (ln > max_lines) {
-                            w.print("  ... (truncated)\n", .{}) catch {};
-                            break;
-                        }
-                        w.print("{d:>4}| {s}\n", .{ ln, line }) catch {};
-                        ln += 1;
-                    }
+                    const extracted = explore_mod.extractLines(
+                        data,
+                        start_line,
+                        end_line,
+                        true,
+                        compact,
+                        explore_mod.detectLanguage(path),
+                        alloc,
+                    ) catch {
+                        w.print("error: read failed\n", .{}) catch {};
+                        had_failure = true;
+                        failure_step = step_i;
+                        failure_reason = "read failed";
+                        failure_step_args = step;
+                        break;
+                    };
+                    defer alloc.free(extracted);
+                    out.appendSlice(alloc, extracted) catch {};
                 }
                 if (out.items.len > 100 * 1024) {
                     w.print("... truncated\n", .{}) catch {};
                     break;
                 }
             }
+            if (had_failure) break;
         } else if (std.mem.eql(u8, op, "sort")) {
             if (!have_set) {
                 w.print("error: sort needs prior step\n", .{}) catch {};
-                return;
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "sort needs prior step";
+                failure_step_args = step;
+                break;
             }
             const by = getStr(step, "by") orelse "path";
             if (std.mem.eql(u8, by, "path")) {
@@ -4045,20 +4448,25 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                     }
                 }.lt);
             }
-            // "score" sorting is implicit from find — no re-sort needed
         } else if (std.mem.eql(u8, op, "word")) {
             const word = getStr(step, "word") orelse {
                 w.print("error: word needs 'word'\n", .{}) catch {};
-                finishQueryWithFailure(alloc, out, step_i, "word needs 'word'", step);
-                return;
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "word needs 'word'";
+                failure_step_args = step;
+                break;
             };
             const hits = explorer.searchWord(word, alloc) catch {
                 w.print("error: word search failed\n", .{}) catch {};
-                return;
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "word search failed";
+                failure_step_args = step;
+                break;
             };
             defer alloc.free(hits);
             if (have_set) {
-                // Intersect: only show hits from files in current set
                 var path_set = std.StringHashMap(void).init(alloc);
                 defer path_set.deinit();
                 var hit_set = std.StringHashMap(void).init(alloc);
@@ -4073,14 +4481,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                         hit_set.put(hp, {}) catch {};
                     }
                 }
-                var wr: usize = 0;
-                for (file_set.items) |p| {
-                    if (hit_set.contains(p)) {
-                        file_set.items[wr] = p;
-                        wr += 1;
-                    }
-                }
-                file_set.items.len = wr;
+                retainOwnedPathsPresent(alloc, &file_set, &hit_set);
             } else {
                 explorer.mu.lockShared();
                 defer explorer.mu.unlockShared();
@@ -4092,9 +4493,8 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                     const hp = explorer.word_index.hitPath(h);
                     w.print("  {s}:{d}\n", .{ hp, h.line_num }) catch {};
                     if (!seen.contains(hp)) {
-                        const duped = alloc.dupe(u8, hp) catch continue;
-                        seen.put(duped, {}) catch { alloc.free(duped); continue; };
-                        file_set.append(alloc, duped) catch { alloc.free(duped); continue; };
+                        seen.put(hp, {}) catch continue;
+                        appendOwnedPath(alloc, &file_set, hp) catch continue;
                     }
                 }
                 have_set = true;
@@ -4102,12 +4502,19 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
         } else if (std.mem.eql(u8, op, "symbol")) {
             const name = getStr(step, "name") orelse {
                 w.print("error: symbol needs 'name'\n", .{}) catch {};
-                finishQueryWithFailure(alloc, out, step_i, "symbol needs 'name'", step);
-                return;
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "symbol needs 'name'";
+                failure_step_args = step;
+                break;
             };
             const results = explorer.findAllSymbols(name, alloc) catch {
                 w.print("error: symbol search failed\n", .{}) catch {};
-                return;
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "symbol search failed";
+                failure_step_args = step;
+                break;
             };
             defer {
                 for (results) |r| {
@@ -4117,50 +4524,78 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 }
                 alloc.free(results);
             }
+
+            var path_set = std.StringHashMap(void).init(alloc);
+            defer path_set.deinit();
+            if (have_set) {
+                for (file_set.items) |p| path_set.put(p, {}) catch {};
+            }
+            var hit_set = std.StringHashMap(void).init(alloc);
+            defer hit_set.deinit();
             var seen = std.StringHashMap(void).init(alloc);
             defer seen.deinit();
-            w.print("{d} symbols '{s}':\n", .{ results.len, name }) catch {};
+
+            var visible_total: usize = 0;
             for (results) |r| {
-                w.print("  {s}:{d} ({s})\n", .{ r.path, r.symbol.line_start, @tagName(r.symbol.kind) }) catch {};
+                if (have_set and !path_set.contains(r.path)) continue;
+                visible_total += 1;
             }
-            if (!have_set) {
-                file_set.clearRetainingCapacity();
-                for (results) |r| {
-                    if (!seen.contains(r.path)) {
-                        const duped = alloc.dupe(u8, r.path) catch continue;
-                        seen.put(duped, {}) catch { alloc.free(duped); continue; };
-                        file_set.append(alloc, duped) catch { alloc.free(duped); continue; };
-                    }
+            w.print("{d} symbols '{s}':\n", .{ visible_total, name }) catch {};
+
+            if (!have_set) file_set.clearRetainingCapacity();
+            for (results) |r| {
+                if (have_set and !path_set.contains(r.path)) continue;
+                w.print("  {s}:{d} ({s})\n", .{ r.path, r.symbol.line_start, @tagName(r.symbol.kind) }) catch {};
+                if (have_set) {
+                    hit_set.put(r.path, {}) catch {};
+                } else if (!seen.contains(r.path)) {
+                    seen.put(r.path, {}) catch continue;
+                    appendOwnedPath(alloc, &file_set, r.path) catch continue;
                 }
+            }
+            if (have_set) {
+                retainOwnedPathsPresent(alloc, &file_set, &hit_set);
+            } else {
                 have_set = true;
             }
         } else if (std.mem.eql(u8, op, "limit")) {
             if (!have_set) {
                 w.print("error: limit needs prior step\n", .{}) catch {};
-                return;
+                had_failure = true;
+                failure_step = step_i;
+                failure_reason = "limit needs prior step";
+                failure_step_args = step;
+                break;
             }
             const n: usize = if (getInt(step, "n")) |i| @intCast(@max(1, @min(i, 100))) else 10;
-            if (file_set.items.len > n) file_set.items.len = n;
+            truncateOwnedPaths(alloc, &file_set, n);
         } else {
             w.print("error: unknown op '{s}'\n", .{op}) catch {};
-            return;
+            had_failure = true;
+            failure_step = step_i;
+            failure_reason = "unknown op";
+            failure_step_args = step;
+            break;
         }
-        // Issue #356-p3: track each successfully-completed step.
+
         stages.append(alloc, .{ .op = op, .files_out = file_set.items.len }) catch {};
     }
 
-    if (out.items.len == 0 and have_set) {
-        w.print("{d} files:\n", .{file_set.items.len}) catch {};
-        for (file_set.items) |path| w.print("  {s}\n", .{path}) catch {};
+    if (have_set) {
+        appendQueryTerminalFileSet(alloc, out, &file_set);
     }
 
-    // Issue #356-p3: per-stage summary tail. Lists each completed step's op
-    // and outgoing file count so callers can audit a multi-step pipeline at
-    // a glance without re-parsing the unstructured output above.
     if (stages.items.len > 0) {
         w.print("\n--- stages ---\n", .{}) catch {};
         for (stages.items, 0..) |s, i| {
             w.print("{d}: {s} ({d} files)\n", .{ i, s.op, s.files_out }) catch {};
+        }
+    }
+
+    if (had_failure) {
+        finishQueryWithFailure(alloc, out, failure_step, failure_reason, failure_step_args);
+        if (!std.mem.startsWith(u8, out.items, "error:")) {
+            out.insertSlice(alloc, 0, "error: query pipeline failed\n") catch {};
         }
     }
 }

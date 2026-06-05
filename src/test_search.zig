@@ -135,6 +135,120 @@ test "issue-292: codedb_search guidance does not warn when regex=true is set" {
 }
 
 
+test "issue-p1-2: codedb_search surfaces invalid regex errors" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"query":"(","regex":true}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "invalid regex pattern") != null);
+}
+
+
+test "issue-p1-1: codedb_search widens per-file cap when one file matches" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(testing.allocator);
+    var line_buf: [64]u8 = undefined;
+    for (0..20) |i| {
+        const line = try std.fmt.bufPrint(&line_buf, "Needle line {d}\n", .{i});
+        try content.appendSlice(testing.allocator, line);
+    }
+    try explorer.indexFile("src/solo.zig", content.items);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"query":"Needle","max_results":20}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    var hits: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, out.items, pos, "src/solo.zig:")) |idx| {
+        hits += 1;
+        pos = idx + 1;
+    }
+    try testing.expectEqual(@as(usize, 20), hits);
+    try testing.expect(std.mem.indexOf(u8, out.items, "truncated by per-file cap") == null);
+}
+
+
+test "issue-p1-1: codedb_search regex widens per-file cap when one file matches" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(testing.allocator);
+    var line_buf: [64]u8 = undefined;
+    for (0..20) |i| {
+        const line = try std.fmt.bufPrint(&line_buf, "Needle line {d}\n", .{i});
+        try content.appendSlice(testing.allocator, line);
+    }
+    try explorer.indexFile("src/solo_regex.zig", content.items);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"query":"Needle","regex":true,"max_results":20}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    var hits: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, out.items, pos, "src/solo_regex.zig:")) |idx| {
+        hits += 1;
+        pos = idx + 1;
+    }
+    try testing.expectEqual(@as(usize, 20), hits);
+    try testing.expect(std.mem.indexOf(u8, out.items, "truncated by per-file cap") == null);
+}
+
+
 test "issue-290: codedb_search guidance does not warn on plain hyphen" {
     const args_json = "{\"query\":\"test-case\"}";
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
@@ -143,6 +257,31 @@ test "issue-290: codedb_search guidance does not warn on plain hyphen" {
     defer buf.deinit(testing.allocator);
     mcp_mod.mcpGenerateGuidance(testing.allocator, "codedb_search", &parsed.value.object, "", false, &buf);
     try testing.expect(std.mem.indexOf(u8, buf.items, "regex=true") == null);
+}
+
+
+test "issue-p0-5: searchContent falls back to tier 5 when trigram index is empty" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/main.zig", "pub const SnapshotOnlyNeedle = 42;\n");
+    try testing.expect(explorer.trigram_index.fileCount() > 0);
+
+    explorer.trigram_index.deinit();
+    explorer.trigram_index = .{ .heap = TrigramIndex.init(testing.allocator) };
+    try testing.expectEqual(@as(u32, 0), explorer.trigram_index.fileCount());
+
+    const results = try explorer.searchContent("SnapshotOnlyNeedle", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len > 0);
+    try testing.expectEqualStrings("src/main.zig", results[0].path);
 }
 
 

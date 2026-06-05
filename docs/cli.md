@@ -62,7 +62,7 @@ codedb-cli [root] <command> [args...]
 | `outline <path>` | Symbols in a file (functions, structs, imports) | `codedb-cli outline src/main.zig` |
 | `find <symbol>` | Find symbol definitions across codebase | `codedb-cli find Explorer` |
 | `search <query> [max]` | Trigram full-text search | `codedb-cli search "handleAuth" 20` |
-| `word <identifier>` | O(1) inverted index exact word lookup | `codedb-cli word allocator` |
+| `word <identifier>` | O(1) inverted index identifier/sub-token lookup | `codedb-cli word allocator` |
 | `hot [limit]` | Recently modified files | `codedb-cli hot 5` |
 | `deps <path>` | Reverse dependency graph | `codedb-cli deps src/store.zig` |
 | `read <path> [start] [end]` | Read file content with optional line range | `codedb-cli read src/main.zig 1 30` |
@@ -111,7 +111,7 @@ The CLI overhead is ~7ms (curl + jq) on top of the raw HTTP query time (~8ms).
 ## Requirements
 
 - `curl` and `jq` (both standard on most systems)
-- `codedb` binary (build with Zig 0.15+)
+- `codedb` binary (build with Zig 0.16+)
 
 ## Examples
 

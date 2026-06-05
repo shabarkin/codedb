@@ -11,6 +11,8 @@ Scenarios covered:
      stays alive and tools respond gracefully (0 files, no crash).
   4. issue-512 regression: direct tools/call accepts inline params when
      arguments is empty, matching codedb_bundle's compatibility fallback.
+  5. issue-p0-3 regression: oversized stdin line returns -32700 and the next
+     valid request still succeeds on the same MCP session.
 
 Usage:
   python3 scripts/e2e_mcp_test.py [--binary /path/to/codedb] [--project /path/to/project]
@@ -30,6 +32,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+import re
 
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
@@ -44,6 +47,51 @@ RESET = "\033[0m"
 PASS = f"{GREEN}PASS{RESET}"
 FAIL = f"{RED}FAIL{RESET}"
 SKIP = f"{YELLOW}SKIP{RESET}"
+
+IGNORED_DIRS = {
+    ".git",
+    ".codedb",
+    ".tmp-home",
+    ".venv",
+    ".zig-cache",
+    ".zig-global-cache",
+    ".zig-local-cache",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+    "zig-out",
+}
+
+SOURCE_SUFFIXES = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".dart",
+    ".go",
+    ".h",
+    ".hpp",
+    ".hxx",
+    ".js",
+    ".jsx",
+    ".php",
+    ".py",
+    ".r",
+    ".rb",
+    ".rs",
+    ".ts",
+    ".tsx",
+    ".zig",
+}
+
+SYMBOL_PATTERNS = [
+    re.compile(r"\b(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+    re.compile(r"\b(?:async\s+def|def|function|func)\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+    re.compile(r"\b(?:class|struct|enum|trait|interface|module)\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+    re.compile(r"\b(?:pub\s+const|const|var|let|type)\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+]
 
 
 # ── MCP subprocess wrapper ────────────────────────────────────────────────────
@@ -93,6 +141,11 @@ class MCPProcess:
     def send(self, msg: dict[str, Any]) -> None:
         assert self.proc.stdin
         self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+
+    def send_raw(self, line: str) -> None:
+        assert self.proc.stdin
+        self.proc.stdin.write(line)
         self.proc.stdin.flush()
 
     def recv(self, timeout: float = 10.0) -> dict[str, Any] | None:
@@ -220,7 +273,6 @@ def all_tool_text(resp: dict[str, Any] | None) -> str:
 
 def wait_for_scan(p: MCPProcess, timeout: float = 60.0) -> bool:
     """Poll codedb_status until outlines > 0 (full scan + outline pass done) or timeout."""
-    import re
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         resp = p.call_tool("codedb_status", {}, timeout=5.0)
@@ -236,6 +288,59 @@ def wait_for_scan(p: MCPProcess, timeout: float = 60.0) -> bool:
 def tool_text(resp: dict[str, Any] | None) -> str:
     """Return all content text joined — use all_tool_text directly for assertions."""
     return all_tool_text(resp)
+
+
+def candidate_source_files(project: str, limit: int = 24) -> list[str]:
+    root = Path(project)
+    candidates: list[tuple[int, str]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in IGNORED_DIRS and not name.startswith(".")
+        ]
+        for filename in filenames:
+            if filename.startswith("."):
+                continue
+            suffix = Path(filename).suffix.lower()
+            if suffix not in SOURCE_SUFFIXES:
+                continue
+            path = Path(dirpath) / filename
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            rel = path.relative_to(root).as_posix()
+            candidates.append((size, rel))
+    candidates.sort(key=lambda item: (item[1].count("/"), -item[0], item[1]))
+    return [rel for _, rel in candidates[:limit]]
+
+
+def discover_local_probe(project: str) -> tuple[str, str] | None:
+    root = Path(project)
+    for rel_path in candidate_source_files(project):
+        path = root / rel_path
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for pattern in SYMBOL_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                symbol = match.group(1)
+                if len(symbol) >= 3:
+                    return rel_path, symbol
+    return None
+
+
+def wait_for_probe_outline(p: MCPProcess, probe_path: str, timeout: float = 60.0) -> str | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = p.call_tool("codedb_outline", {"path": probe_path}, timeout=10.0)
+        text = tool_text(resp)
+        if text and "file not indexed" not in text.lower():
+            return text
+        time.sleep(1.0)
+    return None
 
 
 # ── Test cases ────────────────────────────────────────────────────────────────
@@ -267,6 +372,14 @@ def run_scenario_1_issue346_regression(binary: str, project: str) -> list[TestRe
         r = TestResult(f"[S1] {name}")
         results.append(r)
         return r
+
+    probe = discover_local_probe(project)
+    if probe is None:
+        results.append(TestResult("[S1] derive an indexed probe file and symbol").fail(
+            "could not derive a probe file/symbol from the target project"
+        ))
+        return results
+    probe_path, probe_symbol = probe
 
     p = MCPProcess(binary, [], cwd="/")
 
@@ -300,11 +413,14 @@ def run_scenario_1_issue346_regression(binary: str, project: str) -> list[TestRe
         else:
             r.ok(f"{len(text)} chars")
 
-        r = t("codedb_search finds 'DeferredScan' in project")
-        resp = p.call_tool("codedb_search", {"query": "DeferredScan", "max_results": 5})
+        r = t("derive an indexed probe file and symbol")
+        r.ok(f"{probe_path} :: {probe_symbol}")
+
+        r = t("codedb_search finds the derived probe symbol")
+        resp = p.call_tool("codedb_search", {"query": probe_symbol, "max_results": 5})
         text = tool_text(resp)
-        if "DeferredScan" not in text:
-            r.fail(f"DeferredScan not found in search results: {text[:200]!r}")
+        if probe_symbol not in text:
+            r.fail(f"{probe_symbol!r} not found in search results: {text[:200]!r}")
         else:
             r.ok()
 
@@ -316,18 +432,17 @@ def run_scenario_1_issue346_regression(binary: str, project: str) -> list[TestRe
         else:
             r.ok(f"{len(text)} chars")
 
-        r = t("codedb_outline works on src/mcp.zig")
-        resp = p.call_tool("codedb_outline", {"path": "src/mcp.zig"})
-        text = tool_text(resp)
-        if "run" not in text and "DeferredScan" not in text:
-            r.fail(f"outline missing expected symbols: {text[:200]!r}")
+        r = t("codedb_outline works on the derived probe file")
+        text = wait_for_probe_outline(p, probe_path, timeout=30.0)
+        if not text or probe_symbol not in text:
+            r.fail(f"outline missing expected symbols: {(text or '')[:200]!r}")
         else:
             r.ok()
 
-        r = t("codedb_symbol finds 'DeferredScan'")
-        resp = p.call_tool("codedb_symbol", {"name": "DeferredScan"})
+        r = t("codedb_symbol finds the derived probe symbol")
+        resp = p.call_tool("codedb_symbol", {"name": probe_symbol})
         text = tool_text(resp)
-        if "DeferredScan" not in text:
+        if probe_symbol not in text:
             r.fail(f"symbol lookup returned: {text[:200]!r}")
         else:
             r.ok()
@@ -349,6 +464,14 @@ def run_scenario_2_normal_mode(binary: str, project: str) -> list[TestResult]:
         r = TestResult(f"[S2] {name}")
         results.append(r)
         return r
+
+    probe = discover_local_probe(project)
+    if probe is None:
+        results.append(TestResult("[S2] derive an indexed probe file and symbol").fail(
+            "could not derive a probe file/symbol from the target project"
+        ))
+        return results
+    probe_path, probe_symbol = probe
 
     p = MCPProcess(binary, [], cwd="/", command=[binary, project, "mcp"])
 
@@ -375,10 +498,20 @@ def run_scenario_2_normal_mode(binary: str, project: str) -> list[TestResult]:
         else:
             r.ok()
 
+        r = t("derive an indexed probe file and symbol")
+        r.ok(probe_symbol)
+
+        r = t("derived probe file becomes outline-readable")
+        probe_outline = wait_for_probe_outline(p, probe_path, timeout=30.0)
+        if not probe_outline or probe_symbol not in probe_outline:
+            r.fail(f"probe outline missing expected symbol: {(probe_outline or '')[:200]!r}")
+            return results
+        r.ok()
+
         r = t("codedb_search works")
-        resp = p.call_tool("codedb_search", {"query": "isIndexableRoot", "max_results": 3})
+        resp = p.call_tool("codedb_search", {"query": probe_symbol, "max_results": 3})
         text = tool_text(resp)
-        if "isIndexableRoot" not in text:
+        if probe_symbol not in text:
             r.fail(f"search result: {text[:200]!r}")
         else:
             r.ok()
@@ -457,6 +590,14 @@ def run_scenario_4_issue512_direct_inline_args(binary: str, project: str) -> lis
         results.append(r)
         return r
 
+    probe = discover_local_probe(project)
+    if probe is None:
+        results.append(TestResult("[S4] derive an indexed probe file and symbol").fail(
+            "could not derive a probe file/symbol from the target project"
+        ))
+        return results
+    probe_path, probe_symbol = probe
+
     p = MCPProcess(binary, [], cwd="/", command=[binary, project, "mcp"])
 
     try:
@@ -474,21 +615,78 @@ def run_scenario_4_issue512_direct_inline_args(binary: str, project: str) -> lis
             return results
         r.ok()
 
+        r = t("derive an indexed probe file and symbol")
+        r.ok(f"{probe_path} :: {probe_symbol}")
+
+        r = t("derived probe file becomes outline-readable")
+        probe_outline = wait_for_probe_outline(p, probe_path, timeout=30.0)
+        if not probe_outline or probe_symbol not in probe_outline:
+            r.fail(f"probe outline missing expected symbol: {(probe_outline or '')[:200]!r}")
+            return results
+        r.ok()
+
         r = t("direct tools/call accepts inline path with empty arguments")
         resp = p.call_tool_params({
             "name": "codedb_outline",
             "arguments": {},
-            "path": "src/mcp.zig",
+            "path": probe_path,
         })
         text = tool_text(resp)
         if resp is None:
             r.fail("no response to inline-arg tools/call")
         elif "missing 'path'" in text or "received keys: []" in text:
             r.fail(f"inline path was dropped: {text[:220]!r}")
-        elif "src/mcp.zig" not in text and "handleCall" not in text:
+        elif probe_path not in text and probe_symbol not in text:
             r.fail(f"outline response missing expected file/symbol: {text[:220]!r}")
         else:
             r.ok()
+
+    finally:
+        p.close()
+
+    return results
+
+
+def run_scenario_5_issue_p0_3_oversized_line(binary: str, project: str) -> list[TestResult]:
+    """
+    issue-p0-3: an oversized stdin line must yield -32700 without killing the
+    session, and the following valid request must still succeed.
+    """
+    results: list[TestResult] = []
+
+    def t(name: str) -> TestResult:
+        r = TestResult(f"[S5] {name}")
+        results.append(r)
+        return r
+
+    p = MCPProcess(binary, [], cwd="/", command=[binary, project, "mcp"])
+
+    try:
+        r = t("oversized line returns JSON-RPC parse error")
+        p.send_raw(("x" * (1024 * 1024 + 1)) + "\n")
+        resp = p.recv(timeout=10.0)
+        if resp is None:
+            r.fail("no response after oversized line")
+            return results
+        err = resp.get("error")
+        if not isinstance(err, dict) or err.get("code") != -32700:
+            r.fail(f"unexpected oversized-line response: {resp!r}")
+            return results
+        r.ok()
+
+        r = t("initialize still succeeds after oversized line")
+        ok = do_initialize(p, with_roots=False)
+        if not ok:
+            r.fail("initialize failed after oversized line")
+            return results
+        r.ok()
+
+        r = t("next valid tools/call still succeeds")
+        resp = p.call_tool("codedb_status", {})
+        if resp is None or "result" not in resp:
+            r.fail(f"codedb_status failed after oversized line: {resp!r}")
+        else:
+            r.ok(tool_text(resp)[:80])
 
     finally:
         p.close()
@@ -531,6 +729,9 @@ def main() -> int:
 
     print(f"\n{CYAN}── Scenario 4: issue-512 direct inline args ──{RESET}")
     all_results += run_scenario_4_issue512_direct_inline_args(binary, project)
+
+    print(f"\n{CYAN}── Scenario 5: oversized stdin line recovery ──{RESET}")
+    all_results += run_scenario_5_issue_p0_3_oversized_line(binary, project)
 
     print()
     passed = 0

@@ -1,6 +1,6 @@
 # codedb Benchmarks
 
-Benchmarked on Apple Silicon (M-series), Zig 0.15.1, macOS.
+Benchmarked on Apple Silicon (M-series), Zig 0.16, macOS.
 
 ## Cold Start (Indexing)
 
@@ -112,7 +112,7 @@ WordIndex       inverted word → (path, line) index, O(1) lookup
 TrigramIndex    3-byte sequence → file set index, intersection-based candidate filtering
 Watcher         mtime + hash change detection, 2s polling, per-cycle arena
 EditEngine      line-based replace/insert/delete with lock acquisition + provenance
-MCP Server      JSON-RPC 2.0 over stdio, 11 tools
+MCP Server      JSON-RPC 2.0 over stdio, 22 tools
 HTTP Server     JSON API on :7719
 ```
 

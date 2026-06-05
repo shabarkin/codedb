@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const cio = @import("cio.zig");
 const testing = std.testing;
 const io = std.testing.io;
@@ -8,7 +9,7 @@ const Language = explore.Language;
 const SymbolKind = explore.SymbolKind;
 const DependencyGraph = explore.DependencyGraph;
 const Store = @import("store.zig").Store;
-
+const tree_sitter = @import("tree_sitter.zig");
 
 fn expectOutlineSymbol(outline: *const explore.FileOutline, name: []const u8, kind: SymbolKind) !void {
     for (outline.symbols.items) |sym| {
@@ -17,7 +18,6 @@ fn expectOutlineSymbol(outline: *const explore.FileOutline, name: []const u8, ki
     return error.TestUnexpectedResult;
 }
 
-
 fn expectOutlineImport(outline: *const explore.FileOutline, import_path: []const u8) !void {
     for (outline.imports.items) |imp| {
         if (std.mem.eql(u8, imp, import_path)) return;
@@ -25,6 +25,514 @@ fn expectOutlineImport(outline: *const explore.FileOutline, import_path: []const
     return error.TestUnexpectedResult;
 }
 
+fn expectNoOutlineImport(outline: *const explore.FileOutline, import_path: []const u8) !void {
+    for (outline.imports.items) |imp| {
+        if (std.mem.eql(u8, imp, import_path)) return error.TestUnexpectedResult;
+    }
+}
+
+fn expectNoOutlineSymbol(outline: *const explore.FileOutline, name: []const u8) !void {
+    for (outline.symbols.items) |sym| {
+        if (std.mem.eql(u8, sym.name, name)) return error.TestUnexpectedResult;
+    }
+}
+
+test "issue-ts-0: tree-sitter rust smoke parses and walks named nodes" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    try testing.expect(tree_sitter.rustLanguageVersion() >= tree_sitter.tree_sitter_min_compatible_language_version);
+    try testing.expect(tree_sitter.rustLanguageVersion() <= tree_sitter.tree_sitter_language_version);
+
+    const source =
+        \\pub struct Greeter;
+        \\
+        \\impl Greeter {
+        \\    pub fn greet(&self) {}
+        \\}
+    ;
+
+    var parser = try tree_sitter.Parser.initRust();
+    defer parser.deinit();
+
+    var tree = try parser.parseString(source);
+    defer tree.deinit();
+
+    const root = tree.rootNode();
+    try testing.expectEqualStrings("source_file", tree_sitter.nodeType(root));
+    try testing.expect(tree_sitter.namedChildCount(root) >= 2);
+    try testing.expectEqualStrings("struct_item", tree_sitter.nodeType(tree_sitter.namedChild(root, 0)));
+    try testing.expectEqualStrings("impl_item", tree_sitter.nodeType(tree_sitter.namedChild(root, 1)));
+
+    var dump: std.ArrayList(u8) = .empty;
+    defer dump.deinit(testing.allocator);
+    try tree_sitter.dumpNamedNodes(cio.listWriter(&dump, testing.allocator), root);
+
+    try testing.expect(std.mem.indexOf(u8, dump.items, "source_file") != null);
+    try testing.expect(std.mem.indexOf(u8, dump.items, "struct_item") != null);
+    try testing.expect(std.mem.indexOf(u8, dump.items, "impl_item") != null);
+    try testing.expect(std.mem.indexOf(u8, dump.items, "function_item") != null);
+}
+
+test "issue-ts-rust: rust outline uses tree-sitter spans and impl target" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/lib.rs",
+        \\use crate::fmt::Display;
+        \\
+        \\pub struct Greeter;
+        \\
+        \\impl Display for Greeter {
+        \\    pub fn greet(&self) {
+        \\        let _ = 1;
+        \\    }
+        \\}
+        \\
+        \\#[test]
+        \\fn works() {
+        \\    assert!(true);
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/lib.rs", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectOutlineImport(&outline, "use crate::fmt::Display;");
+    try expectOutlineSymbol(&outline, "Greeter", .struct_def);
+    try expectOutlineSymbol(&outline, "Greeter", .impl_block);
+    try expectOutlineSymbol(&outline, "greet", .function);
+    try expectOutlineSymbol(&outline, "works", .test_decl);
+
+    var found_impl_span = false;
+    var found_method_span = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .impl_block and std.mem.eql(u8, sym.name, "Greeter")) {
+            try testing.expect(sym.line_start == 5);
+            try testing.expect(sym.line_end == 9);
+            found_impl_span = true;
+        }
+        if (sym.kind == .function and std.mem.eql(u8, sym.name, "greet")) {
+            try testing.expect(sym.line_start == 6);
+            try testing.expect(sym.line_end == 8);
+            found_method_span = true;
+        }
+    }
+    try testing.expect(found_impl_span);
+    try testing.expect(found_method_span);
+}
+
+test "issue-ts-rust-inline-mod: inline module stays local and preserves nested items" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/lib.rs",
+        \\mod helpers {
+        \\    pub struct Inner;
+        \\    pub fn helper() {}
+        \\}
+        \\
+        \\mod disk;
+    );
+
+    var outline = (try explorer.getOutline("src/lib.rs", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectOutlineSymbol(&outline, "Inner", .struct_def);
+    try expectOutlineSymbol(&outline, "helper", .function);
+    try expectOutlineImport(&outline, "disk");
+    try expectNoOutlineImport(&outline, "helpers");
+
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .import and std.mem.eql(u8, sym.name, "helpers")) {
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "issue-ts-typescript-0: tree-sitter typescript smoke parses named nodes" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    try testing.expect(tree_sitter.typescriptLanguageVersion() >= tree_sitter.tree_sitter_min_compatible_language_version);
+    try testing.expect(tree_sitter.typescriptLanguageVersion() <= tree_sitter.tree_sitter_language_version);
+
+    const source =
+        \\import { foo as f } from './foo';
+        \\
+        \\export class Greeter {
+        \\    greet() {
+        \\        return f();
+        \\    }
+        \\}
+    ;
+
+    var parser = try tree_sitter.Parser.initTypeScript();
+    defer parser.deinit();
+
+    var tree = try parser.parseString(source);
+    defer tree.deinit();
+
+    const root = tree.rootNode();
+    try testing.expectEqualStrings("program", tree_sitter.nodeType(root));
+    try testing.expect(tree_sitter.namedChildCount(root) >= 2);
+}
+
+test "issue-ts-typescript: tree-sitter typescript outline captures methods and ignores body locals" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/component.ts",
+        \\import { foo as f } from './foo';
+        \\
+        \\export class Greeter {
+        \\    greet() {
+        \\        const hidden = 1;
+        \\        if (hidden) {
+        \\            function inner() {}
+        \\        }
+        \\        return f();
+        \\    }
+        \\}
+        \\
+        \\export interface Runner {
+        \\    run(): void;
+        \\}
+        \\
+        \\const PORT = 3000;
+    );
+
+    var outline = (try explorer.getOutline("src/component.ts", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectOutlineImport(&outline, "./foo");
+    try expectOutlineSymbol(&outline, "Greeter", .class_def);
+    try expectOutlineSymbol(&outline, "greet", .method);
+    try expectOutlineSymbol(&outline, "Runner", .interface_def);
+    try expectOutlineSymbol(&outline, "run", .method);
+    try expectOutlineSymbol(&outline, "PORT", .constant);
+    try expectNoOutlineSymbol(&outline, "hidden");
+    try expectNoOutlineSymbol(&outline, "inner");
+}
+
+test "issue-ts-tsx: tsx grammar handles jsx bodies" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/widget.tsx",
+        \\export class Widget {
+        \\    render() {
+        \\        return <div className="ok">{1}</div>;
+        \\    }
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/widget.tsx", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectOutlineSymbol(&outline, "Widget", .class_def);
+    try expectOutlineSymbol(&outline, "render", .method);
+}
+
+test "issue-ts-python: tree-sitter python handles decorated async defs and import aliases" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    try testing.expect(tree_sitter.pythonLanguageVersion() >= tree_sitter.tree_sitter_min_compatible_language_version);
+    try testing.expect(tree_sitter.pythonLanguageVersion() <= tree_sitter.tree_sitter_language_version);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("pkg/app.py",
+        \\from . import util
+        \\import helpers as h
+        \\
+        \\class Server:
+        \\    @classmethod
+        \\    async def handle(cls):
+        \\        def inner():
+        \\            return 1
+        \\        return inner()
+        \\
+        \\async def main():
+        \\    return h
+    );
+
+    var outline = (try explorer.getOutline("pkg/app.py", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectOutlineImport(&outline, ".util");
+    try expectOutlineImport(&outline, "helpers");
+    try expectOutlineSymbol(&outline, "Server", .class_def);
+    try expectOutlineSymbol(&outline, "handle", .method);
+    try expectOutlineSymbol(&outline, "main", .function);
+    try expectNoOutlineSymbol(&outline, "inner");
+}
+
+test "issue-ts-go: tree-sitter go handles import blocks and receiver methods" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    try testing.expect(tree_sitter.goLanguageVersion() >= tree_sitter.tree_sitter_min_compatible_language_version);
+    try testing.expect(tree_sitter.goLanguageVersion() <= tree_sitter.tree_sitter_language_version);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("main.go",
+        \\package main
+        \\
+        \\import (
+        \\    "fmt"
+        \\    `net/http`
+        \\)
+        \\
+        \\type Config struct {
+        \\    Port int
+        \\}
+        \\
+        \\type Handler interface {
+        \\    Handle()
+        \\}
+        \\
+        \\func main() {
+        \\    fmt.Println(http.MethodGet)
+        \\}
+        \\
+        \\func (c *Config) Validate() bool {
+        \\    return c.Port > 0
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("main.go", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectOutlineImport(&outline, "fmt");
+    try expectOutlineImport(&outline, "net/http");
+    try expectOutlineSymbol(&outline, "Config", .struct_def);
+    try expectOutlineSymbol(&outline, "Handler", .struct_def);
+    try expectOutlineSymbol(&outline, "main", .function);
+    try expectOutlineSymbol(&outline, "Validate", .function);
+}
+
+test "issue-ts-hcl-0: tree-sitter hcl smoke parses named blocks" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    try testing.expect(tree_sitter.hclLanguageVersion() >= tree_sitter.tree_sitter_min_compatible_language_version);
+    try testing.expect(tree_sitter.hclLanguageVersion() <= tree_sitter.tree_sitter_language_version);
+
+    const source =
+        \\resource "aws_instance" "web" {
+        \\  ami = "abc-123"
+        \\}
+    ;
+
+    var parser = try tree_sitter.Parser.initHcl();
+    defer parser.deinit();
+
+    var tree = try parser.parseString(source);
+    defer tree.deinit();
+
+    try testing.expect(tree_sitter.namedChildCount(tree.rootNode()) >= 1);
+}
+
+test "issue-ts-hcl: tree-sitter hcl outline preserves terraform block labels" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("main.tf",
+        \\provider "aws" {
+        \\  region = "us-east-1"
+        \\}
+        \\resource "aws_instance" "web" {
+        \\  user_data = "{ not a block }"
+        \\}
+        \\module "vpc" {
+        \\  source = "./modules/vpc"
+        \\}
+        \\variable "region" {}
+        \\output "ip" {}
+        \\locals {
+        \\  name = "demo"
+        \\}
+        \\terraform {
+        \\  required_version = ">= 1.0.0"
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("main.tf", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectOutlineSymbol(&outline, "aws", .import);
+    try expectOutlineSymbol(&outline, "web", .struct_def);
+    try expectOutlineSymbol(&outline, "vpc", .import);
+    try expectOutlineSymbol(&outline, "region", .variable);
+    try expectOutlineSymbol(&outline, "ip", .constant);
+    try expectOutlineSymbol(&outline, "locals", .struct_def);
+    try expectOutlineSymbol(&outline, "terraform", .struct_def);
+    try testing.expectEqual(@as(usize, 0), outline.imports.items.len);
+}
+
+test "issue-ts-r-0: tree-sitter r smoke parses top-level assignment" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    try testing.expect(tree_sitter.rLanguageVersion() >= tree_sitter.tree_sitter_min_compatible_language_version);
+    try testing.expect(tree_sitter.rLanguageVersion() <= tree_sitter.tree_sitter_language_version);
+
+    const source =
+        \\greet <- function(name) {
+        \\  paste("Hello", name)
+        \\}
+    ;
+
+    var parser = try tree_sitter.Parser.initR();
+    defer parser.deinit();
+
+    var tree = try parser.parseString(source);
+    defer tree.deinit();
+
+    const root = tree.rootNode();
+    try testing.expect(tree_sitter.namedChildCount(root) >= 1);
+    try testing.expectEqualStrings("binary_operator", tree_sitter.nodeType(tree_sitter.namedChild(root, 0)));
+}
+
+test "issue-ts-r: tree-sitter r outline handles imports classes and function strings" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("analysis.R",
+        \\greet <- function(name) {
+        \\  text <- "{ still a string }"
+        \\  paste("Hello", name)
+        \\}
+        \\library(dplyr)
+        \\require("ggplot2")
+        \\setClass("Person")
+    );
+
+    var outline = (try explorer.getOutline("analysis.R", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectOutlineSymbol(&outline, "greet", .function);
+    try expectOutlineSymbol(&outline, "Person", .class_def);
+    try expectOutlineImport(&outline, "dplyr");
+    try expectOutlineImport(&outline, "ggplot2");
+    try expectNoOutlineSymbol(&outline, "text");
+}
+
+test "issue-ts-ruby: tree-sitter ruby handles require_relative and nested defs" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    try testing.expect(tree_sitter.rubyLanguageVersion() >= tree_sitter.tree_sitter_min_compatible_language_version);
+    try testing.expect(tree_sitter.rubyLanguageVersion() <= tree_sitter.tree_sitter_language_version);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("app.rb",
+        \\require "json"
+        \\require_relative "./helpers"
+        \\
+        \\module Authentication
+        \\  class User
+        \\    def initialize(name)
+        \\      @name = name
+        \\    end
+        \\
+        \\    def self.lookup(id)
+        \\      id
+        \\    end
+        \\  end
+        \\end
+    );
+
+    var outline = (try explorer.getOutline("app.rb", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectOutlineImport(&outline, "json");
+    try expectOutlineImport(&outline, "./helpers");
+    try expectOutlineSymbol(&outline, "Authentication", .struct_def);
+    try expectOutlineSymbol(&outline, "User", .struct_def);
+    try expectOutlineSymbol(&outline, "initialize", .function);
+    try expectOutlineSymbol(&outline, "lookup", .function);
+}
+
+test "issue-ts-c-0: tree-sitter c smoke parses named nodes" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    try testing.expect(tree_sitter.cLanguageVersion() >= tree_sitter.tree_sitter_min_compatible_language_version);
+    try testing.expect(tree_sitter.cLanguageVersion() <= tree_sitter.tree_sitter_language_version);
+
+    const source =
+        \\#include <stdio.h>
+        \\int main(void) { return 0; }
+    ;
+
+    var parser = try tree_sitter.Parser.initC();
+    defer parser.deinit();
+
+    var tree = try parser.parseString(source);
+    defer tree.deinit();
+
+    const root = tree.rootNode();
+    try testing.expectEqualStrings("translation_unit", tree_sitter.nodeType(root));
+    try testing.expect(tree_sitter.namedChildCount(root) >= 2);
+
+    var dump: std.ArrayList(u8) = .empty;
+    defer dump.deinit(testing.allocator);
+    try tree_sitter.dumpNamedNodes(cio.listWriter(&dump, testing.allocator), root);
+
+    try testing.expect(std.mem.indexOf(u8, dump.items, "preproc_include") != null);
+    try testing.expect(std.mem.indexOf(u8, dump.items, "function_definition") != null);
+}
+
+test "issue-ts-dart-0: tree-sitter dart smoke parses named nodes" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    try testing.expect(tree_sitter.dartLanguageVersion() >= tree_sitter.tree_sitter_min_compatible_language_version);
+    try testing.expect(tree_sitter.dartLanguageVersion() <= tree_sitter.tree_sitter_language_version);
+
+    const source =
+        \\import 'package:flutter/widgets.dart';
+        \\class Greeter {
+        \\  Widget build() => const Placeholder();
+        \\}
+    ;
+
+    var parser = try tree_sitter.Parser.initDart();
+    defer parser.deinit();
+
+    var tree = try parser.parseString(source);
+    defer tree.deinit();
+
+    const root = tree.rootNode();
+    try testing.expect(tree_sitter.namedChildCount(root) >= 2);
+
+    var dump: std.ArrayList(u8) = .empty;
+    defer dump.deinit(testing.allocator);
+    try tree_sitter.dumpNamedNodes(cio.listWriter(&dump, testing.allocator), root);
+
+    try testing.expect(std.mem.indexOf(u8, dump.items, "import_or_export") != null);
+    try testing.expect(std.mem.indexOf(u8, dump.items, "class_definition") != null);
+}
 
 test "issue-301: Dart / Flutter parser" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -96,6 +604,36 @@ test "issue-301: Dart / Flutter parser" {
     try testing.expect(std.mem.indexOf(u8, tree, "home_screen.dart  dart") != null);
 }
 
+test "issue-ts-php-0: tree-sitter php smoke parses named nodes" {
+    if (!build_options.tree_sitter) return error.SkipZigTest;
+
+    try testing.expect(tree_sitter.phpLanguageVersion() >= tree_sitter.tree_sitter_min_compatible_language_version);
+    try testing.expect(tree_sitter.phpLanguageVersion() <= tree_sitter.tree_sitter_language_version);
+
+    const source =
+        \\<?php
+        \\use App\Models\User;
+        \\class Greeter {
+        \\    public function hello() {}
+        \\}
+    ;
+
+    var parser = try tree_sitter.Parser.initPhp();
+    defer parser.deinit();
+
+    var tree = try parser.parseString(source);
+    defer tree.deinit();
+
+    const root = tree.rootNode();
+    try testing.expect(tree_sitter.namedChildCount(root) >= 2);
+
+    var dump: std.ArrayList(u8) = .empty;
+    defer dump.deinit(testing.allocator);
+    try tree_sitter.dumpNamedNodes(cio.listWriter(&dump, testing.allocator), root);
+
+    try testing.expect(std.mem.indexOf(u8, dump.items, "namespace_use_declaration") != null);
+    try testing.expect(std.mem.indexOf(u8, dump.items, "class_declaration") != null);
+}
 
 test "issue-php-1: PHP class definition herkend" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -123,7 +661,6 @@ test "issue-php-1: PHP class definition herkend" {
     }
     try testing.expect(found);
 }
-
 
 test "issue-php-2: PHP methode binnen class herkend" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -154,7 +691,6 @@ test "issue-php-2: PHP methode binnen class herkend" {
     try testing.expectEqual(@as(usize, 2), method_count);
 }
 
-
 test "issue-php-3: PHP top-level functie herkend" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -181,7 +717,6 @@ test "issue-php-3: PHP top-level functie herkend" {
     try testing.expectEqual(@as(usize, 2), fn_count);
 }
 
-
 test "issue-php-4: PHP interface herkend" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -207,7 +742,6 @@ test "issue-php-4: PHP interface herkend" {
     }
     try testing.expect(found);
 }
-
 
 test "issue-php-5: PHP trait herkend" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -237,7 +771,6 @@ test "issue-php-5: PHP trait herkend" {
     try testing.expect(found);
 }
 
-
 test "issue-php-6: PHP use-import omgezet naar pad in dep_graph" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -256,7 +789,6 @@ test "issue-php-6: PHP use-import omgezet naar pad in dep_graph" {
     try testing.expectEqualStrings("app/Models/Candidate.php", outline.imports.items[0]);
     try testing.expectEqualStrings("illuminate/Support/Facades/DB.php", outline.imports.items[1]);
 }
-
 
 test "issue-php-7: PHP commentaarregels worden overgeslagen" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -280,7 +812,6 @@ test "issue-php-7: PHP commentaarregels worden overgeslagen" {
     try testing.expectEqual(@as(usize, 1), outline.symbols.items.len);
     try testing.expect(outline.symbols.items[0].kind == .class_def);
 }
-
 
 test "issue-php-8: PHP function after class is top-level, not method" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -314,7 +845,6 @@ test "issue-php-8: PHP function after class is top-level, not method" {
     try testing.expectEqual(@as(usize, 1), function_count);
 }
 
-
 test "issue-php-9: PHP 8.1 enum herkend" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -343,7 +873,6 @@ test "issue-php-9: PHP 8.1 enum herkend" {
     try testing.expect(found_method);
 }
 
-
 test "issue-php-10: PHP grouped use-statement parsed into individual imports" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -364,7 +893,6 @@ test "issue-php-10: PHP grouped use-statement parsed into individual imports" {
     try testing.expectEqualStrings("app/Models/Candidate.php", outline.imports.items[1]);
     try testing.expectEqualStrings("app/Models/Role.php", outline.imports.items[2]);
 }
-
 
 test "issue-php-11: PHP readonly class herkend" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -391,7 +919,6 @@ test "issue-php-11: PHP readonly class herkend" {
     try testing.expect(found);
 }
 
-
 test "issue-php-12: PHP class and public constants herkend" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -416,7 +943,6 @@ test "issue-php-12: PHP class and public constants herkend" {
     }
     try testing.expectEqual(@as(usize, 3), constant_count);
 }
-
 
 test "issue-php-13: PHP nested braces in methods do not break class tracking" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -459,7 +985,6 @@ test "issue-php-13: PHP nested braces in methods do not break class tracking" {
     try testing.expectEqual(@as(usize, 1), function_count);
 }
 
-
 test "issue-php-14: PHP multi-line block comments do not produce symbols" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -496,7 +1021,6 @@ test "issue-php-14: PHP multi-line block comments do not produce symbols" {
     try testing.expectEqual(@as(usize, 1), function_count);
 }
 
-
 test "issue-php-15: PHP use-as alias stripped from import path" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -513,7 +1037,6 @@ test "issue-php-15: PHP use-as alias stripped from import path" {
     try testing.expectEqual(@as(usize, 1), outline.imports.items.len);
     try testing.expectEqualStrings("app/Models/User.php", outline.imports.items[0]);
 }
-
 
 test "issue-php-16: PHP escaped quotes do not end string mode" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -552,7 +1075,6 @@ test "issue-php-16: PHP escaped quotes do not end string mode" {
     try testing.expectEqual(@as(usize, 1), function_count);
 }
 
-
 test "issue-php-17: PHP code after block comment terminator is parsed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -578,7 +1100,6 @@ test "issue-php-17: PHP code after block comment terminator is parsed" {
     try testing.expectEqual(@as(usize, 1), function_count);
 }
 
-
 test "issue-php-18: PHP use-as alias case-insensitive" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -598,7 +1119,6 @@ test "issue-php-18: PHP use-as alias case-insensitive" {
     try testing.expectEqualStrings("app/Services/Cache.php", outline.imports.items[1]);
     try testing.expectEqualStrings("app/Services/Logger.php", outline.imports.items[2]);
 }
-
 
 test "issue-111: Python triple-quote docstrings not parsed as code" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -624,7 +1144,6 @@ test "issue-111: Python triple-quote docstrings not parsed as code" {
     try testing.expect(func_count == 1);
 }
 
-
 test "issue-112: Python import-as alias stripped from dep path" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -640,7 +1159,6 @@ test "issue-112: Python import-as alias stripped from dep path" {
     }
     try testing.expect(deps.len == 1);
 }
-
 
 test "issue-113: TypeScript block comments not parsed as code" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -663,7 +1181,6 @@ test "issue-113: TypeScript block comments not parsed as code" {
     try testing.expect(func_count == 1);
 }
 
-
 test "issue-114: TypeScript import-as alias does not affect dep path" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -678,7 +1195,6 @@ test "issue-114: TypeScript import-as alias does not affect dep path" {
     try testing.expect(outline.imports.items.len == 1);
     try testing.expectEqualStrings("./mod", outline.imports.items[0]);
 }
-
 
 test "issue-151: Go func and type definitions" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -720,7 +1236,6 @@ test "issue-151: Go func and type definitions" {
     try testing.expect(outline.imports.items.len == 1); // "fmt"
 }
 
-
 test "issue-151: Ruby class, module, and def" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -756,7 +1271,6 @@ test "issue-151: Ruby class, module, and def" {
     try testing.expect(outline.imports.items.len == 2); // json + ./helpers
 }
 
-
 test "issue-151: Ruby =begin/=end comments skipped" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -782,7 +1296,6 @@ test "issue-151: Ruby =begin/=end comments skipped" {
     try testing.expect(func_count == 1); // only real_method
 }
 
-
 test "issue-151: Go block comments skipped" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -805,7 +1318,6 @@ test "issue-151: Go block comments skipped" {
     }
     try testing.expect(func_count == 1); // only realFunc
 }
-
 
 test "issue-301: Dart block comments skipped" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -833,7 +1345,6 @@ test "issue-301: Dart block comments skipped" {
     try testing.expectEqual(@as(usize, 0), func_count);
 }
 
-
 test "issue-179: block comment does not produce phantom symbols" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -855,7 +1366,6 @@ test "issue-179: block comment does not produce phantom symbols" {
     try testing.expect(!found_fake);
 }
 
-
 test "issue-179: code after single-line /* */ comment is parsed" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -873,7 +1383,6 @@ test "issue-179: code after single-line /* */ comment is parsed" {
     }
     try testing.expect(found);
 }
-
 
 test "issue-179: Python docstring with text does not leak symbols" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -896,7 +1405,6 @@ test "issue-179: Python docstring with text does not leak symbols" {
     try testing.expect(!found_fake);
 }
 
-
 test "issue-108: HCL resource block parsed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -912,7 +1420,6 @@ test "issue-108: HCL resource block parsed" {
     try testing.expect(results.len == 1);
     try testing.expectEqual(SymbolKind.struct_def, results[0].symbol.kind);
 }
-
 
 test "issue-108: HCL variable and output parsed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -937,7 +1444,6 @@ test "issue-108: HCL variable and output parsed" {
     try testing.expectEqual(SymbolKind.constant, outs[0].symbol.kind);
 }
 
-
 test "issue-108: HCL module and provider parsed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -959,7 +1465,6 @@ test "issue-108: HCL module and provider parsed" {
     try testing.expect(mods.len == 1);
 }
 
-
 test "issue-108: HCL comment lines skipped" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -974,7 +1479,6 @@ test "issue-108: HCL comment lines skipped" {
     defer alloc.free(results);
     try testing.expect(results.len == 1);
 }
-
 
 test "issue-215: R function assignment parsed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -992,7 +1496,6 @@ test "issue-215: R function assignment parsed" {
     try testing.expectEqual(SymbolKind.function, results[0].symbol.kind);
 }
 
-
 test "issue-215: R library import parsed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1005,7 +1508,6 @@ test "issue-215: R library import parsed" {
     const outline = try explorer.getOutline("script.r", alloc) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 2), outline.imports.items.len);
 }
-
 
 test "issue-215: R setClass parsed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1024,7 +1526,6 @@ test "issue-215: R setClass parsed" {
     defer alloc.free(a2);
     try testing.expect(a2.len == 1);
 }
-
 
 test "issue-319: C parser extracts includes macros types and functions" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1103,7 +1604,6 @@ test "issue-319: C parser extracts includes macros types and functions" {
     try testing.expectEqual(SymbolKind.function, alloc_item[0].symbol.kind);
 }
 
-
 test "issue-319: C parser avoids comments strings prototypes and macro calls" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1149,7 +1649,6 @@ test "issue-319: C parser avoids comments strings prototypes and macro calls" {
     defer alloc.free(handler);
     try testing.expectEqual(@as(usize, 0), handler.len);
 }
-
 
 test "issue-321: common detected extensions produce outlines" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1466,7 +1965,6 @@ test "issue-321: common detected extensions produce outlines" {
     try testing.expectEqual(@as(usize, 1), r0.len);
 }
 
-
 test "issue-179: Python inline docstring does not leak symbols" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1487,7 +1985,6 @@ test "issue-179: Python inline docstring does not leak symbols" {
     defer alloc.free(fake);
     try testing.expectEqual(@as(usize, 0), fake.len);
 }
-
 
 test "issue-179: Python multi-line docstring with def inside" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1513,7 +2010,6 @@ test "issue-179: Python multi-line docstring with def inside" {
     defer alloc.free(inner);
     try testing.expectEqual(@as(usize, 0), inner.len);
 }
-
 
 test "issue-331: C parser does not index indented call sites as functions" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1553,7 +2049,6 @@ test "issue-331: C parser does not index indented call sites as functions" {
     try testing.expect(found_real);
 }
 
-
 test "issue-331: C parser finds nginx-style split-line definitions" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1586,7 +2081,6 @@ test "issue-331: C parser finds nginx-style split-line definitions" {
     try testing.expect(found_init);
     try testing.expect(found_create);
 }
-
 
 test "issue-392: Swift parser" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1651,4 +2145,3 @@ test "issue-392: Swift parser" {
     try testing.expect(found_top_fn);
     try testing.expect(found_method);
 }
-

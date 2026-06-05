@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cio = @import("cio.zig");
 const ContentCache = @import("hot_cache.zig").ContentCache;
 
@@ -1834,6 +1835,7 @@ pub const MmapTrigramIndex = struct {
         for (self.file_table) |p| self.allocator.free(p);
         self.allocator.free(self.file_table);
         self.file_set.deinit();
+        if (builtin.os.tag == .freestanding) return;
         std.posix.munmap(self.postings_data);
         std.posix.munmap(self.lookup_data);
     }

@@ -36,6 +36,7 @@ const path_security = @import("path_security.zig");
 
 const MAGIC = [4]u8{ 'C', 'D', 'B', 0x01 };
 const FORMAT_VERSION: u16 = 2;
+const max_snapshot_string_len = std.math.maxInt(u16);
 
 pub const SectionId = enum(u32) {
     tree = 1,
@@ -166,10 +167,7 @@ pub fn writeSnapshot(
             const path = entry.key_ptr.*;
             const outline = entry.value_ptr;
 
-            var path_len_buf: [2]u8 = undefined;
-            std.mem.writeInt(u16, &path_len_buf, @intCast(path.len), .little);
-            try writer.writeAll(&path_len_buf);
-            try writer.writeAll(path);
+            try writeSnapshotString(writer, path);
 
             try writer.writeByte(@intFromEnum(outline.language));
 
@@ -185,20 +183,14 @@ pub fn writeSnapshot(
             std.mem.writeInt(u32, &import_count_buf, @intCast(outline.imports.items.len), .little);
             try writer.writeAll(&import_count_buf);
             for (outline.imports.items) |imp| {
-                var import_len_buf: [2]u8 = undefined;
-                std.mem.writeInt(u16, &import_len_buf, @intCast(imp.len), .little);
-                try writer.writeAll(&import_len_buf);
-                try writer.writeAll(imp);
+                try writeSnapshotString(writer, imp);
             }
 
             var symbol_count_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &symbol_count_buf, @intCast(outline.symbols.items.len), .little);
             try writer.writeAll(&symbol_count_buf);
             for (outline.symbols.items) |sym| {
-                var name_len_buf: [2]u8 = undefined;
-                std.mem.writeInt(u16, &name_len_buf, @intCast(sym.name.len), .little);
-                try writer.writeAll(&name_len_buf);
-                try writer.writeAll(sym.name);
+                try writeSnapshotString(writer, sym.name);
 
                 try writer.writeByte(@intFromEnum(sym.kind));
 
@@ -212,10 +204,9 @@ pub fn writeSnapshot(
 
                 if (sym.detail) |detail| {
                     try writer.writeByte(1);
-                    var detail_len_buf: [2]u8 = undefined;
-                    std.mem.writeInt(u16, &detail_len_buf, @intCast(detail.len), .little);
-                    try writer.writeAll(&detail_len_buf);
-                    try writer.writeAll(detail);
+                    // Symbol detail comes from parser-emitted source context, so
+                    // clamp it instead of panicking if a signature line is huge.
+                    try writeSnapshotString(writer, truncateSnapshotDetail(detail));
                 } else {
                     try writer.writeByte(0);
                 }
@@ -245,10 +236,7 @@ pub fn writeSnapshot(
             if (isSensitivePath(path)) continue;
             const cached_content = explorer.contents.get(path);
             if (cached_content) |content| {
-                var pl_buf: [2]u8 = undefined;
-                std.mem.writeInt(u16, &pl_buf, @intCast(path.len), .little);
-                try fw.writeAll(&pl_buf);
-                try fw.writeAll(path);
+                try writeSnapshotString(fw, path);
                 var cl_buf: [4]u8 = undefined;
                 std.mem.writeInt(u32, &cl_buf, @intCast(content.len), .little);
                 try fw.writeAll(&cl_buf);
@@ -257,10 +245,7 @@ pub fn writeSnapshot(
                 const disk_content = path_security.readFileAlloc(io, dir.*, real_root, path, allocator, .limited(64 * 1024 * 1024)) catch continue;
                 errdefer allocator.free(disk_content);
 
-                var pl_buf: [2]u8 = undefined;
-                std.mem.writeInt(u16, &pl_buf, @intCast(path.len), .little);
-                try fw.writeAll(&pl_buf);
-                try fw.writeAll(path);
+                try writeSnapshotString(fw, path);
                 var cl_buf: [4]u8 = undefined;
                 std.mem.writeInt(u32, &cl_buf, @intCast(disk_content.len), .little);
                 try fw.writeAll(&cl_buf);
@@ -450,12 +435,15 @@ pub fn loadSnapshotValidated(
     // Read section table (validates magic internally) — reuse already-open file (#253)
     var sections = (readSectionsFromFile(io, file, allocator) catch return false) orelse return false;
     defer sections.deinit();
+    const file_stat = file.stat(io) catch return false;
+    const file_size = file_stat.size;
 
     // Parse META section to get expected file_count and root_hash
     var expected_file_count: ?u32 = null;
     var meta_root_hash: ?u64 = null;
     if (sections.get(@intFromEnum(SectionId.meta))) |meta_entry| {
         if (meta_entry.length <= 256 * 1024 * 1024) blk: {
+            if (meta_entry.offset > file_size or meta_entry.length > file_size - meta_entry.offset) break :blk;
             const mb = allocator.alloc(u8, @intCast(meta_entry.length)) catch break :blk;
             defer allocator.free(mb);
             const nr = file.readPositionalAll(io, mb, meta_entry.offset) catch break :blk;
@@ -488,9 +476,7 @@ pub fn loadSnapshotValidated(
     const content_entry = sections.get(@intFromEnum(SectionId.content)) orelse return false;
 
     // Validate content section fits within actual file size (issue-40: truncation detection)
-    const file_stat = file.stat(io) catch return false;
-    const file_size = file_stat.size;
-    if (content_entry.offset + content_entry.length > file_size) return false;
+    if (content_entry.offset > file_size or content_entry.length > file_size - content_entry.offset) return false;
 
     var read_pos: u64 = content_entry.offset;
     const snap_mtime: i128 = @intCast(file_stat.mtime.nanoseconds);
@@ -685,20 +671,52 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
     return result;
 }
 
-fn rebuildDepsFromOutline(explorer: *Explorer, path: []const u8, outline: *const FileOutline, allocator: std.mem.Allocator) !void {
-    var deps: std.ArrayList([]const u8) = .empty;
-    errdefer deps.deinit(allocator);
+const SnapshotDepExistsCtx = struct {
+    explorer: *Explorer,
+    pending: *const std.StringHashMap(FileOutline),
+};
 
-    for (outline.imports.items) |imp| {
-        if (std.mem.indexOf(u8, imp, "..") != null) continue;
-        try deps.append(allocator, imp);
+fn snapshotDepPathExists(ctx: SnapshotDepExistsCtx, dep_path: []const u8) bool {
+    return ctx.explorer.outlines.contains(dep_path) or ctx.pending.contains(dep_path);
+}
+
+fn rebuildDepsFromOutline(
+    explorer: *Explorer,
+    pending_outlines: *const std.StringHashMap(FileOutline),
+    path: []const u8,
+    outline: *const FileOutline,
+    allocator: std.mem.Allocator,
+) !void {
+    var deps: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (deps.items) |dep| allocator.free(dep);
+        deps.deinit(allocator);
     }
 
-    try explorer.dep_graph.setDeps(path, deps);
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+
+    const ctx = SnapshotDepExistsCtx{
+        .explorer = explorer,
+        .pending = pending_outlines,
+    };
+    for (outline.imports.items) |imp| {
+        const resolved = explore_mod.resolveImportPath(imp, path, outline.language, allocator, ctx, snapshotDepPathExists) orelse continue;
+        const gop = try seen.getOrPut(resolved);
+        if (gop.found_existing) {
+            allocator.free(resolved);
+            continue;
+        }
+        gop.key_ptr.* = resolved;
+        try deps.append(allocator, resolved);
+    }
+
+    try explorer.dep_graph.setOwnedDeps(path, deps);
 }
 
 fn insertRestoredFile(
     explorer: *Explorer,
+    pending_outlines: *const std.StringHashMap(FileOutline),
     path: []const u8,
     content: []const u8,
     outline: FileOutline,
@@ -714,7 +732,7 @@ fn insertRestoredFile(
 
     try explorer.contents.put(path, content);
 
-    try rebuildDepsFromOutline(explorer, path, &restored_outline, allocator);
+    try rebuildDepsFromOutline(explorer, pending_outlines, path, &restored_outline, allocator);
 }
 
 fn loadSnapshotFast(
@@ -817,7 +835,7 @@ fn loadSnapshotFast(
             allocator.free(content);
         } else if (outline_states.fetchRemove(path_buf)) |removed| {
             allocator.free(path_buf);
-            insertRestoredFile(explorer, removed.key, content, removed.value, allocator) catch {
+            insertRestoredFile(explorer, &outline_states, removed.key, content, removed.value, allocator) catch {
                 allocator.free(removed.key);
                 var bad_outline = removed.value;
                 bad_outline.deinit();
@@ -977,6 +995,18 @@ pub fn writeProjectCacheSnapshot(
     f.close(io);
 
     try writeSnapshot(io, explorer, root_path, secondary, allocator);
+}
+
+fn writeSnapshotString(writer: anytype, value: []const u8) !void {
+    const len = std.math.cast(u16, value.len) orelse return error.StringTooLong;
+    var len_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &len_buf, len, .little);
+    try writer.writeAll(&len_buf);
+    try writer.writeAll(value);
+}
+
+fn truncateSnapshotDetail(detail: []const u8) []const u8 {
+    return detail[0..@min(detail.len, max_snapshot_string_len)];
 }
 
 fn writeJsonEscaped(writer: anytype, s: []const u8) !void {

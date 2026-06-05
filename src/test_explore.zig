@@ -21,7 +21,6 @@ const watcher = @import("watcher.zig");
 const git_mod = @import("git.zig");
 const snapshot_mod = @import("snapshot.zig");
 
-
 test "word tokenizer" {
     var tok = WordTokenizer{ .buf = "pub fn main() !void {" };
     const w1 = tok.next().?;
@@ -34,7 +33,6 @@ test "word tokenizer" {
     try testing.expectEqualStrings("void", w4);
     try testing.expect(tok.next() == null);
 }
-
 
 test "word index: index and search" {
     var wi = WordIndex.init(testing.allocator);
@@ -57,7 +55,6 @@ test "word index: index and search" {
     try testing.expect(const_hits[0].line_num == 2);
 }
 
-
 test "word index: re-index clears old entries" {
     var wi = WordIndex.init(testing.allocator);
     defer wi.deinit();
@@ -70,7 +67,6 @@ test "word index: re-index clears old entries" {
     try testing.expect(wi.search("new_func").len > 0);
 }
 
-
 test "word index: removeFile" {
     var wi = WordIndex.init(testing.allocator);
     defer wi.deinit();
@@ -81,7 +77,6 @@ test "word index: removeFile" {
     wi.removeFile("a.zig");
     try testing.expect(wi.search("hello").len == 0);
 }
-
 
 test "word index: deduped search" {
     var wi = WordIndex.init(testing.allocator);
@@ -95,7 +90,6 @@ test "word index: deduped search" {
     try testing.expect(hits.len == 1);
 }
 
-
 test "explorer: sparse ngram index integrated into searchContent" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -108,7 +102,6 @@ test "explorer: sparse ngram index integrated into searchContent" {
     try testing.expectEqual(@as(usize, 1), results.len);
     try testing.expectEqualStrings("src/alpha.zig", results[0].path);
 }
-
 
 test "explorer: searchContent finds query embedded in longer identifier" {
     // Verify that searchContent correctly finds files whose content contains
@@ -130,7 +123,6 @@ test "explorer: searchContent finds query embedded in longer identifier" {
     try testing.expect(found);
 }
 
-
 test "explorer: index file and get outline" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -148,7 +140,6 @@ test "explorer: index file and get outline" {
     try testing.expect(outline.symbols.items.len == 3);
 }
 
-
 test "explorer: findSymbol" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -162,7 +153,6 @@ test "explorer: findSymbol" {
     try testing.expectEqualStrings("a.zig", result.?.path);
 }
 
-
 test "explorer: findAllSymbols returns multiple" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -175,7 +165,6 @@ test "explorer: findAllSymbols returns multiple" {
     defer arena.allocator().free(results);
     try testing.expect(results.len == 2);
 }
-
 
 test "explorer: searchContent with trigram acceleration" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -199,7 +188,6 @@ test "explorer: searchContent with trigram acceleration" {
     try testing.expect(results[0].line_num == 1);
 }
 
-
 test "explorer: searchWord via inverted index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -212,7 +200,6 @@ test "explorer: searchWord via inverted index" {
     try testing.expect(hits.len > 0);
     try testing.expectEqualStrings("math.zig", explorer.word_index.hitPath(hits[0]));
 }
-
 
 test "explorer: removeFile cleans up everything" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -227,7 +214,6 @@ test "explorer: removeFile cleans up everything" {
     try testing.expect((try explorer.getOutline("gone.zig", testing.allocator)) == null);
     try testing.expect((try explorer.findSymbol("doStuff", testing.allocator)) == null);
 }
-
 
 test "explorer: python parser" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -246,7 +232,6 @@ test "explorer: python parser" {
     try testing.expect(outline.symbols.items.len == 3); // import, class, def
 }
 
-
 test "explorer: typescript parser" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -262,7 +247,6 @@ test "explorer: typescript parser" {
     defer outline.deinit();
     try testing.expect(outline.symbols.items.len >= 3);
 }
-
 
 test "explorer: reindex OOM keeps prior outline reachable" {
     // Use a real allocator for the explorer so the first indexFile always succeeds.
@@ -306,7 +290,6 @@ test "explorer: reindex OOM keeps prior outline reachable" {
     try testing.expect(new_results.len == 1);
 }
 
-
 test "explorer: getOutline clone OOM preserves source outline" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -341,7 +324,6 @@ test "explorer: getOutline clone OOM preserves source outline" {
     try testing.expect(induced_oom);
 }
 
-
 test "explorer: outline copy survives source removal" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -356,7 +338,6 @@ test "explorer: outline copy survives source removal" {
     try testing.expectEqualStrings("persist.zig", outline.path);
     try testing.expect(outline.symbols.items.len > 0);
 }
-
 
 test "explorer: removeFile frees owned map key" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -375,7 +356,6 @@ test "explorer: removeFile frees owned map key" {
     try testing.expect(explorer.dep_graph.count() == 0);
 }
 
-
 test "word index: removeFile prunes empty buckets" {
     var wi = WordIndex.init(testing.allocator);
     defer wi.deinit();
@@ -389,7 +369,6 @@ test "word index: removeFile prunes empty buckets" {
     try testing.expect(wi.search("uniqueWordOnlyHere").len == 0);
 }
 
-
 test "extractLines: basic range with line numbers" {
     const content = "line1\nline2\nline3\nline4\nline5";
     const result = try extractLines(content, 2, 4, true, false, .unknown, testing.allocator);
@@ -401,14 +380,12 @@ test "extractLines: basic range with line numbers" {
     try testing.expect(std.mem.indexOf(u8, result, "line5") == null);
 }
 
-
 test "extractLines: start beyond file returns empty" {
     const content = "line1\nline2";
     const result = try extractLines(content, 10, 20, true, false, .unknown, testing.allocator);
     defer testing.allocator.free(result);
     try testing.expect(result.len == 0);
 }
-
 
 test "extractLines: compact skips comments and blanks" {
     const content = "fn main() void {}\n// this is a comment\n\n    return 0;\n}";
@@ -419,7 +396,6 @@ test "extractLines: compact skips comments and blanks" {
     try testing.expect(std.mem.indexOf(u8, result, "// this is a comment") == null);
     try testing.expect(std.mem.indexOf(u8, result, "return 0") != null);
 }
-
 
 test "isCommentOrBlank: detects language-specific comments" {
     try testing.expect(isCommentOrBlank("  // zig comment", .zig));
@@ -433,7 +409,6 @@ test "isCommentOrBlank: detects language-specific comments" {
     // unknown language: never strips
     try testing.expect(!isCommentOrBlank("// comment", .unknown));
 }
-
 
 test "explorer: getSymbolBody returns source lines" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -451,7 +426,6 @@ test "explorer: getSymbolBody returns source lines" {
     }
 }
 
-
 test "explorer: getSymbolBody returns null for unknown file" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -460,7 +434,6 @@ test "explorer: getSymbolBody returns null for unknown file" {
     const body = try exp.getSymbolBody("nonexistent.zig", 1, 5, testing.allocator);
     try testing.expect(body == null);
 }
-
 
 test "explorer: searchContentWithScope annotates results" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -488,7 +461,6 @@ test "explorer: searchContentWithScope annotates results" {
     try testing.expectEqualStrings("handleAuth", results[0].scope_name.?);
 }
 
-
 test "explorer: searchContentWithScope no scope for standalone line" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -511,7 +483,6 @@ test "explorer: searchContentWithScope no scope for standalone line" {
     try testing.expect(results[0].scope_name == null);
 }
 
-
 test "content hash: Wyhash produces consistent hash" {
     const content = "pub fn main() void {}";
     const hash1 = std.hash.Wyhash.hash(0, content);
@@ -522,7 +493,6 @@ test "content hash: Wyhash produces consistent hash" {
     try testing.expect(hash1 != hash3);
 }
 
-
 test "detectLanguage: public access and correct detection" {
     try testing.expect(explore.detectLanguage("src/main.zig") == .zig);
     try testing.expect(explore.detectLanguage("app.py") == .python);
@@ -530,14 +500,12 @@ test "detectLanguage: public access and correct detection" {
     try testing.expect(explore.detectLanguage("style.css") == .css);
 }
 
-
 test "extractLines: without line numbers" {
     const content = "alpha\nbeta\ngamma";
     const result = try extractLines(content, 1, 3, false, false, .unknown, testing.allocator);
     defer testing.allocator.free(result);
     try testing.expectEqualStrings("alpha\nbeta\ngamma\n", result);
 }
-
 
 test "extractLines: start only reads to EOF" {
     const content = "a\nb\nc\nd\ne";
@@ -550,7 +518,6 @@ test "extractLines: start only reads to EOF" {
     try testing.expect(std.mem.indexOf(u8, result, "| b") == null);
 }
 
-
 test "extractLines: end beyond file clamps to EOF" {
     const content = "x\ny\nz";
     const result = try extractLines(content, 2, 999, true, false, .unknown, testing.allocator);
@@ -561,7 +528,6 @@ test "extractLines: end beyond file clamps to EOF" {
     try testing.expect(std.mem.count(u8, result, "\n") == 2);
 }
 
-
 test "extractLines: single line range (start == end)" {
     const content = "one\ntwo\nthree";
     const result = try extractLines(content, 2, 2, true, false, .unknown, testing.allocator);
@@ -570,14 +536,12 @@ test "extractLines: single line range (start == end)" {
     try testing.expect(std.mem.count(u8, result, "\n") == 1);
 }
 
-
 test "extractLines: empty content returns single empty line" {
     const result = try extractLines("", 1, 10, true, false, .unknown, testing.allocator);
     defer testing.allocator.free(result);
     // Empty string splits to one empty line, which is line 1
     try testing.expect(result.len > 0);
 }
-
 
 test "extractLines: compact with Python comments" {
     const content = "# comment\nimport os\n\ndef hello():\n    # inline comment\n    print('hi')";
@@ -590,7 +554,6 @@ test "extractLines: compact with Python comments" {
     try testing.expect(std.mem.indexOf(u8, result, "print('hi')") != null);
 }
 
-
 test "extractLines: compact with JS/TS comments" {
     const content = "// header\nconst x = 1;\n/* block */\n* star line\nexport default x;";
     const result = try extractLines(content, 1, 5, false, true, .typescript, testing.allocator);
@@ -602,18 +565,15 @@ test "extractLines: compact with JS/TS comments" {
     try testing.expect(std.mem.indexOf(u8, result, "export default x;") != null);
 }
 
-
 test "isCommentOrBlank: rust double-slash" {
     try testing.expect(isCommentOrBlank("  // rust comment", .rust));
     try testing.expect(!isCommentOrBlank("  let x = 1;", .rust));
 }
 
-
 test "isCommentOrBlank: go double-slash" {
     try testing.expect(isCommentOrBlank("  // go comment", .go_lang));
     try testing.expect(!isCommentOrBlank("  func main() {", .go_lang));
 }
-
 
 test "isCommentOrBlank: dart comments" {
     try testing.expect(isCommentOrBlank("  // dart comment", .dart));
@@ -621,14 +581,12 @@ test "isCommentOrBlank: dart comments" {
     try testing.expect(!isCommentOrBlank("  class WidgetBuilder {}", .dart));
 }
 
-
 test "isCommentOrBlank: cpp block and line comments" {
     try testing.expect(isCommentOrBlank("  // cpp line comment", .cpp));
     try testing.expect(isCommentOrBlank("  /* cpp block comment */", .cpp));
     try testing.expect(isCommentOrBlank("  * continued block comment", .cpp));
     try testing.expect(!isCommentOrBlank("  int x = 0;", .cpp));
 }
-
 
 test "isCommentOrBlank: detected extension language comments" {
     try testing.expect(isCommentOrBlank("  // java line comment", .java));
@@ -648,20 +606,17 @@ test "isCommentOrBlank: detected extension language comments" {
     try testing.expect(!isCommentOrBlank("  SELECT * FROM users;", .sql));
 }
 
-
 test "isCommentOrBlank: tabs and mixed whitespace" {
     try testing.expect(isCommentOrBlank("\t\t// tabbed comment", .zig));
     try testing.expect(isCommentOrBlank(" \t \t ", .zig));
     try testing.expect(isCommentOrBlank("\t", .python));
 }
 
-
 test "isCommentOrBlank: markdown and json never strip" {
     try testing.expect(!isCommentOrBlank("# heading", .markdown));
     try testing.expect(!isCommentOrBlank("// not a comment in json", .json));
     try testing.expect(!isCommentOrBlank("# not a comment in yaml", .yaml));
 }
-
 
 test "explorer: getSymbolBody multi-line range" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -684,7 +639,6 @@ test "explorer: getSymbolBody multi-line range" {
     }
 }
 
-
 test "explorer: getSymbolBody range beyond file length" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -700,7 +654,6 @@ test "explorer: getSymbolBody range beyond file length" {
         return error.TestUnexpectedResult;
     }
 }
-
 
 test "explorer: searchContentWithScope across multiple files" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -727,7 +680,6 @@ test "explorer: searchContentWithScope across multiple files" {
     }
 }
 
-
 test "explorer: searchContentWithScope respects max_results" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -747,7 +699,6 @@ test "explorer: searchContentWithScope respects max_results" {
 
     try testing.expect(results.len == 2);
 }
-
 
 test "explorer: searchContentWithScope no results for missing query" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -769,7 +720,6 @@ test "explorer: searchContentWithScope no results for missing query" {
     try testing.expect(results.len == 0);
 }
 
-
 test "content hash: format as hex string" {
     const content = "hello world";
     const hash = std.hash.Wyhash.hash(0, content);
@@ -785,13 +735,11 @@ test "content hash: format as hex string" {
     try testing.expectEqualStrings(hex, hex2);
 }
 
-
 test "content hash: empty content hashes consistently" {
     const h1 = std.hash.Wyhash.hash(0, "");
     const h2 = std.hash.Wyhash.hash(0, "");
     try testing.expect(h1 == h2);
 }
-
 
 test "detectLanguage: all supported extensions" {
     try testing.expect(explore.detectLanguage("main.zig") == .zig);
@@ -834,7 +782,6 @@ test "detectLanguage: all supported extensions" {
     try testing.expect(explore.detectLanguage("no_ext") == .unknown);
 }
 
-
 test "explorer: getSymbolBody with line number format" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -855,7 +802,6 @@ test "explorer: getSymbolBody with line number format" {
     }
 }
 
-
 test "extractLines: compact preserves brace-only lines" {
     const content = "fn main() void {\n    // comment\n    doWork();\n}";
     const result = try extractLines(content, 1, 4, false, true, .zig, testing.allocator);
@@ -866,14 +812,12 @@ test "extractLines: compact preserves brace-only lines" {
     try testing.expect(std.mem.indexOf(u8, result, "// comment") == null);
 }
 
-
 test "extractLines: compact on all-comment file returns empty" {
     const content = "// comment 1\n// comment 2\n// comment 3";
     const result = try extractLines(content, 1, 3, false, true, .zig, testing.allocator);
     defer testing.allocator.free(result);
     try testing.expect(result.len == 0);
 }
-
 
 test "explorer: searchContentRegex end-to-end" {
     var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -904,7 +848,6 @@ test "explorer: searchContentRegex end-to-end" {
     try testing.expect(found2);
 }
 
-
 test "explorer: searchContentRegex no match" {
     var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer_inst.deinit();
@@ -917,6 +860,54 @@ test "explorer: searchContentRegex no match" {
     try testing.expectEqual(@as(usize, 0), results.len);
 }
 
+test "issue-p1-2: searchContentRegex invalid pattern returns InvalidPattern" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+
+    try explorer_inst.indexFile("only.zig", "const x = 42;");
+
+    try testing.expectError(
+        error.InvalidPattern,
+        explorer_inst.searchContentRegex("(", testing.allocator, 50),
+    );
+}
+
+test "issue-p1-2: searchContentRegex caps dominant file per file" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+
+    var dominant_buf: std.ArrayList(u8) = .empty;
+    defer dominant_buf.deinit(testing.allocator);
+    for (0..20) |_| try dominant_buf.appendSlice(testing.allocator, "FROBNICATE token\n");
+    try explorer_inst.indexFile("src/dominant.zig", dominant_buf.items);
+    try explorer_inst.indexFile("src/a.zig", "FROBNICATE token\n");
+    try explorer_inst.indexFile("src/b.zig", "FROBNICATE token\n");
+    try explorer_inst.indexFile("src/c.zig", "FROBNICATE token\n");
+
+    const results = try explorer_inst.searchContentRegexCapped("FROBNICATE", testing.allocator, 10, 5);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+
+    var dominant_hits: usize = 0;
+    var found_a = false;
+    var found_b = false;
+    var found_c = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "src/dominant.zig")) dominant_hits += 1;
+        if (std.mem.eql(u8, r.path, "src/a.zig")) found_a = true;
+        if (std.mem.eql(u8, r.path, "src/b.zig")) found_b = true;
+        if (std.mem.eql(u8, r.path, "src/c.zig")) found_c = true;
+    }
+    try testing.expect(dominant_hits <= 5);
+    try testing.expect(found_a);
+    try testing.expect(found_b);
+    try testing.expect(found_c);
+}
 
 test "git: getGitHead returns 40-char hex SHA in a git repo" {
     // codedb itself is a git repo, so this should succeed
@@ -929,13 +920,11 @@ test "git: getGitHead returns 40-char hex SHA in a git repo" {
     }
 }
 
-
 test "git: getGitHead returns null for non-git directory" {
     // /tmp is not a git repo
     const head = try git_mod.getGitHead("/tmp", testing.allocator);
     try testing.expect(head == null);
 }
-
 
 test "thread-safe: concurrent TrigramIndex.candidates() with per-thread allocators" {
     var ti = TrigramIndex.init(testing.allocator);
@@ -968,7 +957,6 @@ test "thread-safe: concurrent TrigramIndex.candidates() with per-thread allocato
     try testing.expectEqual(@as(u32, 0), ctx.errors.load(.monotonic));
 }
 
-
 test "thread-safe: concurrent SparseNgramIndex.candidates() with per-thread allocators" {
     var sni = SparseNgramIndex.init(testing.allocator);
     defer sni.deinit();
@@ -997,7 +985,6 @@ test "thread-safe: concurrent SparseNgramIndex.candidates() with per-thread allo
     for (&threads) |*t| t.* = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctx});
     for (threads) |t| t.join();
 }
-
 
 test "issue-43: trigram_index swap in scanBg races with concurrent MCP queries" {
     // Regression: the scanBg disk-load path must serialize trigram_index swaps
@@ -1029,7 +1016,6 @@ test "issue-43: trigram_index swap in scanBg races with concurrent MCP queries" 
     try testing.expect(!raced);
 }
 
-
 test "issue-116: getGitHead returns valid SHA for git repos" {
     const git = @import("git.zig");
 
@@ -1043,7 +1029,6 @@ test "issue-116: getGitHead returns valid SHA for git repos" {
         }
     }
 }
-
 
 test "issue-224: codedb_symbol body=true returns full body — line_end populated" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1074,7 +1059,6 @@ test "issue-224: codedb_symbol body=true returns full body — line_end populate
     try testing.expect(std.mem.indexOf(u8, body, "return a + b;") != null);
 }
 
-
 test "issue-224: Python def line_end covers full body" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1097,19 +1081,16 @@ test "issue-224: Python def line_end covers full body" {
     try testing.expectEqual(@as(u32, 3), sym.line_end);
 }
 
-
 test "issue-108: detectLanguage handles .tf and .tfvars" {
     try testing.expectEqual(Language.hcl, explore.detectLanguage("main.tf"));
     try testing.expectEqual(Language.hcl, explore.detectLanguage("prod.tfvars"));
     try testing.expectEqual(Language.hcl, explore.detectLanguage("config.hcl"));
 }
 
-
 test "issue-215: detectLanguage handles .r and .R" {
     try testing.expectEqual(Language.r, explore.detectLanguage("script.r"));
     try testing.expectEqual(Language.r, explore.detectLanguage("analysis.R"));
 }
-
 
 test "dep-graph: reverse index gives O(1) imported_by lookup" {
     var graph = DependencyGraph.init(testing.allocator);
@@ -1143,7 +1124,6 @@ test "dep-graph: reverse index gives O(1) imported_by lookup" {
     try testing.expectEqual(@as(usize, 1), imported_by2.len);
     try testing.expectEqualStrings("main.zig", imported_by2[0]);
 }
-
 
 test "dep-graph: setDeps removes old reverse edges" {
     var graph = DependencyGraph.init(testing.allocator);
@@ -1183,7 +1163,6 @@ test "dep-graph: setDeps removes old reverse edges" {
     try testing.expectEqual(@as(usize, 1), utils_deps.len);
 }
 
-
 test "dep-graph: transitive dependents via BFS" {
     var graph = DependencyGraph.init(testing.allocator);
     defer graph.deinit();
@@ -1219,7 +1198,6 @@ test "dep-graph: transitive dependents via BFS" {
     try testing.expectEqualStrings("store.zig", shallow[0]);
 }
 
-
 test "dep-graph: transitive dependencies (forward BFS)" {
     var graph = DependencyGraph.init(testing.allocator);
     defer graph.deinit();
@@ -1254,7 +1232,6 @@ test "dep-graph: transitive dependencies (forward BFS)" {
     try testing.expectEqual(@as(usize, 2), deps_shallow.len);
 }
 
-
 test "dep-graph: remove cleans forward and reverse edges" {
     var graph = DependencyGraph.init(testing.allocator);
     defer graph.deinit();
@@ -1282,7 +1259,6 @@ test "dep-graph: remove cleans forward and reverse edges" {
     try testing.expectEqual(@as(usize, 1), imported_by.len);
     try testing.expectEqualStrings("server.zig", imported_by[0]);
 }
-
 
 test "dep-graph: cycle does not cause infinite BFS" {
     var graph = DependencyGraph.init(testing.allocator);
@@ -1319,7 +1295,6 @@ test "dep-graph: cycle does not cause infinite BFS" {
     try testing.expectEqual(@as(usize, 2), fwd.len);
 }
 
-
 test "dep-graph: Explorer integration — getImportedBy uses reverse index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1336,7 +1311,6 @@ test "dep-graph: Explorer integration — getImportedBy uses reverse index" {
     }
     try testing.expectEqual(@as(usize, 2), deps.len);
 }
-
 
 test "dep-graph: Explorer transitive dependents" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1355,7 +1329,6 @@ test "dep-graph: Explorer transitive dependents" {
     }
     try testing.expectEqual(@as(usize, 2), blast.len);
 }
-
 
 test "issue-445: dep-graph dedupes multi-aliased forward imports" {
     // A file that imports the same dep under multiple aliases
@@ -1388,6 +1361,199 @@ test "issue-445: dep-graph dedupes multi-aliased forward imports" {
     try testing.expectEqualStrings("index.zig", fwd[0]);
 }
 
+test "issue-p2-dep: zig relative parent import resolves instead of being dropped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/util.zig", "pub fn helper() void {}\n");
+    try explorer.indexFile("src/features/worker.zig",
+        \\const util = @import("../util.zig");
+        \\pub fn work() void {
+        \\    util.helper();
+        \\}
+        \\
+    );
+
+    const importers = try explorer.getImportedBy("src/util.zig", testing.allocator);
+    defer {
+        for (importers) |p| testing.allocator.free(p);
+        testing.allocator.free(importers);
+    }
+
+    try testing.expectEqual(@as(usize, 1), importers.len);
+    try testing.expectEqualStrings("src/features/worker.zig", importers[0]);
+}
+
+test "issue-p2-dep: rust mod and crate use resolve to repo paths" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/util.rs", "pub fn helper() {}\n");
+    try explorer.indexFile("src/sub/helper.rs", "pub fn run() {}\n");
+    try explorer.indexFile("src/lib.rs",
+        \\mod util;
+        \\use crate::sub::helper::run;
+        \\pub fn main() {
+        \\    run();
+        \\}
+        \\
+    );
+
+    const util_importers = try explorer.getImportedBy("src/util.rs", testing.allocator);
+    defer {
+        for (util_importers) |p| testing.allocator.free(p);
+        testing.allocator.free(util_importers);
+    }
+    try testing.expectEqual(@as(usize, 1), util_importers.len);
+    try testing.expectEqualStrings("src/lib.rs", util_importers[0]);
+
+    const helper_importers = try explorer.getImportedBy("src/sub/helper.rs", testing.allocator);
+    defer {
+        for (helper_importers) |p| testing.allocator.free(p);
+        testing.allocator.free(helper_importers);
+    }
+    try testing.expectEqual(@as(usize, 1), helper_importers.len);
+    try testing.expectEqualStrings("src/lib.rs", helper_importers[0]);
+}
+
+test "issue-p2-dep: rust super use resolves relative to the current module" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/sub/util.rs", "pub fn helper() {}\n");
+    try explorer.indexFile("src/sub/child.rs",
+        \\use super::util::helper;
+        \\pub fn run() {
+        \\    helper();
+        \\}
+        \\
+    );
+
+    const util_importers = try explorer.getImportedBy("src/sub/util.rs", testing.allocator);
+    defer {
+        for (util_importers) |p| testing.allocator.free(p);
+        testing.allocator.free(util_importers);
+    }
+    try testing.expectEqual(@as(usize, 1), util_importers.len);
+    try testing.expectEqualStrings("src/sub/child.rs", util_importers[0]);
+}
+
+test "issue-p2-dep: typescript relative imports resolve and bare specifiers stay external" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/util.ts", "export const util = 1;\n");
+    try explorer.indexFile("src/pkg/index.ts", "export const pkg = 1;\n");
+    try explorer.indexFile("src/main.ts",
+        \\import { util } from './util';
+        \\import { pkg } from './pkg';
+        \\import React from 'react';
+        \\export const value = util + pkg;
+        \\
+    );
+
+    const util_importers = try explorer.getImportedBy("src/util.ts", testing.allocator);
+    defer {
+        for (util_importers) |p| testing.allocator.free(p);
+        testing.allocator.free(util_importers);
+    }
+    try testing.expectEqual(@as(usize, 1), util_importers.len);
+    try testing.expectEqualStrings("src/main.ts", util_importers[0]);
+
+    const pkg_importers = try explorer.getImportedBy("src/pkg/index.ts", testing.allocator);
+    defer {
+        for (pkg_importers) |p| testing.allocator.free(p);
+        testing.allocator.free(pkg_importers);
+    }
+    try testing.expectEqual(@as(usize, 1), pkg_importers.len);
+    try testing.expectEqualStrings("src/main.ts", pkg_importers[0]);
+
+    explorer.mu.lockShared();
+    const fwd_opt = explorer.dep_graph.getForwardDeps("src/main.ts");
+    explorer.mu.unlockShared();
+    try testing.expect(fwd_opt != null);
+    const fwd = fwd_opt.?;
+    try testing.expectEqual(@as(usize, 2), fwd.len);
+    try testing.expectEqualStrings("src/util.ts", fwd[0]);
+    try testing.expectEqualStrings("src/pkg/index.ts", fwd[1]);
+}
+
+test "issue-p2-dep: python relative imports resolve and stdlib imports stay external" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("pkg/util.py", "def helper(): pass\n");
+    try explorer.indexFile("pkg/sub/helper.py", "def sub_helper(): pass\n");
+    try explorer.indexFile("pkg/sub/module.py",
+        \\from . import helper
+        \\from .. import util
+        \\import os.path
+        \\from pathlib import Path
+        \\
+    );
+
+    const helper_importers = try explorer.getImportedBy("pkg/sub/helper.py", testing.allocator);
+    defer {
+        for (helper_importers) |p| testing.allocator.free(p);
+        testing.allocator.free(helper_importers);
+    }
+    try testing.expectEqual(@as(usize, 1), helper_importers.len);
+    try testing.expectEqualStrings("pkg/sub/module.py", helper_importers[0]);
+
+    const util_importers = try explorer.getImportedBy("pkg/util.py", testing.allocator);
+    defer {
+        for (util_importers) |p| testing.allocator.free(p);
+        testing.allocator.free(util_importers);
+    }
+    try testing.expectEqual(@as(usize, 1), util_importers.len);
+    try testing.expectEqualStrings("pkg/sub/module.py", util_importers[0]);
+
+    explorer.mu.lockShared();
+    const fwd_opt = explorer.dep_graph.getForwardDeps("pkg/sub/module.py");
+    explorer.mu.unlockShared();
+    try testing.expect(fwd_opt != null);
+    const fwd = fwd_opt.?;
+    try testing.expectEqual(@as(usize, 2), fwd.len);
+    try testing.expectEqualStrings("pkg/sub/helper.py", fwd[0]);
+    try testing.expectEqualStrings("pkg/util.py", fwd[1]);
+}
+
+test "issue-p2-dep: transitive dependencies follow resolved exact paths in nested dirs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/util.zig", "pub fn helper() void {}\n");
+    try explorer.indexFile("src/server.zig",
+        \\const util = @import("util.zig");
+        \\pub fn serve() void {
+        \\    util.helper();
+        \\}
+        \\
+    );
+    try explorer.indexFile("src/app/main.zig",
+        \\const server = @import("../server.zig");
+        \\pub fn main() void {
+        \\    server.serve();
+        \\}
+        \\
+    );
+
+    const deps = try explorer.getTransitiveDependencies("src/app/main.zig", testing.allocator, null);
+    defer {
+        for (deps) |p| testing.allocator.free(p);
+        testing.allocator.free(deps);
+    }
+
+    try testing.expectEqual(@as(usize, 2), deps.len);
+    try testing.expectEqualStrings("src/server.zig", deps[0]);
+    try testing.expectEqualStrings("src/util.zig", deps[1]);
+}
 
 test "symbol-index: O(1) findSymbol via symbol_index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1421,7 +1587,6 @@ test "symbol-index: O(1) findSymbol via symbol_index" {
     try testing.expectEqual(@as(usize, 2), all.len);
 }
 
-
 test "symbol-index: removeFile cleans symbol_index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1439,7 +1604,6 @@ test "symbol-index: removeFile cleans symbol_index" {
     const after = try explorer.findSymbol("unique_func", testing.allocator);
     try testing.expect(after == null);
 }
-
 
 test "symbol-index: re-index updates symbol_index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1465,7 +1629,6 @@ test "symbol-index: re-index updates symbol_index" {
     if (r3.?.symbol.detail) |d| testing.allocator.free(d);
 }
 
-
 test "word-index: splitIdentifier snake_case" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1481,7 +1644,6 @@ test "word-index: splitIdentifier snake_case" {
     try testing.expectEqualStrings("put", out.items[2]);
 }
 
-
 test "word-index: splitIdentifier camelCase" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1495,7 +1657,6 @@ test "word-index: splitIdentifier camelCase" {
     try testing.expectEqualStrings("validate", out.items[0]);
     try testing.expectEqualStrings("token", out.items[1]);
 }
-
 
 test "word-index: splitIdentifier acronym (HTTPHandler)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1511,7 +1672,6 @@ test "word-index: splitIdentifier acronym (HTTPHandler)" {
     try testing.expectEqualStrings("handler", out.items[1]);
 }
 
-
 test "word-index: splitIdentifier simple word emits itself" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1524,7 +1684,6 @@ test "word-index: splitIdentifier simple word emits itself" {
     try testing.expectEqual(@as(usize, 1), out.items.len);
     try testing.expectEqualStrings("handler", out.items[0]);
 }
-
 
 test "word-index: sub-token search finds camelCase components" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1559,7 +1718,6 @@ test "word-index: sub-token search finds camelCase components" {
     try testing.expectEqualStrings("b.zig", r2[0].path);
 }
 
-
 test "word-index: sub-token search finds snake_case components" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1590,7 +1748,6 @@ test "word-index: sub-token search finds snake_case components" {
     try testing.expect(r2.len >= 1);
 }
 
-
 test "word-index: case-insensitive lookup finds exact identifiers" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1610,7 +1767,6 @@ test "word-index: case-insensitive lookup finds exact identifiers" {
     try testing.expectEqual(@as(usize, 1), r1.len);
 }
 
-
 test "word-index: searchPrefix finds extensions of a prefix" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1624,7 +1780,6 @@ test "word-index: searchPrefix finds extensions of a prefix" {
     const hits = try wi.searchPrefix("searchco", a, 32);
     try testing.expect(hits.len >= 1);
 }
-
 
 test "word-index: searchPrefix skips exact match (Tier 0 responsibility)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1646,7 +1801,6 @@ test "word-index: searchPrefix skips exact match (Tier 0 responsibility)" {
     try testing.expect(hits_prefix.len >= 1);
 }
 
-
 test "word-index: searchPrefix respects max_results cap" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1667,7 +1821,6 @@ test "word-index: searchPrefix respects max_results cap" {
     try testing.expect(hits.len > 0);
 }
 
-
 test "integration: Tier 0.5 prefix expansion finds partial identifier" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1687,7 +1840,6 @@ test "integration: Tier 0.5 prefix expansion finds partial identifier" {
 
     try testing.expect(results.len >= 1);
 }
-
 
 test "security: FilteredWalker skips file symlinks" {
     var tmp_dir = testing.tmpDir(.{});
@@ -1733,7 +1885,6 @@ test "security: FilteredWalker skips file symlinks" {
     try testing.expect(!explorer.contents.contains("src/alias.zig"));
     try testing.expect(!explorer.contents.contains("src/outside_alias.zig"));
 }
-
 
 test "issue-405: FilteredWalker walks directory symlinks safely (cycle + escape)" {
     // Follow-up to #389. The current FilteredWalker.next() (src/watcher.zig:319-323)
@@ -1806,6 +1957,59 @@ test "issue-405: FilteredWalker walks directory symlinks safely (cycle + escape)
     }
 }
 
+test "issue-p2-watcher: slash-terminated globstar stays on segment boundaries" {
+    try testing.expect(explore.matchGlob("src/**/x", "src/x"));
+    try testing.expect(explore.matchGlob("src/**/x", "src/a/x"));
+    try testing.expect(explore.matchGlob("src/**/x", "src/a/b/x"));
+
+    try testing.expect(!explore.matchGlob("src/**/x", "src/ax"));
+    try testing.expect(!explore.matchGlob("src/**/x", "src/a/xz"));
+    try testing.expect(!explore.matchGlob("**/main.rs", "fs_helper_main.rs"));
+}
+
+test "issue-p2-watcher: nested gitignore patterns and negation shape initial scan" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(io, "app/sub");
+    try tmp_dir.dir.createDirPath(io, "pkg");
+    try tmp_dir.dir.writeFile(io, .{
+        .sub_path = "app/.gitignore",
+        .data =
+        \\/local-only.txt
+        \\*.tmp
+        \\*.zig
+        \\!keep.zig
+        ,
+    });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "app/local-only.txt", .data = "hidden at app root\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "app/sub/local-only.txt", .data = "still visible in subdir\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "app/skip.zig", .data = "pub fn skip() void {}\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "app/keep.zig", .data = "pub fn keep() void {}\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "app/sub/keep.zig", .data = "pub fn keepNested() void {}\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "app/sub/deep.tmp", .data = "temporary\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "pkg/skip.zig", .data = "pub fn pkgSkip() void {}\n" });
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPathFile(io, ".", &root_buf);
+    const root = root_buf[0..root_len];
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    explorer.setRoot(io, root);
+    try watcher.initialScanWithWorkerCount(io, &store, &explorer, root, testing.allocator, false, 1);
+
+    try testing.expect(explorer.contents.contains("app/keep.zig"));
+    try testing.expect(explorer.contents.contains("app/sub/keep.zig"));
+    try testing.expect(explorer.contents.contains("app/sub/local-only.txt"));
+    try testing.expect(explorer.contents.contains("pkg/skip.zig"));
+
+    try testing.expect(!explorer.contents.contains("app/local-only.txt"));
+    try testing.expect(!explorer.contents.contains("app/skip.zig"));
+    try testing.expect(!explorer.contents.contains("app/sub/deep.tmp"));
+}
 
 test "issue-405: cleanupStaleTmpFiles deletes in-flight sibling tmp files" {
     // BUG: snapshot.zig:cleanupStaleTmpFiles deletes ANY file matching
@@ -1864,7 +2068,6 @@ test "issue-405: cleanupStaleTmpFiles deletes in-flight sibling tmp files" {
     };
 }
 
-
 test "issue-409: snapshot .env prefix filter wrongly excludes .envoy/.environment files" {
     // BUG: snapshot.zig:isSensitivePath uses
     //     if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env")) return true;
@@ -1913,7 +2116,6 @@ test "issue-409: snapshot .env prefix filter wrongly excludes .envoy/.environmen
     try testing.expect(exp2.outlines.contains("a.zig"));
     try testing.expect(exp2.outlines.contains(".envoy.json"));
 }
-
 
 test "issue-208: content cache evicts cold entries under pressure" {
     const ContentCache = @import("hot_cache.zig").ContentCache;

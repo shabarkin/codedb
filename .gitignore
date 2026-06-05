@@ -1,6 +1,10 @@
 # Zig build artifacts
 .zig-cache/
+.zig-global-cache/
+.zig-local-cache/
 zig-out/
+.tmp-home/
+.tmp-pyc/
 
 # Local/dev files
 .codedb/
@@ -20,9 +24,11 @@ install/.wrangler/
 
 # Generated snapshot (machine-specific)
 codedb.snapshot
+codedb.snapshot.*.tmp
 release/
 socials/
 .zigrep_archive
 
 # Benchmark / dev output dirs
 logs/
+wasm/

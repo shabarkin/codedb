@@ -1,4 +1,6 @@
 const std = @import("std");
+const build_options = @import("build_options");
+const builtin = @import("builtin");
 const ContentCache = @import("hot_cache.zig").ContentCache;
 const nanoregex = @import("nanoregex");
 const cio = @import("cio.zig");
@@ -10,6 +12,9 @@ const MmapTrigramIndex = idx.MmapTrigramIndex;
 const AnyTrigramIndex = idx.AnyTrigramIndex;
 const SparseNgramIndex = idx.SparseNgramIndex;
 const path_security = @import("path_security.zig");
+const tree_sitter_mod = @import("tree_sitter.zig");
+
+const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.fs.max_path_bytes;
 
 pub fn approxIndexSizeBytes(explorer: *const Explorer) u64 {
     // Aggregate-only estimate. Keep this O(1): status calls this on hot paths,
@@ -212,6 +217,11 @@ pub const DependencyGraph = struct {
     reverse: std.StringHashMap(std.StringHashMap(void)),
     allocator: std.mem.Allocator,
 
+    const TraversalItem = struct {
+        path: []const u8,
+        depth: u32,
+    };
+
     pub fn init(allocator: std.mem.Allocator) DependencyGraph {
         return .{
             .forward = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
@@ -230,55 +240,66 @@ pub const DependencyGraph = struct {
         var rev_iter = self.reverse.iterator();
         while (rev_iter.next()) |entry| {
             entry.value_ptr.deinit();
+            self.allocator.free(entry.key_ptr.*);
         }
         self.reverse.deinit();
     }
 
-    pub fn setDeps(self: *DependencyGraph, path: []const u8, deps: std.ArrayList([]const u8)) !void {
-        // Remove old reverse edges for this path
-        if (self.forward.getPtr(path)) |old_deps| {
-            for (old_deps.items) |old_dep| {
-                if (self.reverse.getPtr(old_dep)) |rev_set| {
-                    _ = rev_set.remove(path);
-                }
-            }
-            old_deps.deinit(self.allocator);
-        }
+    fn setDepsInternal(self: *DependencyGraph, path: []const u8, deps: std.ArrayList([]const u8), free_input_items: bool) !void {
+        var input_deps = deps;
+        defer input_deps.deinit(self.allocator);
 
-        // Set forward edge
-        const gop = try self.forward.getOrPut(path);
-        gop.key_ptr.* = path;
-        gop.value_ptr.* = deps;
+        self.remove(path);
 
-        // Add reverse edges: for each dep, record that `path` depends on it
-        for (deps.items) |dep| {
+        var stable_deps: std.ArrayList([]const u8) = .empty;
+        errdefer stable_deps.deinit(self.allocator);
+        try stable_deps.ensureTotalCapacity(self.allocator, input_deps.items.len);
+
+        for (input_deps.items) |dep| {
             const rev_gop = try self.reverse.getOrPut(dep);
             if (!rev_gop.found_existing) {
-                rev_gop.key_ptr.* = dep;
+                rev_gop.key_ptr.* = try self.allocator.dupe(u8, dep);
                 rev_gop.value_ptr.* = std.StringHashMap(void).init(self.allocator);
             }
             try rev_gop.value_ptr.put(path, {});
+            stable_deps.appendAssumeCapacity(rev_gop.key_ptr.*);
         }
+
+        const gop = try self.forward.getOrPut(path);
+        gop.key_ptr.* = path;
+        gop.value_ptr.* = stable_deps;
+
+        if (free_input_items) {
+            for (input_deps.items) |dep| self.allocator.free(dep);
+        }
+    }
+
+    pub fn setDeps(self: *DependencyGraph, path: []const u8, deps: std.ArrayList([]const u8)) !void {
+        try self.setDepsInternal(path, deps, false);
+    }
+
+    pub fn setOwnedDeps(self: *DependencyGraph, path: []const u8, deps: std.ArrayList([]const u8)) !void {
+        try self.setDepsInternal(path, deps, true);
     }
 
     pub fn remove(self: *DependencyGraph, path: []const u8) void {
         // Remove forward edges and their reverse counterparts
-        if (self.forward.getPtr(path)) |deps| {
+        if (self.forward.fetchRemove(path)) |removed| {
+            var deps = removed.value;
             for (deps.items) |dep| {
                 if (self.reverse.getPtr(dep)) |rev_set| {
                     _ = rev_set.remove(path);
+                    if (rev_set.count() == 0) {
+                        if (self.reverse.fetchRemove(dep)) |rev_removed| {
+                            var removed_set = rev_removed.value;
+                            removed_set.deinit();
+                            self.allocator.free(rev_removed.key);
+                        }
+                    }
                 }
             }
             deps.deinit(self.allocator);
-            _ = self.forward.remove(path);
         }
-        // Remove path from reverse index (others importing this path)
-        // The entries in reverse[path] are the files that import `path`.
-        // We don't remove those — they still have forward edges pointing here.
-        // We just remove the reverse key if nobody imports this path anymore.
-        // Actually, we should NOT remove reverse[path] here — other files
-        // still reference `path` in their forward edges. The reverse entry
-        // is cleaned up lazily when those files are re-indexed or removed.
     }
 
     pub fn getForwardDeps(self: *const DependencyGraph, path: []const u8) ?[]const []const u8 {
@@ -329,22 +350,44 @@ pub const DependencyGraph = struct {
         return result.toOwnedSlice(allocator);
     }
 
+    fn enqueueTraversalKey(
+        allocator: std.mem.Allocator,
+        visited: *std.StringHashMap(void),
+        queue: *std.ArrayList(TraversalItem),
+        path: []const u8,
+        depth: u32,
+    ) !void {
+        if (visited.contains(path)) return;
+        try visited.put(path, {});
+        try queue.append(allocator, .{ .path = path, .depth = depth });
+    }
+
+    fn enqueueTraversalPathAndBasename(
+        allocator: std.mem.Allocator,
+        visited: *std.StringHashMap(void),
+        queue: *std.ArrayList(TraversalItem),
+        path: []const u8,
+        depth: u32,
+    ) !void {
+        try enqueueTraversalKey(allocator, visited, queue, path, depth);
+        const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
+        if (!std.mem.eql(u8, path, basename)) {
+            try enqueueTraversalKey(allocator, visited, queue, basename, depth);
+        }
+    }
+
     pub fn getTransitiveDependents(self: *const DependencyGraph, path: []const u8, allocator: std.mem.Allocator, max_depth: ?u32) ![]const []const u8 {
         const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
 
         var visited = std.StringHashMap(void).init(allocator);
         defer visited.deinit();
 
-        var queue: std.ArrayList(struct { path: []const u8, depth: u32 }) = .empty;
+        var queue: std.ArrayList(TraversalItem) = .empty;
         defer queue.deinit(allocator);
 
-        try visited.put(path, {});
+        try enqueueTraversalKey(allocator, &visited, &queue, path, 0);
         if (!std.mem.eql(u8, path, basename)) {
-            try visited.put(basename, {});
-        }
-        try queue.append(allocator, .{ .path = path, .depth = 0 });
-        if (!std.mem.eql(u8, path, basename)) {
-            try queue.append(allocator, .{ .path = basename, .depth = 0 });
+            try enqueueTraversalKey(allocator, &visited, &queue, basename, 0);
         }
 
         var result: std.ArrayList([]const u8) = .empty;
@@ -366,17 +409,9 @@ pub const DependencyGraph = struct {
                 while (rev_iter.next()) |key_ptr| {
                     const dep = key_ptr.*;
                     if (!visited.contains(dep)) {
-                        try visited.put(dep, {});
                         const dep_copy = try allocator.dupe(u8, dep);
                         try result.append(allocator, dep_copy);
-                        try queue.append(allocator, .{ .path = dep, .depth = item.depth + 1 });
-
-                        // Also enqueue basename for this dep
-                        const dep_basename = if (std.mem.lastIndexOfScalar(u8, dep, '/')) |pos| dep[pos + 1 ..] else dep;
-                        if (!std.mem.eql(u8, dep, dep_basename) and !visited.contains(dep_basename)) {
-                            try visited.put(dep_basename, {});
-                            try queue.append(allocator, .{ .path = dep_basename, .depth = item.depth + 1 });
-                        }
+                        try enqueueTraversalPathAndBasename(allocator, &visited, &queue, dep, item.depth + 1);
                     }
                 }
             }
@@ -389,11 +424,10 @@ pub const DependencyGraph = struct {
         var visited = std.StringHashMap(void).init(allocator);
         defer visited.deinit();
 
-        var queue: std.ArrayList(struct { path: []const u8, depth: u32 }) = .empty;
+        var queue: std.ArrayList(TraversalItem) = .empty;
         defer queue.deinit(allocator);
 
-        try visited.put(path, {});
-        try queue.append(allocator, .{ .path = path, .depth = 0 });
+        try enqueueTraversalPathAndBasename(allocator, &visited, &queue, path, 0);
 
         var result: std.ArrayList([]const u8) = .empty;
         errdefer {
@@ -412,10 +446,9 @@ pub const DependencyGraph = struct {
             if (self.forward.get(item.path)) |fwd_deps| {
                 for (fwd_deps.items) |dep| {
                     if (!visited.contains(dep)) {
-                        try visited.put(dep, {});
                         const dep_copy = try allocator.dupe(u8, dep);
                         try result.append(allocator, dep_copy);
-                        try queue.append(allocator, .{ .path = dep, .depth = item.depth + 1 });
+                        try enqueueTraversalPathAndBasename(allocator, &visited, &queue, dep, item.depth + 1);
                     }
                 }
             }
@@ -496,6 +529,10 @@ fn findBraceAlternatives(pattern: []const u8, open: usize) ?usize {
     return null;
 }
 
+fn isSegmentBoundary(path: []const u8, pos: usize) bool {
+    return pos == 0 or (pos <= path.len and path[pos - 1] == '/');
+}
+
 fn matchGlobFragmentThen(fragment: []const u8, gi_start: usize, path: []const u8, ti_start: usize, rest: []const u8) bool {
     var gi = gi_start;
     var ti = ti_start;
@@ -503,11 +540,13 @@ fn matchGlobFragmentThen(fragment: []const u8, gi_start: usize, path: []const u8
         const c = fragment[gi];
         if (c == '*') {
             if (gi + 1 < fragment.len and fragment[gi + 1] == '*') {
+                const slash_terminated = gi + 2 < fragment.len and fragment[gi + 2] == '/';
                 var next = gi + 2;
-                if (next < fragment.len and fragment[next] == '/') next += 1;
+                if (slash_terminated) next += 1;
                 if (matchGlobFragmentThen(fragment, next, path, ti, rest)) return true;
                 var k: usize = ti;
                 while (k < path.len) : (k += 1) {
+                    if (slash_terminated and !isSegmentBoundary(path, k + 1)) continue;
                     if (matchGlobFragmentThen(fragment, next, path, k + 1, rest)) return true;
                 }
                 return false;
@@ -540,11 +579,13 @@ fn matchGlobRec(pattern: []const u8, gi_start: usize, path: []const u8, ti_start
         if (c == '*') {
             if (gi + 1 < pattern.len and pattern[gi + 1] == '*') {
                 // ** matches across path separators
+                const slash_terminated = gi + 2 < pattern.len and pattern[gi + 2] == '/';
                 var rest = gi + 2;
-                if (rest < pattern.len and pattern[rest] == '/') rest += 1;
+                if (slash_terminated) rest += 1;
                 if (matchGlobRec(pattern, rest, path, ti)) return true;
                 var k: usize = ti;
                 while (k < path.len) : (k += 1) {
+                    if (slash_terminated and !isSegmentBoundary(path, k + 1)) continue;
                     if (matchGlobRec(pattern, rest, path, k + 1)) return true;
                 }
                 return false;
@@ -634,7 +675,7 @@ pub const Explorer = struct {
         self.io = io;
         self.root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{}) catch null;
         if (self.root_dir) |dir| {
-            var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+            var real_buf: [max_path_bytes]u8 = undefined;
             const real_len = dir.realPathFile(io, ".", &real_buf) catch return;
             self.root_real = self.allocator.dupe(u8, real_buf[0..real_len]) catch &.{};
         }
@@ -839,6 +880,7 @@ pub const Explorer = struct {
             }
 
             if (sym.line_start == 0 or sym.line_start > total_lines) continue;
+            if (sym.line_end > sym.line_start) continue;
 
             if (is_brace_lang) {
                 sym.line_end = findBraceEnd(content, line_offsets.items, sym.line_start, total_lines, outline.language);
@@ -1033,7 +1075,1217 @@ pub const Explorer = struct {
         return count;
     }
 
+    fn appendOutlineSymbolRange(
+        allocator: std.mem.Allocator,
+        outline: *FileOutline,
+        name: []const u8,
+        kind: SymbolKind,
+        line_start: u32,
+        line_end: u32,
+        detail: ?[]const u8,
+    ) !void {
+        try appendOutlineSymbol(allocator, outline, name, kind, line_start, detail);
+        outline.symbols.items[outline.symbols.items.len - 1].line_end = @max(line_start, line_end);
+    }
+
+    fn treeSitterNodeSlice(content: []const u8, node: tree_sitter_mod.TSNode) []const u8 {
+        const start: usize = tree_sitter_mod.nodeStartByte(node);
+        const end: usize = tree_sitter_mod.nodeEndByte(node);
+        if (start > end or end > content.len) return "";
+        return content[start..end];
+    }
+
+    fn treeSitterFirstNamedChildOfType(node: tree_sitter_mod.TSNode, child_types: []const []const u8) ?tree_sitter_mod.TSNode {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(node)) : (i += 1) {
+            const child = tree_sitter_mod.namedChild(node, i);
+            const child_type = tree_sitter_mod.nodeType(child);
+            for (child_types) |candidate| {
+                if (std.mem.eql(u8, child_type, candidate)) return child;
+            }
+        }
+        return null;
+    }
+
+    fn treeSitterFirstNamedDescendantOfType(node: tree_sitter_mod.TSNode, child_types: []const []const u8) ?tree_sitter_mod.TSNode {
+        const node_type = tree_sitter_mod.nodeType(node);
+        for (child_types) |candidate| {
+            if (std.mem.eql(u8, node_type, candidate)) return node;
+        }
+
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(node)) : (i += 1) {
+            if (treeSitterFirstNamedDescendantOfType(tree_sitter_mod.namedChild(node, i), child_types)) |found| {
+                return found;
+            }
+        }
+        return null;
+    }
+
+    fn treeSitterRustIsTestAttribute(attr_text: []const u8) bool {
+        return std.mem.indexOf(u8, attr_text, "#[test") != null or
+            std.mem.indexOf(u8, attr_text, "::test") != null;
+    }
+
+    fn treeSitterRustImplName(raw: []const u8) ?[]const u8 {
+        var rest = std.mem.trim(u8, raw, " \t\r\n{");
+        if (startsWith(rest, "unsafe ")) rest = std.mem.trimStart(u8, rest["unsafe ".len..], " \t");
+        if (!startsWith(rest, "impl")) return null;
+        rest = std.mem.trimStart(u8, rest["impl".len..], " \t");
+        if (startsWith(rest, "<")) {
+            var depth: i32 = 0;
+            var i: usize = 0;
+            while (i < rest.len) : (i += 1) {
+                if (rest[i] == '<') depth += 1 else if (rest[i] == '>') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        rest = std.mem.trimStart(u8, rest[i + 1 ..], " \t");
+                        break;
+                    }
+                }
+            }
+        }
+        if (std.mem.indexOf(u8, rest, " for ")) |for_pos| {
+            return extractIdent(std.mem.trimStart(u8, rest[for_pos + 5 ..], " \t"));
+        }
+        return extractIdent(rest);
+    }
+
+    fn treeSitterIdentifierLikeSlice(content: []const u8, node: tree_sitter_mod.TSNode) ?[]const u8 {
+        const node_type = tree_sitter_mod.nodeType(node);
+        if (std.mem.eql(u8, node_type, "identifier") or
+            std.mem.eql(u8, node_type, "field_identifier") or
+            std.mem.eql(u8, node_type, "type_identifier"))
+        {
+            return treeSitterNodeSlice(content, node);
+        }
+
+        var last: ?[]const u8 = null;
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(node)) : (i += 1) {
+            if (treeSitterIdentifierLikeSlice(content, tree_sitter_mod.namedChild(node, i))) |name| {
+                last = name;
+            }
+        }
+        return last;
+    }
+
+    fn treeSitterCDeclaratorName(content: []const u8, node: tree_sitter_mod.TSNode) ?[]const u8 {
+        if (tree_sitter_mod.childByFieldName(node, "declarator")) |inner| {
+            return treeSitterCDeclaratorName(content, inner);
+        }
+        if (tree_sitter_mod.childByFieldName(node, "name")) |name_node| {
+            return treeSitterCDeclaratorName(content, name_node);
+        }
+        if (treeSitterIdentifierLikeSlice(content, node)) |name| return name;
+
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(node)) : (i += 1) {
+            if (treeSitterCDeclaratorName(content, tree_sitter_mod.namedChild(node, i))) |name| return name;
+        }
+        return null;
+    }
+
+    fn treeSitterCImportPath(content: []const u8, node: tree_sitter_mod.TSNode) ?[]const u8 {
+        const path_node = tree_sitter_mod.childByFieldName(node, "path") orelse return null;
+        const raw = treeSitterNodeSlice(content, path_node);
+        if (extractStringLiteral(raw)) |value| return value;
+        if (raw.len >= 2 and raw[0] == '<' and raw[raw.len - 1] == '>') return raw[1 .. raw.len - 1];
+        return if (raw.len == 0) null else raw;
+    }
+
+    fn treeSitterCTypeKind(node: tree_sitter_mod.TSNode) ?SymbolKind {
+        const node_type = tree_sitter_mod.nodeType(node);
+        if (std.mem.eql(u8, node_type, "struct_specifier")) return .struct_def;
+        if (std.mem.eql(u8, node_type, "enum_specifier")) return .enum_def;
+        if (std.mem.eql(u8, node_type, "union_specifier")) return .union_def;
+        if (std.mem.eql(u8, node_type, "class_specifier")) return .class_def;
+        return null;
+    }
+
+    fn treeSitterDartUriValue(content: []const u8, node: tree_sitter_mod.TSNode) ?[]const u8 {
+        const uri_node = treeSitterFirstNamedDescendantOfType(node, &.{"uri"}) orelse return null;
+        return extractStringLiteral(treeSitterNodeSlice(content, uri_node));
+    }
+
+    fn treeSitterPhpNameValue(content: []const u8, node: tree_sitter_mod.TSNode) []const u8 {
+        return treeSitterNodeSlice(content, node);
+    }
+
+    fn treeSitterGrammarForPath(path: []const u8) ?tree_sitter_mod.Grammar {
+        if (std.mem.endsWith(u8, path, ".mm")) return null;
+        return switch (detectLanguage(path)) {
+            .c => .c,
+            .cpp => .cpp,
+            .rust => .rust,
+            .typescript => if (std.mem.endsWith(u8, path, ".tsx")) .tsx else .typescript,
+            .python => .python,
+            .go_lang => .go,
+            .dart => .dart,
+            .php => .php,
+            .hcl => .hcl,
+            .r => .r,
+            .ruby => .ruby,
+            else => null,
+        };
+    }
+
+    fn treeSitterStringValue(content: []const u8, node: tree_sitter_mod.TSNode) ?[]const u8 {
+        return extractStringLiteral(treeSitterNodeSlice(content, node));
+    }
+
+    fn appendCTreeSitterTypeSymbol(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        const kind = treeSitterCTypeKind(node) orelse return;
+        const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+        const name = treeSitterIdentifierLikeSlice(content, name_node) orelse return;
+        try self.appendTreeSitterNamedSymbol(outline, content, node, kind, name, treeSitterNodeSlice(content, node));
+    }
+
+    fn appendCTreeSitterTypedef(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) anyerror!void {
+        if (tree_sitter_mod.childByFieldName(node, "type")) |type_node| {
+            if (treeSitterCTypeKind(type_node)) |_| {
+                try self.appendCTreeSitterTypeSymbol(outline, content, type_node);
+                if (tree_sitter_mod.childByFieldName(type_node, "body")) |body| {
+                    try self.parseCTreeSitterItems(outline, content, body);
+                }
+                return;
+            }
+        }
+
+        const declarator = tree_sitter_mod.childByFieldName(node, "declarator") orelse return;
+        const raw = treeSitterNodeSlice(content, declarator);
+        if (std.mem.indexOf(u8, raw, "(*") != null or std.mem.indexOf(u8, raw, "(&") != null) return;
+        const name = treeSitterCDeclaratorName(content, declarator) orelse return;
+        try self.appendTreeSitterNamedSymbol(outline, content, node, .type_alias, name, treeSitterNodeSlice(content, node));
+    }
+
+    fn parseCTreeSitterItems(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        container: tree_sitter_mod.TSNode,
+    ) anyerror!void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(container)) : (i += 1) {
+            const node = tree_sitter_mod.namedChild(container, i);
+            const node_type = tree_sitter_mod.nodeType(node);
+
+            if (std.mem.eql(u8, node_type, "preproc_include")) {
+                const import_path = treeSitterCImportPath(content, node) orelse continue;
+                try self.appendTreeSitterImport(outline, node, import_path, treeSitterNodeSlice(content, node));
+                continue;
+            }
+
+            if (std.mem.eql(u8, node_type, "preproc_def") or std.mem.eql(u8, node_type, "preproc_function_def")) {
+                const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse continue;
+                const name = treeSitterIdentifierLikeSlice(content, name_node) orelse continue;
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .macro_def, name, treeSitterNodeSlice(content, node));
+                continue;
+            }
+
+            if (std.mem.eql(u8, node_type, "function_definition")) {
+                const declarator = tree_sitter_mod.childByFieldName(node, "declarator") orelse continue;
+                const name = treeSitterCDeclaratorName(content, declarator) orelse continue;
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .function, name, treeSitterNodeSlice(content, node));
+                continue;
+            }
+
+            if (std.mem.eql(u8, node_type, "type_definition")) {
+                try self.appendCTreeSitterTypedef(outline, content, node);
+                continue;
+            }
+
+            if (treeSitterCTypeKind(node)) |_| {
+                try self.appendCTreeSitterTypeSymbol(outline, content, node);
+                if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                    try self.parseCTreeSitterItems(outline, content, body);
+                }
+                continue;
+            }
+
+            if (std.mem.eql(u8, node_type, "declaration") or
+                std.mem.eql(u8, node_type, "field_declaration_list") or
+                std.mem.eql(u8, node_type, "namespace_definition") or
+                std.mem.eql(u8, node_type, "linkage_specification"))
+            {
+                try self.parseCTreeSitterItems(outline, content, node);
+            }
+        }
+    }
+
+    fn appendDartTreeSitterImports(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        const import_path = treeSitterDartUriValue(content, node) orelse return;
+        try self.appendTreeSitterImport(outline, node, import_path, treeSitterNodeSlice(content, node));
+    }
+
+    fn appendDartTreeSitterDeclarationVariables(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+        kind: SymbolKind,
+    ) !void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(node)) : (i += 1) {
+            const child = tree_sitter_mod.namedChild(node, i);
+            const child_type = tree_sitter_mod.nodeType(child);
+            if (std.mem.eql(u8, child_type, "initialized_variable_definition")) {
+                const name_node = tree_sitter_mod.childByFieldName(child, "name") orelse continue;
+                const name = treeSitterIdentifierLikeSlice(content, name_node) orelse continue;
+                try self.appendTreeSitterNamedSymbol(outline, content, child, kind, name, treeSitterNodeSlice(content, child));
+                continue;
+            }
+            if (std.mem.eql(u8, child_type, "initialized_identifier")) {
+                const name_node = treeSitterFirstNamedChildOfType(child, &.{"identifier"}) orelse continue;
+                const name = treeSitterIdentifierLikeSlice(content, name_node) orelse continue;
+                try self.appendTreeSitterNamedSymbol(outline, content, child, kind, name, treeSitterNodeSlice(content, child));
+                continue;
+            }
+            if (std.mem.eql(u8, child_type, "static_final_declaration")) {
+                const name_node = treeSitterFirstNamedChildOfType(child, &.{"identifier"}) orelse continue;
+                const name = treeSitterIdentifierLikeSlice(content, name_node) orelse continue;
+                try self.appendTreeSitterNamedSymbol(outline, content, child, kind, name, treeSitterNodeSlice(content, child));
+                continue;
+            }
+            try self.appendDartTreeSitterDeclarationVariables(outline, content, child, kind);
+        }
+    }
+
+    fn appendDartTreeSitterCallable(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        const signature = treeSitterFirstNamedDescendantOfType(node, &.{"function_signature"}) orelse return;
+        const name_node = tree_sitter_mod.childByFieldName(signature, "name") orelse return;
+        const name = treeSitterIdentifierLikeSlice(content, name_node) orelse return;
+        try self.appendTreeSitterNamedSymbol(outline, content, node, .function, name, treeSitterNodeSlice(content, node));
+    }
+
+    fn appendPhpTreeSitterImport(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        const raw = treeSitterNodeSlice(content, node);
+        const line_num = tree_sitter_mod.nodeStartPoint(node).row + 1;
+        try self.parsePhpUseImport(self.allocator, raw, line_num, outline);
+    }
+
+    fn appendPhpTreeSitterConstants(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(node)) : (i += 1) {
+            const child = tree_sitter_mod.namedChild(node, i);
+            if (!std.mem.eql(u8, tree_sitter_mod.nodeType(child), "const_element")) continue;
+            const name_node = treeSitterFirstNamedChildOfType(child, &.{"name"}) orelse continue;
+            try self.appendTreeSitterNamedSymbol(outline, content, child, .constant, treeSitterPhpNameValue(content, name_node), treeSitterNodeSlice(content, child));
+        }
+    }
+
+    fn parsePhpTreeSitterNode(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+        in_type_body: bool,
+    ) anyerror!void {
+        const node_type = tree_sitter_mod.nodeType(node);
+        const raw = treeSitterNodeSlice(content, node);
+
+        if (std.mem.eql(u8, node_type, "namespace_definition")) {
+            if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                try self.parsePhpTreeSitterItems(outline, content, body, false);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "namespace_use_declaration")) {
+            try self.appendPhpTreeSitterImport(outline, content, node);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "class_declaration")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .class_def, treeSitterPhpNameValue(content, name_node), raw);
+            if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                try self.parsePhpTreeSitterItems(outline, content, body, true);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "interface_declaration")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .interface_def, treeSitterPhpNameValue(content, name_node), raw);
+            if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                try self.parsePhpTreeSitterItems(outline, content, body, true);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "trait_declaration")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .trait_def, treeSitterPhpNameValue(content, name_node), raw);
+            if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                try self.parsePhpTreeSitterItems(outline, content, body, true);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "enum_declaration")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .enum_def, treeSitterPhpNameValue(content, name_node), raw);
+            if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                try self.parsePhpTreeSitterItems(outline, content, body, true);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "function_definition")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .function, treeSitterPhpNameValue(content, name_node), raw);
+            return;
+        }
+
+        if (in_type_body and std.mem.eql(u8, node_type, "method_declaration")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .method, treeSitterPhpNameValue(content, name_node), raw);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "const_declaration")) {
+            try self.appendPhpTreeSitterConstants(outline, content, node);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "declaration_list") or
+            std.mem.eql(u8, node_type, "enum_declaration_list") or
+            std.mem.eql(u8, node_type, "compound_statement"))
+        {
+            try self.parsePhpTreeSitterItems(outline, content, node, in_type_body);
+        }
+    }
+
+    fn parsePhpTreeSitterItems(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        container: tree_sitter_mod.TSNode,
+        in_type_body: bool,
+    ) anyerror!void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(container)) : (i += 1) {
+            try self.parsePhpTreeSitterNode(outline, content, tree_sitter_mod.namedChild(container, i), in_type_body);
+        }
+    }
+
+    fn parseDartTreeSitterNode(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+        in_type_body: bool,
+    ) anyerror!void {
+        const node_type = tree_sitter_mod.nodeType(node);
+        const raw = treeSitterNodeSlice(content, node);
+
+        if (std.mem.eql(u8, node_type, "import_or_export") or std.mem.eql(u8, node_type, "part_directive")) {
+            try self.appendDartTreeSitterImports(outline, content, node);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "class_definition")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .class_def, treeSitterNodeSlice(content, name_node), raw);
+            if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                try self.parseDartTreeSitterItems(outline, content, body, true);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "mixin_declaration")) {
+            const name_node = treeSitterFirstNamedDescendantOfType(node, &.{"identifier"}) orelse return;
+            const name = treeSitterIdentifierLikeSlice(content, name_node) orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .trait_def, name, raw);
+            if (treeSitterFirstNamedDescendantOfType(node, &.{"class_body"})) |body| {
+                try self.parseDartTreeSitterItems(outline, content, body, true);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "extension_declaration")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse {
+                if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                    try self.parseDartTreeSitterItems(outline, content, body, true);
+                }
+                return;
+            };
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .impl_block, treeSitterNodeSlice(content, name_node), raw);
+            if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                try self.parseDartTreeSitterItems(outline, content, body, true);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "enum_declaration")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .enum_def, treeSitterNodeSlice(content, name_node), raw);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "type_alias")) {
+            const name_node = treeSitterFirstNamedDescendantOfType(node, &.{"type_identifier"}) orelse return;
+            const name = treeSitterIdentifierLikeSlice(content, name_node) orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .type_alias, name, raw);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "static_final_declaration_list") or std.mem.eql(u8, node_type, "static_final_declaration")) {
+            try self.appendDartTreeSitterDeclarationVariables(outline, content, node, .constant);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "declaration")) {
+            if (treeSitterFirstNamedDescendantOfType(node, &.{"function_signature"})) |_| {
+                try self.appendDartTreeSitterCallable(outline, content, node);
+                return;
+            }
+
+            if (std.mem.indexOf(u8, raw, "const ") != null or std.mem.indexOf(u8, raw, "final ") != null) {
+                try self.appendDartTreeSitterDeclarationVariables(outline, content, node, .constant);
+            }
+            return;
+        }
+
+        if (in_type_body and std.mem.eql(u8, node_type, "method_signature")) {
+            try self.appendDartTreeSitterCallable(outline, content, node);
+        }
+    }
+
+    fn parseDartTreeSitterItems(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        container: tree_sitter_mod.TSNode,
+        in_type_body: bool,
+    ) anyerror!void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(container)) : (i += 1) {
+            try self.parseDartTreeSitterNode(outline, content, tree_sitter_mod.namedChild(container, i), in_type_body);
+        }
+    }
+
+    fn appendTreeSitterNamedSymbol(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+        kind: SymbolKind,
+        name: []const u8,
+        detail: ?[]const u8,
+    ) !void {
+        const start_line = tree_sitter_mod.nodeStartPoint(node).row + 1;
+        const end_line = tree_sitter_mod.nodeEndPoint(node).row + 1;
+        try appendOutlineSymbolRange(self.allocator, outline, name, kind, start_line, end_line, detail);
+        _ = content;
+    }
+
+    fn appendTreeSitterImport(
+        self: *Explorer,
+        outline: *FileOutline,
+        node: tree_sitter_mod.TSNode,
+        import_path: []const u8,
+        detail: []const u8,
+    ) !void {
+        const start_line = tree_sitter_mod.nodeStartPoint(node).row + 1;
+        const end_line = tree_sitter_mod.nodeEndPoint(node).row + 1;
+        try appendOutlineSymbolRange(self.allocator, outline, import_path, .import, start_line, end_line, detail);
+        try appendImportPath(self.allocator, outline, import_path);
+    }
+
+    fn treeSitterTypeScriptName(content: []const u8, node: tree_sitter_mod.TSNode) ?[]const u8 {
+        const node_type = tree_sitter_mod.nodeType(node);
+        if (std.mem.eql(u8, node_type, "computed_property_name")) return null;
+        if (std.mem.eql(u8, node_type, "string")) {
+            return treeSitterStringValue(content, node);
+        }
+        return treeSitterNodeSlice(content, node);
+    }
+
+    fn appendTypeScriptTreeSitterVariables(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+        kind: SymbolKind,
+    ) !void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(node)) : (i += 1) {
+            const child = tree_sitter_mod.namedChild(node, i);
+            if (!std.mem.eql(u8, tree_sitter_mod.nodeType(child), "variable_declarator")) continue;
+            const name_node = tree_sitter_mod.childByFieldName(child, "name") orelse continue;
+            if (!std.mem.eql(u8, tree_sitter_mod.nodeType(name_node), "identifier")) continue;
+            try self.appendTreeSitterNamedSymbol(outline, content, child, kind, treeSitterNodeSlice(content, name_node), treeSitterNodeSlice(content, child));
+        }
+    }
+
+    fn parseTypeScriptTreeSitterMembers(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        container: tree_sitter_mod.TSNode,
+    ) !void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(container)) : (i += 1) {
+            const node = tree_sitter_mod.namedChild(container, i);
+            const node_type = tree_sitter_mod.nodeType(node);
+            if (!std.mem.eql(u8, node_type, "method_definition") and !std.mem.eql(u8, node_type, "method_signature")) continue;
+
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse continue;
+            const name = treeSitterTypeScriptName(content, name_node) orelse continue;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .method, name, treeSitterNodeSlice(content, node));
+        }
+    }
+
+    fn parseTypeScriptTreeSitterNode(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        const node_type = tree_sitter_mod.nodeType(node);
+        const raw = treeSitterNodeSlice(content, node);
+
+        if (std.mem.eql(u8, node_type, "import_statement")) {
+            const source_node = tree_sitter_mod.childByFieldName(node, "source") orelse return;
+            const import_path = treeSitterStringValue(content, source_node) orelse return;
+            try self.appendTreeSitterImport(outline, node, import_path, raw);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "export_statement")) {
+            if (tree_sitter_mod.childByFieldName(node, "source")) |source_node| {
+                if (treeSitterStringValue(content, source_node)) |import_path| {
+                    try self.appendTreeSitterImport(outline, node, import_path, raw);
+                }
+            }
+            if (tree_sitter_mod.childByFieldName(node, "declaration")) |decl| {
+                try self.parseTypeScriptTreeSitterNode(outline, content, decl);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "function_declaration") or
+            std.mem.eql(u8, node_type, "generator_function_declaration") or
+            std.mem.eql(u8, node_type, "function_signature"))
+        {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .function, treeSitterNodeSlice(content, name_node), raw);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "class_declaration") or std.mem.eql(u8, node_type, "abstract_class_declaration")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .class_def, treeSitterNodeSlice(content, name_node), raw);
+            if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                try self.parseTypeScriptTreeSitterMembers(outline, content, body);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "interface_declaration")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .interface_def, treeSitterNodeSlice(content, name_node), raw);
+            if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                try self.parseTypeScriptTreeSitterMembers(outline, content, body);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "enum_declaration")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .enum_def, treeSitterNodeSlice(content, name_node), raw);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "type_alias_declaration")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .type_alias, treeSitterNodeSlice(content, name_node), raw);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "lexical_declaration")) {
+            const kind: SymbolKind = if (startsWith(std.mem.trim(u8, raw, " \t"), "const ")) .constant else .variable;
+            try self.appendTypeScriptTreeSitterVariables(outline, content, node, kind);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "variable_declaration")) {
+            try self.appendTypeScriptTreeSitterVariables(outline, content, node, .variable);
+        }
+    }
+
+    fn appendPythonTreeSitterImportStatement(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        const raw = treeSitterNodeSlice(content, node);
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(node)) : (i += 1) {
+            const child = tree_sitter_mod.namedChild(node, i);
+            const child_type = tree_sitter_mod.nodeType(child);
+            const import_path = if (std.mem.eql(u8, child_type, "aliased_import")) blk: {
+                const name_node = tree_sitter_mod.childByFieldName(child, "name") orelse continue;
+                break :blk treeSitterNodeSlice(content, name_node);
+            } else if (std.mem.eql(u8, child_type, "dotted_name"))
+                treeSitterNodeSlice(content, child)
+            else
+                continue;
+            try self.appendTreeSitterImport(outline, child, import_path, raw);
+        }
+    }
+
+    fn appendPythonTreeSitterImportFrom(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        const raw = treeSitterNodeSlice(content, node);
+        const line_num = tree_sitter_mod.nodeStartPoint(node).row + 1;
+        try appendOutlineSymbol(self.allocator, outline, raw, .import, line_num, null);
+        try appendPythonImportSpec(self.allocator, outline, raw);
+    }
+
+    fn appendGoTreeSitterImportSpec(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        const path_node = tree_sitter_mod.childByFieldName(node, "path") orelse return;
+        const import_path = treeSitterStringValue(content, path_node) orelse return;
+        try self.appendTreeSitterImport(outline, node, import_path, treeSitterNodeSlice(content, node));
+    }
+
+    fn appendGoTreeSitterTypeDeclaration(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(node)) : (i += 1) {
+            const child = tree_sitter_mod.namedChild(node, i);
+            const child_type = tree_sitter_mod.nodeType(child);
+            if (!std.mem.eql(u8, child_type, "type_spec") and !std.mem.eql(u8, child_type, "type_alias")) continue;
+
+            const name_node = tree_sitter_mod.childByFieldName(child, "name") orelse continue;
+            var kind: SymbolKind = .type_alias;
+            if (tree_sitter_mod.childByFieldName(child, "type")) |type_node| {
+                const type_name = tree_sitter_mod.nodeType(type_node);
+                if (std.mem.eql(u8, type_name, "struct_type") or std.mem.eql(u8, type_name, "interface_type")) {
+                    kind = .struct_def;
+                }
+            } else if (std.mem.eql(u8, child_type, "type_spec")) {
+                kind = .struct_def;
+            }
+            try self.appendTreeSitterNamedSymbol(outline, content, child, kind, treeSitterNodeSlice(content, name_node), treeSitterNodeSlice(content, child));
+        }
+    }
+
+    fn parseGoTreeSitterItems(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        container: tree_sitter_mod.TSNode,
+    ) !void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(container)) : (i += 1) {
+            const node = tree_sitter_mod.namedChild(container, i);
+            const node_type = tree_sitter_mod.nodeType(node);
+            const raw = treeSitterNodeSlice(content, node);
+
+            if (std.mem.eql(u8, node_type, "import_declaration")) {
+                var j: u32 = 0;
+                while (j < tree_sitter_mod.namedChildCount(node)) : (j += 1) {
+                    const child = tree_sitter_mod.namedChild(node, j);
+                    const child_type = tree_sitter_mod.nodeType(child);
+                    if (std.mem.eql(u8, child_type, "import_spec")) {
+                        try self.appendGoTreeSitterImportSpec(outline, content, child);
+                    } else if (std.mem.eql(u8, child_type, "import_spec_list")) {
+                        var k: u32 = 0;
+                        while (k < tree_sitter_mod.namedChildCount(child)) : (k += 1) {
+                            const spec = tree_sitter_mod.namedChild(child, k);
+                            if (std.mem.eql(u8, tree_sitter_mod.nodeType(spec), "import_spec")) {
+                                try self.appendGoTreeSitterImportSpec(outline, content, spec);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (std.mem.eql(u8, node_type, "function_declaration") or std.mem.eql(u8, node_type, "method_declaration")) {
+                const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse continue;
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .function, treeSitterNodeSlice(content, name_node), raw);
+                continue;
+            }
+
+            if (std.mem.eql(u8, node_type, "type_declaration")) {
+                try self.appendGoTreeSitterTypeDeclaration(outline, content, node);
+            }
+        }
+    }
+
+    fn appendRubyTreeSitterImportCall(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        const method_node = tree_sitter_mod.childByFieldName(node, "method") orelse return;
+        const method_name = treeSitterNodeSlice(content, method_node);
+        if (!std.mem.eql(u8, method_name, "require") and !std.mem.eql(u8, method_name, "require_relative")) return;
+
+        const args = tree_sitter_mod.childByFieldName(node, "arguments") orelse return;
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(args)) : (i += 1) {
+            const child = tree_sitter_mod.namedChild(args, i);
+            const child_type = tree_sitter_mod.nodeType(child);
+            if (!std.mem.eql(u8, child_type, "string")) continue;
+            const import_path = treeSitterStringValue(content, child) orelse continue;
+            try self.appendTreeSitterImport(outline, node, import_path, treeSitterNodeSlice(content, node));
+            return;
+        }
+    }
+
+    fn parseRubyTreeSitterItems(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        container: tree_sitter_mod.TSNode,
+    ) !void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(container)) : (i += 1) {
+            const node = tree_sitter_mod.namedChild(container, i);
+            const node_type = tree_sitter_mod.nodeType(node);
+            const raw = treeSitterNodeSlice(content, node);
+
+            if (std.mem.eql(u8, node_type, "class") or std.mem.eql(u8, node_type, "module")) {
+                const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse continue;
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .struct_def, treeSitterNodeSlice(content, name_node), raw);
+                if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                    try self.parseRubyTreeSitterItems(outline, content, body);
+                }
+                continue;
+            }
+
+            if (std.mem.eql(u8, node_type, "method") or std.mem.eql(u8, node_type, "singleton_method")) {
+                const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse continue;
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .function, treeSitterNodeSlice(content, name_node), raw);
+                continue;
+            }
+
+            if (std.mem.eql(u8, node_type, "call")) {
+                try self.appendRubyTreeSitterImportCall(outline, content, node);
+            }
+        }
+    }
+
+    fn treeSitterHclLabelValue(content: []const u8, node: tree_sitter_mod.TSNode) ?[]const u8 {
+        const node_type = tree_sitter_mod.nodeType(node);
+        if (std.mem.eql(u8, node_type, "identifier")) return treeSitterNodeSlice(content, node);
+        if (std.mem.eql(u8, node_type, "string_lit")) return treeSitterStringValue(content, node);
+        return null;
+    }
+
+    fn parseHclTreeSitterBlock(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+    ) !void {
+        const raw = treeSitterNodeSlice(content, node);
+        var block_type: ?[]const u8 = null;
+        var labels: [4][]const u8 = undefined;
+        var label_count: usize = 0;
+
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(node)) : (i += 1) {
+            const child = tree_sitter_mod.namedChild(node, i);
+            const child_type = tree_sitter_mod.nodeType(child);
+            if (std.mem.eql(u8, child_type, "body") or
+                std.mem.eql(u8, child_type, "block_start") or
+                std.mem.eql(u8, child_type, "block_end")) continue;
+
+            const value = treeSitterHclLabelValue(content, child) orelse continue;
+            if (block_type == null) {
+                block_type = value;
+            } else if (label_count < labels.len) {
+                labels[label_count] = value;
+                label_count += 1;
+            }
+        }
+
+        const kind_name = block_type orelse return;
+        if (std.mem.eql(u8, kind_name, "resource") or std.mem.eql(u8, kind_name, "data")) {
+            if (label_count < 2) return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .struct_def, labels[1], raw);
+            return;
+        }
+        if (std.mem.eql(u8, kind_name, "module")) {
+            if (label_count < 1) return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .import, labels[0], raw);
+            return;
+        }
+        if (std.mem.eql(u8, kind_name, "variable")) {
+            if (label_count < 1) return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .variable, labels[0], raw);
+            return;
+        }
+        if (std.mem.eql(u8, kind_name, "output")) {
+            if (label_count < 1) return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .constant, labels[0], raw);
+            return;
+        }
+        if (std.mem.eql(u8, kind_name, "provider")) {
+            if (label_count < 1) return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .import, labels[0], raw);
+            return;
+        }
+        if (std.mem.eql(u8, kind_name, "locals") or std.mem.eql(u8, kind_name, "terraform")) {
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .struct_def, kind_name, raw);
+        }
+    }
+
+    fn parseHclTreeSitterItems(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        container: tree_sitter_mod.TSNode,
+    ) !void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(container)) : (i += 1) {
+            const node = tree_sitter_mod.namedChild(container, i);
+            const node_type = tree_sitter_mod.nodeType(node);
+            if (std.mem.eql(u8, node_type, "body")) {
+                try self.parseHclTreeSitterItems(outline, content, node);
+                continue;
+            }
+            if (std.mem.eql(u8, node_type, "block")) {
+                try self.parseHclTreeSitterBlock(outline, content, node);
+            }
+        }
+    }
+
+    fn treeSitterRValue(content: []const u8, node: tree_sitter_mod.TSNode) ?[]const u8 {
+        const node_type = tree_sitter_mod.nodeType(node);
+        if (std.mem.eql(u8, node_type, "identifier")) return treeSitterNodeSlice(content, node);
+        if (std.mem.eql(u8, node_type, "string")) return treeSitterStringValue(content, node);
+        return null;
+    }
+
+    fn treeSitterRCallName(content: []const u8, node: tree_sitter_mod.TSNode) ?[]const u8 {
+        const node_type = tree_sitter_mod.nodeType(node);
+        if (std.mem.eql(u8, node_type, "identifier")) return treeSitterNodeSlice(content, node);
+        if (std.mem.eql(u8, node_type, "namespace_operator")) {
+            const rhs = tree_sitter_mod.childByFieldName(node, "rhs") orelse return null;
+            return treeSitterRValue(content, rhs);
+        }
+        return null;
+    }
+
+    fn treeSitterRFirstArgumentValue(content: []const u8, args: tree_sitter_mod.TSNode) ?[]const u8 {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(args)) : (i += 1) {
+            const child = tree_sitter_mod.namedChild(args, i);
+            if (treeSitterRValue(content, child)) |value| return value;
+            if (std.mem.eql(u8, tree_sitter_mod.nodeType(child), "argument")) {
+                if (tree_sitter_mod.childByFieldName(child, "value")) |value_node| {
+                    if (treeSitterRValue(content, value_node)) |value| return value;
+                }
+                if (tree_sitter_mod.childByFieldName(child, "name")) |name_node| {
+                    if (treeSitterRValue(content, name_node)) |value| return value;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn parseRTreeSitterItems(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        container: tree_sitter_mod.TSNode,
+    ) !void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(container)) : (i += 1) {
+            const node = tree_sitter_mod.namedChild(container, i);
+            const node_type = tree_sitter_mod.nodeType(node);
+            const raw = treeSitterNodeSlice(content, node);
+
+            if (std.mem.eql(u8, node_type, "binary_operator")) {
+                const op_node = tree_sitter_mod.childByFieldName(node, "operator") orelse continue;
+                const op = treeSitterNodeSlice(content, op_node);
+                if (!std.mem.eql(u8, op, "<-") and !std.mem.eql(u8, op, "=")) continue;
+
+                const lhs = tree_sitter_mod.childByFieldName(node, "lhs") orelse continue;
+                const rhs = tree_sitter_mod.childByFieldName(node, "rhs") orelse continue;
+                if (!std.mem.eql(u8, tree_sitter_mod.nodeType(lhs), "identifier") or
+                    !std.mem.eql(u8, tree_sitter_mod.nodeType(rhs), "function_definition")) continue;
+
+                const name = treeSitterNodeSlice(content, lhs);
+                if (name.len == 0) continue;
+                if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_' and name[0] != '.') continue;
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .function, name, raw);
+                continue;
+            }
+
+            if (!std.mem.eql(u8, node_type, "call")) continue;
+            const function_node = tree_sitter_mod.childByFieldName(node, "function") orelse continue;
+            const function_name = treeSitterRCallName(content, function_node) orelse continue;
+            const args = tree_sitter_mod.childByFieldName(node, "arguments") orelse continue;
+
+            if (std.mem.eql(u8, function_name, "library") or std.mem.eql(u8, function_name, "require")) {
+                const import_path = treeSitterRFirstArgumentValue(content, args) orelse continue;
+                try self.appendTreeSitterImport(outline, node, import_path, raw);
+                continue;
+            }
+
+            if (std.mem.eql(u8, function_name, "setClass") or std.mem.eql(u8, function_name, "setRefClass")) {
+                const class_name = treeSitterRFirstArgumentValue(content, args) orelse continue;
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .class_def, class_name, raw);
+            }
+        }
+    }
+
+    fn parsePythonTreeSitterNode(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        node: tree_sitter_mod.TSNode,
+        in_class_body: bool,
+    ) anyerror!void {
+        const node_type = tree_sitter_mod.nodeType(node);
+        const raw = treeSitterNodeSlice(content, node);
+
+        if (std.mem.eql(u8, node_type, "decorated_definition")) {
+            const definition = tree_sitter_mod.childByFieldName(node, "definition") orelse return;
+            try self.parsePythonTreeSitterNode(outline, content, definition, in_class_body);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "function_definition")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            const kind: SymbolKind = if (in_class_body) .method else .function;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, kind, treeSitterNodeSlice(content, name_node), raw);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "class_definition")) {
+            const name_node = tree_sitter_mod.childByFieldName(node, "name") orelse return;
+            try self.appendTreeSitterNamedSymbol(outline, content, node, .class_def, treeSitterNodeSlice(content, name_node), raw);
+            if (tree_sitter_mod.childByFieldName(node, "body")) |body| {
+                try self.parsePythonTreeSitterItems(outline, content, body, true);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "import_statement")) {
+            try self.appendPythonTreeSitterImportStatement(outline, content, node);
+            return;
+        }
+
+        if (std.mem.eql(u8, node_type, "import_from_statement") or std.mem.eql(u8, node_type, "future_import_statement")) {
+            try self.appendPythonTreeSitterImportFrom(outline, content, node);
+        }
+    }
+
+    fn parsePythonTreeSitterItems(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        container: tree_sitter_mod.TSNode,
+        in_class_body: bool,
+    ) anyerror!void {
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(container)) : (i += 1) {
+            const node = tree_sitter_mod.namedChild(container, i);
+            try self.parsePythonTreeSitterNode(outline, content, node, in_class_body);
+        }
+    }
+
+    fn parseRustTreeSitterItems(
+        self: *Explorer,
+        outline: *FileOutline,
+        content: []const u8,
+        container: tree_sitter_mod.TSNode,
+        in_type_body: bool,
+    ) !void {
+        var prev_is_test_attr = false;
+        var i: u32 = 0;
+        while (i < tree_sitter_mod.namedChildCount(container)) : (i += 1) {
+            const node = tree_sitter_mod.namedChild(container, i);
+            const node_type = tree_sitter_mod.nodeType(node);
+            const raw = treeSitterNodeSlice(content, node);
+
+            if (std.mem.eql(u8, node_type, "attribute_item")) {
+                prev_is_test_attr = treeSitterRustIsTestAttribute(raw);
+                continue;
+            }
+
+            if (std.mem.eql(u8, node_type, "function_item")) {
+                const name_node = treeSitterFirstNamedChildOfType(node, &.{"identifier"}) orelse {
+                    prev_is_test_attr = false;
+                    continue;
+                };
+                const kind: SymbolKind = if (prev_is_test_attr and !in_type_body) .test_decl else .function;
+                try self.appendTreeSitterNamedSymbol(outline, content, node, kind, treeSitterNodeSlice(content, name_node), raw);
+                prev_is_test_attr = false;
+                continue;
+            }
+
+            if (std.mem.eql(u8, node_type, "struct_item")) {
+                const name_node = treeSitterFirstNamedChildOfType(node, &.{"type_identifier"}) orelse {
+                    prev_is_test_attr = false;
+                    continue;
+                };
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .struct_def, treeSitterNodeSlice(content, name_node), raw);
+            } else if (std.mem.eql(u8, node_type, "enum_item")) {
+                const name_node = treeSitterFirstNamedChildOfType(node, &.{"type_identifier"}) orelse {
+                    prev_is_test_attr = false;
+                    continue;
+                };
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .enum_def, treeSitterNodeSlice(content, name_node), raw);
+            } else if (std.mem.eql(u8, node_type, "trait_item")) {
+                const name_node = treeSitterFirstNamedChildOfType(node, &.{"type_identifier"}) orelse {
+                    prev_is_test_attr = false;
+                    continue;
+                };
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .trait_def, treeSitterNodeSlice(content, name_node), raw);
+                if (treeSitterFirstNamedChildOfType(node, &.{"declaration_list"})) |decls| {
+                    try self.parseRustTreeSitterItems(outline, content, decls, true);
+                }
+            } else if (std.mem.eql(u8, node_type, "impl_item")) {
+                const name = treeSitterRustImplName(raw) orelse {
+                    prev_is_test_attr = false;
+                    continue;
+                };
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .impl_block, name, raw);
+                if (treeSitterFirstNamedChildOfType(node, &.{"declaration_list"})) |decls| {
+                    try self.parseRustTreeSitterItems(outline, content, decls, true);
+                }
+            } else if (std.mem.eql(u8, node_type, "type_item")) {
+                const name_node = treeSitterFirstNamedChildOfType(node, &.{"type_identifier"}) orelse {
+                    prev_is_test_attr = false;
+                    continue;
+                };
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .type_alias, treeSitterNodeSlice(content, name_node), raw);
+            } else if (std.mem.eql(u8, node_type, "const_item") or std.mem.eql(u8, node_type, "static_item")) {
+                const name_node = treeSitterFirstNamedChildOfType(node, &.{"identifier"}) orelse {
+                    prev_is_test_attr = false;
+                    continue;
+                };
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .constant, treeSitterNodeSlice(content, name_node), raw);
+            } else if (std.mem.eql(u8, node_type, "macro_definition")) {
+                const name_node = treeSitterFirstNamedChildOfType(node, &.{"identifier"}) orelse {
+                    prev_is_test_attr = false;
+                    continue;
+                };
+                try self.appendTreeSitterNamedSymbol(outline, content, node, .macro_def, treeSitterNodeSlice(content, name_node), raw);
+            } else if (std.mem.eql(u8, node_type, "use_declaration")) {
+                try self.appendTreeSitterImport(outline, node, raw, raw);
+            } else if (std.mem.eql(u8, node_type, "mod_item")) {
+                const name_node = treeSitterFirstNamedChildOfType(node, &.{"identifier"}) orelse {
+                    prev_is_test_attr = false;
+                    continue;
+                };
+                const name = treeSitterNodeSlice(content, name_node);
+                if (treeSitterFirstNamedChildOfType(node, &.{"declaration_list"})) |decls| {
+                    try self.parseRustTreeSitterItems(outline, content, decls, false);
+                } else {
+                    try self.appendTreeSitterImport(outline, node, name, raw);
+                }
+            }
+
+            prev_is_test_attr = false;
+        }
+    }
+
+    fn parseOutlineWithTreeSitter(self: *Explorer, path: []const u8, content: []const u8) !FileOutline {
+        const grammar = treeSitterGrammarForPath(path) orelse return error.UnsupportedLanguage;
+
+        var outline = FileOutline.init(self.allocator, path);
+        errdefer outline.deinit();
+        outline.byte_size = content.len;
+
+        var parser = try tree_sitter_mod.Parser.init(grammar);
+        defer parser.deinit();
+        var tree = try parser.parseString(content);
+        defer tree.deinit();
+
+        switch (grammar) {
+            .c, .cpp => try self.parseCTreeSitterItems(&outline, content, tree.rootNode()),
+            .rust => try self.parseRustTreeSitterItems(&outline, content, tree.rootNode(), false),
+            .typescript, .tsx => {
+                var i: u32 = 0;
+                const root = tree.rootNode();
+                while (i < tree_sitter_mod.namedChildCount(root)) : (i += 1) {
+                    try self.parseTypeScriptTreeSitterNode(&outline, content, tree_sitter_mod.namedChild(root, i));
+                }
+            },
+            .python => try self.parsePythonTreeSitterItems(&outline, content, tree.rootNode(), false),
+            .go => try self.parseGoTreeSitterItems(&outline, content, tree.rootNode()),
+            .dart => try self.parseDartTreeSitterItems(&outline, content, tree.rootNode(), false),
+            .php => try self.parsePhpTreeSitterItems(&outline, content, tree.rootNode(), false),
+            .hcl => try self.parseHclTreeSitterItems(&outline, content, tree.rootNode()),
+            .r => try self.parseRTreeSitterItems(&outline, content, tree.rootNode()),
+            .ruby => try self.parseRubyTreeSitterItems(&outline, content, tree.rootNode()),
+        }
+
+        var line_count: u32 = if (content.len == 0) 0 else 1;
+        for (content) |c| {
+            if (c == '\n') line_count += 1;
+        }
+        outline.line_count = line_count;
+        computeSymbolEnds(content, &outline);
+        return outline;
+    }
+
     fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []const u8) !FileOutline {
+        if (build_options.tree_sitter) {
+            if (parser.parseOutlineWithTreeSitter(path, content)) |ts_outline| {
+                return ts_outline;
+            } else |err| switch (err) {
+                error.UnsupportedLanguage, error.IncompatibleLanguage, error.ParseFailed => {},
+                else => return err,
+            }
+        }
+
         var outline = FileOutline.init(parser.allocator, path);
         errdefer outline.deinit();
         outline.byte_size = content.len;
@@ -1456,6 +2708,7 @@ pub const Explorer = struct {
         if (self.contents.get(path)) |cached| {
             return .{ .data = cached, .owned = false, .allocator = allocator };
         }
+        if (builtin.os.tag == .freestanding) return null;
         const io = self.io orelse return null;
         const dir = self.root_dir orelse std.Io.Dir.cwd();
         const data = path_security.readFileAlloc(io, dir, self.root_real, path, allocator, .limited(512 * 1024)) catch return null;
@@ -1994,10 +3247,7 @@ pub const Explorer = struct {
             }
         }
 
-        const trigram_ruled_out = if (candidate_paths) |_|
-            (query.len >= 3)
-        else
-            false;
+        const trigram_ruled_out = query.len >= 3 and self.trigram_index.fileCount() > 0;
         if (result_list.items.len == 0 and !trigram_ruled_out) {
             self.search_tier5_count += 1;
             var iter = self.outlines.keyIterator();
@@ -2013,7 +3263,15 @@ pub const Explorer = struct {
         return self.rerankAndFinalize(&result_list, query, allocator);
     }
 
-    pub fn renderPlainSearch(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), max_results: usize, paths_only: bool) !bool {
+    pub fn renderPlainSearch(
+        self: *Explorer,
+        query: []const u8,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        max_results: usize,
+        paths_only: bool,
+        requested_max_per_file: ?usize,
+    ) !bool {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -2093,10 +3351,15 @@ pub const Explorer = struct {
         const w = cio.listWriter(out, allocator);
         try w.print("{d} results for '{s}':\n", .{ max_results, query });
 
-        const CountEntry = struct { doc_id: u32, path: []const u8, count: u8 };
+        const CountEntry = struct { doc_id: u32, path: []const u8, count: usize };
         var counts: [64]CountEntry = undefined;
         var counts_len: usize = 0;
-        const max_per_file: u8 = 5;
+        const max_per_file = if (requested_max_per_file) |n|
+            @max(@as(usize, 1), @min(n, max_results))
+        else if (tier0_files.len <= 1)
+            max_results
+        else
+            @min(max_results, 5);
         var rendered: usize = 0;
         var shown: usize = 0;
 
@@ -2257,6 +3520,7 @@ pub const Explorer = struct {
     /// Caps query at 256 bytes, results at 50 entries, file at 10 MB
     /// (rotates by truncate-clobber).
     fn appendRerankTrace(self: *const Explorer, query: []const u8, results: []const SearchResult) void {
+        if (builtin.os.tag == .freestanding) return;
         const path = self.rerank_trace_path orelse return;
         const io_inst = self.io orelse return;
 
@@ -2520,18 +3784,35 @@ pub const Explorer = struct {
     /// Decomposes the regex to extract literal trigrams for candidate filtering,
     /// then does actual regex matching on candidates.
     pub fn searchContentRegex(self: *Explorer, pattern: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        const default_max_per_file = if (max_results <= 20) max_results else 5;
+        return self.searchContentRegexCapped(pattern, allocator, max_results, default_max_per_file);
+    }
+
+    pub fn searchContentRegexCapped(
+        self: *Explorer,
+        pattern: []const u8,
+        allocator: std.mem.Allocator,
+        max_results: usize,
+        max_per_file: usize,
+    ) ![]const SearchResult {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer result_list.deinit(allocator);
 
+        var rx = nanoregex.Regex.compile(allocator, pattern) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidPattern,
+        };
+        defer rx.deinit();
+
         var query = idx.decomposeRegex(pattern, self.allocator) catch {
             var iter = self.outlines.keyIterator();
             while (iter.next()) |key_ptr| {
                 const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
                 defer ref.deinit();
-                try searchInContentRegex(key_ptr.*, ref.data, pattern, allocator, max_results, &result_list);
+                try searchInContentRegexCompiled(key_ptr.*, ref.data, allocator, &rx, max_per_file, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
             return result_list.toOwnedSlice(allocator);
@@ -2546,7 +3827,7 @@ pub const Explorer = struct {
             for (candidate_paths.?) |path| {
                 const ref = self.readContentForSearch(path, allocator) orelse continue;
                 defer ref.deinit();
-                try searchInContentRegex(path, ref.data, pattern, allocator, max_results, &result_list);
+                try searchInContentRegexCompiled(path, ref.data, allocator, &rx, max_per_file, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
         } else {
@@ -2554,7 +3835,7 @@ pub const Explorer = struct {
             while (iter.next()) |key_ptr| {
                 const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
                 defer ref.deinit();
-                try searchInContentRegex(key_ptr.*, ref.data, pattern, allocator, max_results, &result_list);
+                try searchInContentRegexCompiled(key_ptr.*, ref.data, allocator, &rx, max_per_file, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
             return result_list.toOwnedSlice(allocator);
@@ -2566,7 +3847,7 @@ pub const Explorer = struct {
                 if (self.trigram_index.containsFile(key_ptr.*)) continue;
                 const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
                 defer ref.deinit();
-                try searchInContentRegex(key_ptr.*, ref.data, pattern, allocator, max_results, &result_list);
+                try searchInContentRegexCompiled(key_ptr.*, ref.data, allocator, &rx, max_per_file, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
         }
@@ -3019,25 +4300,7 @@ pub const Explorer = struct {
             }
         } else if (startsWith(line, "import ") or startsWith(line, "from ")) {
             try appendOutlineSymbol(a, outline, line, .import, line_num, null);
-            // Extract module path and convert dots to slashes for dep matching.
-            // "from mypackage.utils.helpers import X" → "mypackage/utils/helpers.py"
-            // "import os.path" → "os/path.py"
-            if (extractPythonModulePath(line)) |mod_path| {
-                var buf: [512]u8 = undefined;
-                var pos: usize = 0;
-                for (mod_path) |c| {
-                    if (pos >= buf.len - 3) break;
-                    buf[pos] = if (c == '.') '/' else c;
-                    pos += 1;
-                }
-                if (pos + 3 <= buf.len) {
-                    buf[pos] = '.';
-                    buf[pos + 1] = 'p';
-                    buf[pos + 2] = 'y';
-                    pos += 3;
-                }
-                try appendImportPath(a, outline, buf[0..pos]);
-            }
+            try appendPythonImportSpec(a, outline, line);
         }
     }
     fn parseTsLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
@@ -3888,25 +5151,32 @@ pub const Explorer = struct {
         }
     }
 
+    fn depPathExists(self: *Explorer, dep_path: []const u8) bool {
+        return self.outlines.contains(dep_path);
+    }
+
     fn rebuildDepsFor(self: *Explorer, path: []const u8, outline: *FileOutline) !void {
         var deps: std.ArrayList([]const u8) = .empty;
-        errdefer deps.deinit(self.allocator);
+        errdefer {
+            for (deps.items) |dep| self.allocator.free(dep);
+            deps.deinit(self.allocator);
+        }
 
-        // Issue #445: outline.imports.items contains one entry per `@import`
-        // site, so a file aliasing the same dep multiple times emits dupes.
-        // Dedup by path before storing — the reverse index already dedupes
-        // naturally via StringHashMap, only forward edges need this.
         var seen = std.StringHashMap(void).init(self.allocator);
         defer seen.deinit();
 
         for (outline.imports.items) |imp| {
-            if (std.mem.indexOf(u8, imp, "..") != null) continue;
-            const gop = try seen.getOrPut(imp);
-            if (gop.found_existing) continue;
-            try deps.append(self.allocator, imp);
+            const resolved = resolveImportPath(imp, path, outline.language, self.allocator, self, depPathExists) orelse continue;
+            const gop = try seen.getOrPut(resolved);
+            if (gop.found_existing) {
+                self.allocator.free(resolved);
+                continue;
+            }
+            gop.key_ptr.* = resolved;
+            try deps.append(self.allocator, resolved);
         }
 
-        try self.dep_graph.setDeps(path, deps);
+        try self.dep_graph.setOwnedDeps(path, deps);
     }
 
     fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline) void {
@@ -4067,6 +5337,17 @@ pub const Explorer = struct {
     /// Scoped regex search: same as searchContentWithScope but uses regex matching
     /// against each line instead of literal substring. Trigram-accelerated.
     pub fn searchContentRegexWithScope(self: *Explorer, pattern: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const ScopedSearchResult {
+        const default_max_per_file = if (max_results <= 20) max_results else 5;
+        return self.searchContentRegexWithScopeCapped(pattern, allocator, max_results, default_max_per_file);
+    }
+
+    pub fn searchContentRegexWithScopeCapped(
+        self: *Explorer,
+        pattern: []const u8,
+        allocator: std.mem.Allocator,
+        max_results: usize,
+        max_per_file: usize,
+    ) ![]const ScopedSearchResult {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -4080,12 +5361,18 @@ pub const Explorer = struct {
             result_list.deinit(allocator);
         }
 
+        var rx = nanoregex.Regex.compile(allocator, pattern) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidPattern,
+        };
+        defer rx.deinit();
+
         var query = idx.decomposeRegex(pattern, self.allocator) catch {
             var iter = self.outlines.keyIterator();
             while (iter.next()) |key_ptr| {
                 const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
                 defer ref.deinit();
-                try self.searchInContentRegexWithScope(key_ptr.*, ref.data, pattern, allocator, max_results, &result_list);
+                try self.searchInContentRegexWithScopeCompiled(key_ptr.*, ref.data, allocator, &rx, max_per_file, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
             return result_list.toOwnedSlice(allocator);
@@ -4100,7 +5387,7 @@ pub const Explorer = struct {
             for (candidate_paths.?) |path| {
                 const ref = self.readContentForSearch(path, allocator) orelse continue;
                 defer ref.deinit();
-                try self.searchInContentRegexWithScope(path, ref.data, pattern, allocator, max_results, &result_list);
+                try self.searchInContentRegexWithScopeCompiled(path, ref.data, allocator, &rx, max_per_file, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
         } else {
@@ -4108,7 +5395,7 @@ pub const Explorer = struct {
             while (iter.next()) |key_ptr| {
                 const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
                 defer ref.deinit();
-                try self.searchInContentRegexWithScope(key_ptr.*, ref.data, pattern, allocator, max_results, &result_list);
+                try self.searchInContentRegexWithScopeCompiled(key_ptr.*, ref.data, allocator, &rx, max_per_file, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
             return result_list.toOwnedSlice(allocator);
@@ -4120,7 +5407,7 @@ pub const Explorer = struct {
                 if (self.trigram_index.containsFile(key_ptr.*)) continue;
                 const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
                 defer ref.deinit();
-                try self.searchInContentRegexWithScope(key_ptr.*, ref.data, pattern, allocator, max_results, &result_list);
+                try self.searchInContentRegexWithScopeCompiled(key_ptr.*, ref.data, allocator, &rx, max_per_file, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
         }
@@ -4157,10 +5444,18 @@ pub const Explorer = struct {
         }
     }
 
-    fn searchInContentRegexWithScope(self: *Explorer, path: []const u8, content: []const u8, pattern: []const u8, allocator: std.mem.Allocator, max_results: usize, result_list: *std.ArrayList(ScopedSearchResult)) !void {
-        var rx = nanoregex.Regex.compile(allocator, pattern) catch return;
-        defer rx.deinit();
+    fn searchInContentRegexWithScopeCompiled(
+        self: *Explorer,
+        path: []const u8,
+        content: []const u8,
+        allocator: std.mem.Allocator,
+        rx: *nanoregex.Regex,
+        max_per_file: usize,
+        max_results: usize,
+        result_list: *std.ArrayList(ScopedSearchResult),
+    ) !void {
         var line_num: u32 = 0;
+        var file_matches: usize = 0;
         var lines = std.mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
             line_num += 1;
@@ -4184,6 +5479,8 @@ pub const Explorer = struct {
                     .scope_start = if (scope) |s| s.line_start else 0,
                     .scope_end = if (scope) |s| s.line_end else 0,
                 });
+                file_matches += 1;
+                if (file_matches >= max_per_file) return;
                 if (result_list.items.len >= max_results) return;
             }
         }
@@ -4475,10 +5772,17 @@ fn matchAtCaseInsensitive(content: []const u8, pos: usize, query_lower: []const 
     return true;
 }
 
-fn searchInContentRegex(path: []const u8, content: []const u8, pattern: []const u8, allocator: std.mem.Allocator, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
-    var rx = nanoregex.Regex.compile(allocator, pattern) catch return;
-    defer rx.deinit();
+fn searchInContentRegexCompiled(
+    path: []const u8,
+    content: []const u8,
+    allocator: std.mem.Allocator,
+    rx: *nanoregex.Regex,
+    max_per_file: usize,
+    max_results: usize,
+    result_list: *std.ArrayList(SearchResult),
+) !void {
     var line_num: u32 = 0;
+    var file_matches: usize = 0;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         line_num += 1;
@@ -4493,6 +5797,8 @@ fn searchInContentRegex(path: []const u8, content: []const u8, pattern: []const 
                 .line_num = line_num,
                 .line_text = line_text,
             });
+            file_matches += 1;
+            if (file_matches >= max_per_file) return;
             if (result_list.items.len >= max_results) return;
         }
     }
@@ -5216,7 +6522,7 @@ fn extractHclBlockName(text: []const u8) ?[]const u8 {
 }
 
 fn extractStringLiteral(s: []const u8) ?[]const u8 {
-    const quote_chars = [_]u8{ '"', '\'' };
+    const quote_chars = [_]u8{ '"', '\'', '`' };
     for (quote_chars) |q| {
         if (std.mem.indexOfScalar(u8, s, q)) |start_pos| {
             if (std.mem.indexOfScalarPos(u8, s, start_pos + 1, q)) |end_pos| {
@@ -5229,7 +6535,7 @@ fn extractStringLiteral(s: []const u8) ?[]const u8 {
 
 fn normalizePath(path: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
-    errdefer parts.deinit(allocator);
+    defer parts.deinit(allocator);
 
     var it = std.mem.splitSequence(u8, path, "/");
     while (it.next()) |part| {
@@ -5248,6 +6554,7 @@ fn normalizePath(path: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     if (parts.items.len == 0) return null;
 
     var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
     for (parts.items, 0..) |part, i| {
         if (i > 0) buf.append(allocator, '/') catch return null;
         buf.appendSlice(allocator, part) catch return null;
@@ -5272,6 +6579,335 @@ fn resolveDartImport(raw: []const u8, file_path: []const u8, allocator: std.mem.
     return result;
 }
 
+fn directoryOfPath(path: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep|
+        path[0..sep]
+    else
+        ".";
+}
+
+fn probeOwnedCandidate(
+    candidate: ?[]const u8,
+    allocator: std.mem.Allocator,
+    exists_ctx: anytype,
+    comptime existsFn: fn (@TypeOf(exists_ctx), []const u8) bool,
+) ?[]const u8 {
+    if (candidate) |path| {
+        if (existsFn(exists_ctx, path)) return path;
+        allocator.free(path);
+    }
+    return null;
+}
+
+fn joinAndNormalize(base: []const u8, rel: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    const joined = std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, rel }) catch return null;
+    defer allocator.free(joined);
+    return normalizePath(joined, allocator);
+}
+
+fn probeRelativeImport(
+    raw: []const u8,
+    importing_path: []const u8,
+    allocator: std.mem.Allocator,
+    exists_ctx: anytype,
+    comptime existsFn: fn (@TypeOf(exists_ctx), []const u8) bool,
+) ?[]const u8 {
+    return probeOwnedCandidate(joinAndNormalize(directoryOfPath(importing_path), raw, allocator), allocator, exists_ctx, existsFn);
+}
+
+fn moduleSpecToPath(spec: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    for (spec) |ch| {
+        buf.append(allocator, if (ch == '.') '/' else ch) catch return null;
+    }
+    return buf.toOwnedSlice(allocator) catch null;
+}
+
+fn rustSpecToPath(spec: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < spec.len) : (i += 1) {
+        if (spec[i] == ':' and i + 1 < spec.len and spec[i + 1] == ':') {
+            buf.append(allocator, '/') catch return null;
+            i += 1;
+            continue;
+        }
+        buf.append(allocator, spec[i]) catch return null;
+    }
+    return buf.toOwnedSlice(allocator) catch null;
+}
+
+fn probeWithSuffixes(
+    base: []const u8,
+    suffixes: []const []const u8,
+    allocator: std.mem.Allocator,
+    exists_ctx: anytype,
+    comptime existsFn: fn (@TypeOf(exists_ctx), []const u8) bool,
+) ?[]const u8 {
+    for (suffixes) |suffix| {
+        const candidate = std.fmt.allocPrint(allocator, "{s}{s}", .{ base, suffix }) catch continue;
+        if (existsFn(exists_ctx, candidate)) return candidate;
+        allocator.free(candidate);
+    }
+    return null;
+}
+
+fn resolveTsJsImport(
+    raw: []const u8,
+    importing_path: []const u8,
+    allocator: std.mem.Allocator,
+    exists_ctx: anytype,
+    comptime existsFn: fn (@TypeOf(exists_ctx), []const u8) bool,
+) ?[]const u8 {
+    if (!std.mem.startsWith(u8, raw, ".")) return null;
+    const base = joinAndNormalize(directoryOfPath(importing_path), raw, allocator) orelse return null;
+    defer allocator.free(base);
+
+    if (existsFn(exists_ctx, base)) {
+        return allocator.dupe(u8, base) catch null;
+    }
+
+    const suffixes = [_][]const u8{
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        "/index.ts",
+        "/index.tsx",
+        "/index.js",
+        "/index.jsx",
+    };
+    return probeWithSuffixes(base, &suffixes, allocator, exists_ctx, existsFn);
+}
+
+fn resolvePythonImport(
+    raw: []const u8,
+    importing_path: []const u8,
+    allocator: std.mem.Allocator,
+    exists_ctx: anytype,
+    comptime existsFn: fn (@TypeOf(exists_ctx), []const u8) bool,
+) ?[]const u8 {
+    var leading_dots: usize = 0;
+    while (leading_dots < raw.len and raw[leading_dots] == '.') : (leading_dots += 1) {}
+
+    const module_part = raw[leading_dots..];
+    const module_path = moduleSpecToPath(module_part, allocator) orelse return null;
+    defer allocator.free(module_path);
+
+    const base = if (leading_dots == 0) blk: {
+        break :blk allocator.dupe(u8, module_path) catch return null;
+    } else blk: {
+        const pkg_dir = directoryOfPath(importing_path);
+        var prefix: std.ArrayList(u8) = .empty;
+        defer prefix.deinit(allocator);
+        for (0..leading_dots - 1) |_| prefix.appendSlice(allocator, "../") catch return null;
+        const rel = std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix.items, module_path }) catch return null;
+        defer allocator.free(rel);
+        break :blk joinAndNormalize(pkg_dir, rel, allocator) orelse return null;
+    };
+    defer allocator.free(base);
+
+    const suffixes = [_][]const u8{
+        ".py",
+        "/__init__.py",
+    };
+    return probeWithSuffixes(base, &suffixes, allocator, exists_ctx, existsFn);
+}
+
+fn rustUseBody(raw: []const u8) ?[]const u8 {
+    var body = std.mem.trim(u8, raw, " \t;");
+    const prefixes = [_][]const u8{
+        "pub(crate) use ",
+        "pub(super) use ",
+        "pub use ",
+        "use ",
+    };
+    for (prefixes) |prefix| {
+        if (startsWith(body, prefix)) {
+            body = std.mem.trimStart(u8, body[prefix.len..], " \t");
+            break;
+        }
+    }
+    if (body.len == 0) return null;
+    if (std.mem.indexOf(u8, body, " as ")) |as_pos| {
+        body = std.mem.trimEnd(u8, body[0..as_pos], " \t");
+    }
+    if (std.mem.endsWith(u8, body, "::*")) {
+        body = body[0 .. body.len - 3];
+    }
+    if (std.mem.indexOfScalar(u8, body, '{')) |brace| {
+        body = std.mem.trimEnd(u8, body[0..brace], " \t:");
+    }
+    return if (body.len > 0) body else null;
+}
+
+fn rustModuleBaseDir(importing_path: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    const filename = if (std.mem.lastIndexOfScalar(u8, importing_path, '/')) |sep|
+        importing_path[sep + 1 ..]
+    else
+        importing_path;
+    if (std.mem.eql(u8, filename, "mod.rs") or std.mem.eql(u8, filename, "lib.rs") or std.mem.eql(u8, filename, "main.rs")) {
+        return allocator.dupe(u8, directoryOfPath(importing_path)) catch null;
+    }
+    if (std.mem.endsWith(u8, importing_path, ".rs")) {
+        return allocator.dupe(u8, importing_path[0 .. importing_path.len - 3]) catch null;
+    }
+    return allocator.dupe(u8, directoryOfPath(importing_path)) catch null;
+}
+
+fn rustCrateRootDir(
+    importing_path: []const u8,
+    allocator: std.mem.Allocator,
+    exists_ctx: anytype,
+    comptime existsFn: fn (@TypeOf(exists_ctx), []const u8) bool,
+) ?[]const u8 {
+    var current = directoryOfPath(importing_path);
+    while (true) {
+        const lib_candidate = std.fmt.allocPrint(allocator, "{s}/lib.rs", .{current}) catch return null;
+        defer allocator.free(lib_candidate);
+        if (existsFn(exists_ctx, lib_candidate)) {
+            return allocator.dupe(u8, current) catch null;
+        }
+
+        const main_candidate = std.fmt.allocPrint(allocator, "{s}/main.rs", .{current}) catch return null;
+        defer allocator.free(main_candidate);
+        if (existsFn(exists_ctx, main_candidate)) {
+            return allocator.dupe(u8, current) catch null;
+        }
+
+        if (std.mem.eql(u8, current, ".") or current.len == 0) break;
+        current = directoryOfPath(current);
+    }
+    return allocator.dupe(u8, ".") catch null;
+}
+
+fn probeRustModulePath(
+    base_dir: []const u8,
+    spec: []const u8,
+    allocator: std.mem.Allocator,
+    exists_ctx: anytype,
+    comptime existsFn: fn (@TypeOf(exists_ctx), []const u8) bool,
+) ?[]const u8 {
+    var module_spec = spec;
+    while (module_spec.len > 0) {
+        const spec_path = rustSpecToPath(module_spec, allocator) orelse return null;
+        defer allocator.free(spec_path);
+
+        const joined = joinAndNormalize(base_dir, spec_path, allocator);
+        if (probeOwnedCandidate(joined, allocator, exists_ctx, existsFn)) |exact| return exact;
+
+        const normalized = joinAndNormalize(base_dir, spec_path, allocator) orelse return null;
+        defer allocator.free(normalized);
+        const suffixes = [_][]const u8{
+            ".rs",
+            "/mod.rs",
+        };
+        if (probeWithSuffixes(normalized, &suffixes, allocator, exists_ctx, existsFn)) |resolved| return resolved;
+
+        if (std.mem.lastIndexOf(u8, module_spec, "::")) |pos| {
+            module_spec = module_spec[0..pos];
+        } else {
+            break;
+        }
+    }
+    return null;
+}
+
+fn resolveRustImport(
+    raw: []const u8,
+    importing_path: []const u8,
+    allocator: std.mem.Allocator,
+    exists_ctx: anytype,
+    comptime existsFn: fn (@TypeOf(exists_ctx), []const u8) bool,
+) ?[]const u8 {
+    const use_body = rustUseBody(raw);
+    const spec = use_body orelse raw;
+    if (spec.len == 0) return null;
+
+    if (std.mem.indexOf(u8, raw, "use ")) |_| {
+        if (startsWith(spec, "crate::")) {
+            const crate_root = rustCrateRootDir(importing_path, allocator, exists_ctx, existsFn) orelse return null;
+            defer allocator.free(crate_root);
+            return probeRustModulePath(crate_root, spec["crate::".len..], allocator, exists_ctx, existsFn);
+        }
+        if (startsWith(spec, "::")) {
+            const crate_root = rustCrateRootDir(importing_path, allocator, exists_ctx, existsFn) orelse return null;
+            defer allocator.free(crate_root);
+            return probeRustModulePath(crate_root, spec[2..], allocator, exists_ctx, existsFn);
+        }
+        if (startsWith(spec, "self::")) {
+            const base_dir = rustModuleBaseDir(importing_path, allocator) orelse return null;
+            defer allocator.free(base_dir);
+            return probeRustModulePath(base_dir, spec["self::".len..], allocator, exists_ctx, existsFn);
+        }
+        if (startsWith(spec, "super::")) {
+            const base_dir = rustModuleBaseDir(importing_path, allocator) orelse return null;
+            defer allocator.free(base_dir);
+
+            var rest = spec;
+            var up: usize = 0;
+            while (startsWith(rest, "super::")) {
+                up += 1;
+                rest = rest["super::".len..];
+            }
+            var prefix: std.ArrayList(u8) = .empty;
+            defer prefix.deinit(allocator);
+            for (0..up) |_| prefix.appendSlice(allocator, "../") catch return null;
+            const rel = std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix.items, rest }) catch return null;
+            defer allocator.free(rel);
+            const normalized = joinAndNormalize(base_dir, rel, allocator) orelse return null;
+            defer allocator.free(normalized);
+            return probeRustModulePath(".", normalized, allocator, exists_ctx, existsFn);
+        }
+
+        const crate_root = rustCrateRootDir(importing_path, allocator, exists_ctx, existsFn) orelse return null;
+        defer allocator.free(crate_root);
+        return probeRustModulePath(crate_root, spec, allocator, exists_ctx, existsFn);
+    }
+
+    return probeRustModulePath(directoryOfPath(importing_path), spec, allocator, exists_ctx, existsFn);
+}
+
+pub fn resolveImportPath(
+    raw_import: []const u8,
+    importing_path: []const u8,
+    language: Language,
+    allocator: std.mem.Allocator,
+    exists_ctx: anytype,
+    comptime existsFn: fn (@TypeOf(exists_ctx), []const u8) bool,
+) ?[]const u8 {
+    if (raw_import.len == 0) return null;
+
+    if (existsFn(exists_ctx, raw_import)) {
+        return allocator.dupe(u8, raw_import) catch null;
+    }
+
+    switch (language) {
+        .typescript, .javascript => {
+            return resolveTsJsImport(raw_import, importing_path, allocator, exists_ctx, existsFn);
+        },
+        .python => {
+            return resolvePythonImport(raw_import, importing_path, allocator, exists_ctx, existsFn);
+        },
+        .rust => {
+            return resolveRustImport(raw_import, importing_path, allocator, exists_ctx, existsFn);
+        },
+        .dart => {
+            return probeOwnedCandidate(resolveDartImport(raw_import, importing_path, allocator), allocator, exists_ctx, existsFn);
+        },
+        else => {},
+    }
+
+    if (probeRelativeImport(raw_import, importing_path, allocator, exists_ctx, existsFn)) |resolved| {
+        return resolved;
+    }
+
+    return null;
+}
+
 fn containsAny(s: []const u8, needles: []const []const u8) bool {
     for (needles) |needle| {
         if (std.mem.indexOf(u8, s, needle) != null) return true;
@@ -5290,30 +6926,49 @@ fn skipKeywords(s: []const u8) []const u8 {
     return result;
 }
 
-/// Extract the module path from a Python import line.
-/// "from mypackage.utils.helpers import X" → "mypackage.utils.helpers"
-/// "import os.path" → "os.path"
-/// "from . import foo" / "from .rel import bar" → null (relative imports too ambiguous)
-fn extractPythonModulePath(line: []const u8) ?[]const u8 {
+fn appendPythonImportSpec(
+    allocator: std.mem.Allocator,
+    outline: *FileOutline,
+    line: []const u8,
+) !void {
     if (startsWith(line, "from ")) {
         const rest = std.mem.trimStart(u8, line[5..], " \t");
-        // Skip relative imports (start with dot)
-        if (rest.len > 0 and rest[0] == '.') return null;
-        // "from module.path import ..." — extract up to " import"
         if (std.mem.indexOf(u8, rest, " import")) |imp_pos| {
-            const mod = std.mem.trimEnd(u8, rest[0..imp_pos], " \t");
-            if (mod.len > 0) return mod;
+            const module = std.mem.trimEnd(u8, rest[0..imp_pos], " \t");
+            const module_is_dots = blk: {
+                if (module.len == 0) break :blk false;
+                for (module) |ch| {
+                    if (ch != '.') break :blk false;
+                }
+                break :blk true;
+            };
+            if (module.len > 0 and !module_is_dots) {
+                try appendImportPath(allocator, outline, module);
+                return;
+            }
+
+            const imported = std.mem.trimStart(u8, rest[imp_pos + " import".len ..], " \t");
+            var end: usize = 0;
+            while (end < imported.len and imported[end] != ' ' and imported[end] != ',' and imported[end] != '\t' and imported[end] != ')') : (end += 1) {}
+            if (end == 0 or imported[0] == '(') return;
+
+            const dots = std.mem.trimEnd(u8, rest[0..imp_pos], " \t");
+            if (dots.len == 0) return;
+            const joined = try std.fmt.allocPrint(allocator, "{s}{s}", .{ dots, imported[0..end] });
+            defer allocator.free(joined);
+            try appendImportPath(allocator, outline, joined);
         }
-        return null;
-    } else if (startsWith(line, "import ")) {
+        return;
+    }
+
+    if (startsWith(line, "import ")) {
         const rest = std.mem.trimStart(u8, line[7..], " \t");
-        // "import os.path" or "import foo" — take up to comma or space
         var end: usize = 0;
         while (end < rest.len and rest[end] != ' ' and rest[end] != ',' and rest[end] != '\t') : (end += 1) {}
-        if (end > 0) return rest[0..end];
-        return null;
+        if (end > 0) {
+            try appendImportPath(allocator, outline, rest[0..end]);
+        }
     }
-    return null;
 }
 
 // ── Fuzzy file matching ─────────────────────────────────────────

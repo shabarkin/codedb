@@ -189,9 +189,19 @@ fn shouldSkipDir(name: []const u8) bool {
 /// Unlike std.Io.Dir.walk(), this never enters .git, node_modules, etc.,
 /// avoiding the CPU cost of traversing potentially huge directory trees.
 const FilteredWalker = struct {
+    const IgnorePattern = struct {
+        pattern: []const u8,
+        base_dir: []const u8,
+        anchored: bool,
+        dir_only: bool,
+        negated: bool,
+        has_slash: bool,
+    };
+
     const StackItem = struct {
         dir_handle: std.Io.Dir,
         iter: std.Io.Dir.Iterator,
+        ignore_len: usize,
     };
 
     stack: std.ArrayList(StackItem),
@@ -199,7 +209,7 @@ const FilteredWalker = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     dir_prefix_len: usize = 0,
-    ignore_patterns: std.ArrayList([]const u8) = .empty,
+    ignore_patterns: std.ArrayList(IgnorePattern) = .empty,
     real_root: []const u8 = &.{},
     visited_real_paths: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -217,6 +227,7 @@ const FilteredWalker = struct {
         try self.stack.append(allocator, .{
             .dir_handle = root,
             .iter = root.iterate(),
+            .ignore_len = 0,
         });
 
         var rr_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -227,31 +238,8 @@ const FilteredWalker = struct {
             try self.visited_real_paths.put(allocator, seed, {});
         } else |_| {}
 
-        // Load .codedbignore if it exists
-        if (root.readFileAlloc(io, ".codedbignore", allocator, .limited(64 * 1024))) |content| {
-            defer allocator.free(content);
-            var lines = std.mem.splitScalar(u8, content, '\n');
-            while (lines.next()) |line| {
-                const trimmed = std.mem.trim(u8, line, " \t\r");
-                if (trimmed.len == 0 or trimmed[0] == '#') continue;
-                const duped = try allocator.dupe(u8, trimmed);
-                try self.ignore_patterns.append(allocator, duped);
-            }
-        } else |_| {}
-
-        // Also load .gitignore patterns (respect git's ignore rules)
-        if (root.readFileAlloc(io, ".gitignore", allocator, .limited(64 * 1024))) |content| {
-            defer allocator.free(content);
-            var lines = std.mem.splitScalar(u8, content, '\n');
-            while (lines.next()) |line| {
-                const trimmed = std.mem.trim(u8, line, " \t\r");
-                if (trimmed.len == 0 or trimmed[0] == '#') continue;
-                // Skip negation patterns (!) — too complex for simple matching
-                if (trimmed[0] == '!') continue;
-                const duped = try allocator.dupe(u8, trimmed);
-                try self.ignore_patterns.append(allocator, duped);
-            }
-        } else |_| {}
+        try self.loadIgnoreFile(root, "", ".codedbignore");
+        try self.loadIgnoreFile(root, "", ".gitignore");
 
         return self;
     }
@@ -262,7 +250,7 @@ const FilteredWalker = struct {
         }
         self.stack.deinit(self.allocator);
         self.name_buffer.deinit(self.allocator);
-        for (self.ignore_patterns.items) |p| self.allocator.free(p);
+        for (self.ignore_patterns.items) |pattern| self.deinitIgnorePattern(pattern);
         self.ignore_patterns.deinit(self.allocator);
         var it = self.visited_real_paths.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
@@ -270,33 +258,93 @@ const FilteredWalker = struct {
         if (self.real_root.len > 0) self.allocator.free(self.real_root);
     }
 
-    fn isIgnored(self: *FilteredWalker, name: []const u8, full_path: []const u8) bool {
-        for (self.ignore_patterns.items) |pattern| {
-            // Root-anchored pattern (starts with /) — only match at project root
-            if (pattern.len > 1 and pattern[0] == '/') {
-                const anchored = pattern[1..];
-                const clean = if (std.mem.endsWith(u8, anchored, "/")) anchored[0 .. anchored.len - 1] else anchored;
-                if (std.mem.eql(u8, full_path, clean) or std.mem.startsWith(u8, full_path, anchored)) return true;
-                continue;
-            }
-            // Directory pattern (ends with /) — match directory names at any depth
-            if (std.mem.endsWith(u8, pattern, "/")) {
-                const dir_name = pattern[0 .. pattern.len - 1];
-                if (std.mem.eql(u8, name, dir_name)) return true;
-                continue;
-            }
-            // Glob suffix match (e.g. *.log)
-            if (pattern.len > 1 and pattern[0] == '*') {
-                if (std.mem.endsWith(u8, name, pattern[1..])) return true;
-                continue;
-            }
-            // Exact name match (matches at any depth)
-            if (std.mem.eql(u8, name, pattern)) return true;
-            // Path prefix match (must match at / boundary)
-            if (std.mem.startsWith(u8, full_path, pattern) and
-                full_path.len > pattern.len and full_path[pattern.len] == '/') return true;
+    fn deinitIgnorePattern(self: *FilteredWalker, pattern: IgnorePattern) void {
+        self.allocator.free(pattern.pattern);
+        if (pattern.base_dir.len > 0) self.allocator.free(pattern.base_dir);
+    }
+
+    fn trimIgnorePatterns(self: *FilteredWalker, len: usize) void {
+        while (self.ignore_patterns.items.len > len) {
+            self.deinitIgnorePattern(self.ignore_patterns.pop().?);
         }
-        return false;
+    }
+
+    fn loadIgnoreFile(self: *FilteredWalker, dir: std.Io.Dir, base_dir: []const u8, file_name: []const u8) !void {
+        if (dir.readFileAlloc(self.io, file_name, self.allocator, .limited(64 * 1024))) |content| {
+            defer self.allocator.free(content);
+            var lines = std.mem.splitScalar(u8, content, '\n');
+            while (lines.next()) |line| {
+                const trimmed = std.mem.trim(u8, line, " \t\r");
+                if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+                var negated = false;
+                var pattern = trimmed;
+                if (pattern[0] == '!') {
+                    negated = true;
+                    pattern = pattern[1..];
+                    if (pattern.len == 0) continue;
+                }
+
+                var anchored = false;
+                if (pattern[0] == '/') {
+                    anchored = true;
+                    pattern = pattern[1..];
+                    if (pattern.len == 0) continue;
+                }
+
+                var dir_only = false;
+                if (std.mem.endsWith(u8, pattern, "/")) {
+                    dir_only = true;
+                    pattern = pattern[0 .. pattern.len - 1];
+                    if (pattern.len == 0) continue;
+                }
+
+                const pattern_copy = try self.allocator.dupe(u8, pattern);
+                errdefer self.allocator.free(pattern_copy);
+                const base_copy: []const u8 = if (base_dir.len == 0)
+                    &.{}
+                else
+                    try self.allocator.dupe(u8, base_dir);
+                errdefer if (base_dir.len > 0) self.allocator.free(base_copy);
+
+                try self.ignore_patterns.append(self.allocator, .{
+                    .pattern = pattern_copy,
+                    .base_dir = base_copy,
+                    .anchored = anchored,
+                    .dir_only = dir_only,
+                    .negated = negated,
+                    .has_slash = std.mem.indexOfScalar(u8, pattern, '/') != null,
+                });
+            }
+        } else |_| {}
+    }
+
+    fn pathRelativeToBase(path: []const u8, base_dir: []const u8) ?[]const u8 {
+        if (base_dir.len == 0) return path;
+        if (!std.mem.startsWith(u8, path, base_dir)) return null;
+        if (path.len == base_dir.len) return "";
+        if (path[base_dir.len] != '/') return null;
+        return path[base_dir.len + 1 ..];
+    }
+
+    fn patternMatches(pattern: IgnorePattern, name: []const u8, full_path: []const u8, is_dir: bool) bool {
+        const rel_path = pathRelativeToBase(full_path, pattern.base_dir) orelse return false;
+        if (rel_path.len == 0) return false;
+        if (pattern.dir_only and !is_dir) return false;
+        if (pattern.anchored or pattern.has_slash) {
+            return explore_mod.matchGlob(pattern.pattern, rel_path);
+        }
+        return explore_mod.matchGlob(pattern.pattern, name);
+    }
+
+    fn isIgnored(self: *FilteredWalker, name: []const u8, full_path: []const u8, is_dir: bool) bool {
+        var ignored = false;
+        for (self.ignore_patterns.items) |pattern| {
+            if (patternMatches(pattern, name, full_path, is_dir)) {
+                ignored = !pattern.negated;
+            }
+        }
+        return ignored;
     }
 
     pub fn next(self: *FilteredWalker) !?Entry {
@@ -308,30 +356,35 @@ const FilteredWalker = struct {
             if (try top.iter.next(self.io)) |entry| {
                 if (entry.kind == .directory) {
                     if (shouldSkipDir(entry.name)) continue;
-                    // Check .codedbignore patterns
                     if (self.ignore_patterns.items.len > 0) {
-                        // Build full path for prefix matching
                         var check_buf: [std.fs.max_path_bytes]u8 = undefined;
                         const check_path = if (self.dir_prefix_len > 0)
                             std.fmt.bufPrint(&check_buf, "{s}/{s}", .{ self.name_buffer.items[0..self.dir_prefix_len], entry.name }) catch entry.name
                         else
                             entry.name;
-                        if (self.isIgnored(entry.name, check_path)) continue;
+                        if (self.isIgnored(entry.name, check_path, true)) continue;
                     }
                     const sub = top.dir_handle.openDir(self.io, entry.name, .{ .iterate = true }) catch continue;
                     errdefer sub.close(self.io);
                     const saved_len = self.name_buffer.items.len;
-                    errdefer self.name_buffer.shrinkRetainingCapacity(saved_len);
+                    const saved_prefix_len = self.dir_prefix_len;
+                    const saved_ignore_len = self.ignore_patterns.items.len;
+                    errdefer {
+                        self.trimIgnorePatterns(saved_ignore_len);
+                        self.dir_prefix_len = saved_prefix_len;
+                        self.name_buffer.shrinkRetainingCapacity(saved_len);
+                    }
 
-                    // Extend the directory prefix in name_buffer
                     if (self.name_buffer.items.len > 0)
                         try self.name_buffer.append(self.allocator, '/');
                     try self.name_buffer.appendSlice(self.allocator, entry.name);
                     self.dir_prefix_len = self.name_buffer.items.len;
+                    try self.loadIgnoreFile(sub, self.name_buffer.items[0..self.dir_prefix_len], ".gitignore");
 
                     try self.stack.append(self.allocator, .{
                         .dir_handle = sub,
                         .iter = sub.iterate(),
+                        .ignore_len = saved_ignore_len,
                     });
                     continue;
                 }
@@ -347,7 +400,7 @@ const FilteredWalker = struct {
                                 std.fmt.bufPrint(&check_buf, "{s}/{s}", .{ self.name_buffer.items[0..self.dir_prefix_len], entry.name }) catch entry.name
                             else
                                 entry.name;
-                            if (self.isIgnored(entry.name, check_path)) continue;
+                            if (self.isIgnored(entry.name, check_path, true)) continue;
                             if (path_security.isSensitivePath(check_path)) continue;
                         }
                         var link_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -375,14 +428,22 @@ const FilteredWalker = struct {
                         const sub = top.dir_handle.openDir(self.io, entry.name, .{ .iterate = true }) catch continue;
                         errdefer sub.close(self.io);
                         const saved_len_sym = self.name_buffer.items.len;
-                        errdefer self.name_buffer.shrinkRetainingCapacity(saved_len_sym);
+                        const saved_prefix_len_sym = self.dir_prefix_len;
+                        const saved_ignore_len_sym = self.ignore_patterns.items.len;
+                        errdefer {
+                            self.trimIgnorePatterns(saved_ignore_len_sym);
+                            self.dir_prefix_len = saved_prefix_len_sym;
+                            self.name_buffer.shrinkRetainingCapacity(saved_len_sym);
+                        }
                         if (self.name_buffer.items.len > 0)
                             try self.name_buffer.append(self.allocator, '/');
                         try self.name_buffer.appendSlice(self.allocator, entry.name);
                         self.dir_prefix_len = self.name_buffer.items.len;
+                        try self.loadIgnoreFile(sub, self.name_buffer.items[0..self.dir_prefix_len], ".gitignore");
                         try self.stack.append(self.allocator, .{
                             .dir_handle = sub,
                             .iter = sub.iterate(),
+                            .ignore_len = saved_ignore_len_sym,
                         });
                         continue;
                     }
@@ -395,17 +456,16 @@ const FilteredWalker = struct {
                     try self.name_buffer.append(self.allocator, '/');
                 try self.name_buffer.appendSlice(self.allocator, entry.name);
 
-                // Check .codedbignore patterns for files
-                if (self.ignore_patterns.items.len > 0 and self.isIgnored(entry.name, self.name_buffer.items)) {
+                if (self.ignore_patterns.items.len > 0 and self.isIgnored(entry.name, self.name_buffer.items, false)) {
                     self.name_buffer.shrinkRetainingCapacity(self.dir_prefix_len);
                     continue;
                 }
 
                 return .{ .path = self.name_buffer.items };
             } else {
-                // Directory exhausted — pop and restore parent prefix
                 if (self.stack.items.len > 1) {
                     var item = self.stack.pop().?;
+                    self.trimIgnorePatterns(item.ignore_len);
                     item.dir_handle.close(self.io);
                 } else {
                     _ = self.stack.pop();

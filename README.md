@@ -13,7 +13,7 @@
 
 <h1 align="center">codedb</h1>
 
-<h3 align="center">Code intelligence server for AI agents. Zig core. MCP native. Zero dependencies.</h3>
+<h3 align="center">Code intelligence server for AI agents. Zig core. MCP native.</h3>
 
 <p align="center">
   Structural indexing · Trigram search · Word index · Dependency graph · File watching · MCP + HTTP
@@ -39,22 +39,21 @@
 > codedb works and is used daily in production AI workflows, but:
 > - **Parser support** — Zig, C/C++, Python, TypeScript/JavaScript, Rust, Go, PHP, Ruby, HCL, R, Dart/Flutter
 > - **Lightweight outline support** — Java, Kotlin, Svelte, Vue, Astro, shell, CSS/SCSS, SQL, protobuf, Fortran, LLVM IR, MLIR, and TableGen
-> - **No auth** — HTTP server binds to localhost only
+> - **HTTP auth** — localhost server requires `X-Codedb-Token` or `Authorization: Bearer ...`
 > - **Snapshot format** may change between versions
 > - **MCP protocol** is JSON-RPC 2.0 over stdio (stable)
 
 | What works today                                       | What's in progress                       |
 |--------------------------------------------------------|------------------------------------------|
-| 21 MCP tools for full codebase intelligence            | Deeper parser coverage and edge-case handling |
+| 22 MCP tools for full codebase intelligence            | Deeper parser coverage and edge-case handling |
 | Trigram v2: integer doc IDs, batch-accumulate, merge intersect | Incremental segment-based indexing |
-| 538x faster than ripgrep on pre-indexed queries        | WASM target for Cloudflare Workers       |
+| Warm, pre-indexed MCP queries can be hundreds of times faster than one-shot ripgrep | WASM target for Cloudflare Workers       |
 | O(1) inverted word index for identifier lookup         | Multi-project support                    |
 | Structural outlines (functions, structs, imports)      | mmap-backed trigram index                |
 | Reverse dependency graph                               |                                          |
 | Atomic line-range edits with version tracking          |                                          |
 | Polling file watcher with filtered directory walker    |                                          |
 | Portable snapshot for instant MCP startup              |                                          |
-| Singleton MCP with PID lock + 1h idle timeout          |                                          |
 | Sensitive file blocking (.env, credentials, keys)      |                                          |
 | Cross-platform: macOS (ARM/x86), Linux (ARM/x86)      |                                          |
 
@@ -103,32 +102,38 @@ zig build -Doptimize=ReleaseFast
 Build codedb, then point your MCP client at the local binary.
 
 ```bash
-zig-out/bin/codedb mcp /path/to/your/project
+zig-out/bin/codedb /path/to/your/project mcp
 ```
+
+Set `CODEDB_MCP_LEAN=1` to suppress the colored summary header and guidance
+blocks in MCP replies, leaving only the raw data payload. `0` and `false`
+keep the default rich output.
 
 ### As an HTTP server
 
 ```bash
-zig-out/bin/codedb serve /path/to/your/project
-# listening on localhost:7719
+zig-out/bin/codedb /path/to/your/project serve
+cat ~/.codedb/server-7719.token
+curl -H "X-Codedb-Token: $(cat ~/.codedb/server-7719.token)" \
+  "http://127.0.0.1:7719/explore/search?q=handleAuth"
 ```
 
 ### CLI
 
 ```bash
-zig-out/bin/codedb tree /path/to/project          # file tree with symbol counts
-zig-out/bin/codedb outline src/main.zig           # symbols in a file
-zig-out/bin/codedb find AgentRegistry             # find symbol definitions
-zig-out/bin/codedb search "handleAuth"            # full-text search (trigram-accelerated)
-zig-out/bin/codedb word Store                     # exact word lookup (inverted index, O(1))
-zig-out/bin/codedb hot                            # recently modified files
+zig-out/bin/codedb /path/to/project tree          # file tree with symbol counts
+zig-out/bin/codedb /path/to/project outline src/main.zig
+zig-out/bin/codedb /path/to/project find AgentRegistry
+zig-out/bin/codedb /path/to/project search "handleAuth"
+zig-out/bin/codedb /path/to/project word Store
+zig-out/bin/codedb /path/to/project hot
 ```
 
 ---
 
 ## 🔧 MCP Tools
 
-21 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio):
+22 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio):
 
 | Tool | Description |
 |------|-------------|
@@ -136,8 +141,8 @@ zig-out/bin/codedb hot                            # recently modified files
 | `codedb_outline` | Symbols in a file: functions, structs, imports, with line numbers |
 | `codedb_symbol` | Find where a symbol is defined across the codebase |
 | `codedb_search` | Trigram-accelerated full-text search (supports regex, scoped results) |
-| `codedb_word` | O(1) inverted index word lookup |
-| `codedb_callers` | Every call site of a symbol — word index ∩ outline scope, in one round-trip |
+| `codedb_word` | O(1) inverted index lookup for identifiers and their sub-tokens |
+| `codedb_callers` | Heuristic call-site finder — word index ∩ outline scope, in one round-trip |
 | `codedb_context` | Task-shaped composer — pass a NL task, get keywords + symbol defs + ranked files + top snippets in one block (replaces 3–5 sequential calls) |
 | `codedb_hot` | Most recently modified files |
 | `codedb_deps` | Dependency graph: `imported_by` (default) or `depends_on`; `transitive=true` for full BFS |
@@ -199,12 +204,12 @@ For Codex and Claude Code hook examples around `codedb_remote`, see [`docs/hooks
 | `codedb find <name>` | Find where a symbol is defined |
 | `codedb search <query>` | Full-text search (trigram, case-insensitive) |
 | `codedb search --regex <pattern>` | Regex search |
-| `codedb word <identifier>` | Exact word lookup via inverted index |
+| `codedb word <identifier>` | Identifier/sub-token lookup via inverted index |
 | `codedb read <path>` | Read file contents (supports `-L FROM-TO`, `--compact`) |
 | `codedb hot` | Recently modified files |
 | `codedb snapshot` | Write codedb.snapshot to project root |
 | `codedb serve` | HTTP daemon on :7719 |
-| `codedb mcp [path]` | JSON-RPC/MCP server over stdio |
+| `codedb [root] mcp` | JSON-RPC/MCP server over stdio |
 | `codedb update` | Disabled for source-build workflow; rebuild with `zig build` |
 | `codedb nuke` | Remove caches/snapshots and deregister MCP integrations |
 | `codedb --version` | Print version |
@@ -212,27 +217,26 @@ For Codex and Claude Code hook examples around `codedb_remote`, see [`docs/hooks
 ### Example: agent explores a codebase
 
 ```bash
+TOKEN=$(cat ~/.codedb/server-7719.token)
+
 # 1. Get the file tree
-curl localhost:7719/tree
-# → src/main.zig      (zig, 55L, 4 symbols)
-#   src/store.zig     (zig, 156L, 12 symbols)
-#   src/agent.zig     (zig, 135L, 8 symbols)
+curl -H "X-Codedb-Token: $TOKEN" http://127.0.0.1:7719/explore/tree
 
 # 2. Drill into a file
-curl "localhost:7719/outline?path=src/store.zig"
-# → L20: struct_def Store
-#   L30: function init
-#   L55: function recordSnapshot
+curl -H "X-Codedb-Token: $TOKEN" \
+  "http://127.0.0.1:7719/explore/outline?path=src/store.zig"
 
 # 3. Find a symbol across the codebase
-curl "localhost:7719/symbol?name=AgentRegistry"
-# → {"path":"src/agent.zig","line":30,"kind":"struct_def"}
+curl -H "X-Codedb-Token: $TOKEN" \
+  "http://127.0.0.1:7719/explore/symbol?name=AgentRegistry"
 
 # 4. Full-text search
-curl "localhost:7719/search?q=handleAuth&max=10"
+curl -H "X-Codedb-Token: $TOKEN" \
+  "http://127.0.0.1:7719/explore/search?q=handleAuth"
 
 # 5. Check what changed
-curl "localhost:7719/changes?since=42"
+curl -H "X-Codedb-Token: $TOKEN" \
+  "http://127.0.0.1:7719/changes?since=42"
 ```
 
 ---
@@ -328,7 +332,7 @@ The watcher now stats `.git/HEAD` mtime before forking `git rev-parse HEAD`. On 
 | Atomic file edits | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | File watcher | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
 
-> **codedb = tree-sitter + search index + dependency graph + agent runtime.** Zero external dependencies. Pure Zig. Single binary.
+> **codedb = tree-sitter + search index + dependency graph + agent runtime.** Single binary, source-built, with vendored tree-sitter C grammars.
 
 
 ---

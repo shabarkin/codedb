@@ -17,7 +17,6 @@ const git_mod = @import("git.zig");
 const AgentRegistry = @import("agent.zig").AgentRegistry;
 const edit_mod = @import("edit.zig");
 
-
 test "issue-35: edits immediately update explorer and snapshot output" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -80,7 +79,6 @@ test "issue-35: edits immediately update explorer and snapshot output" {
     try testing.expect(std.mem.indexOf(u8, after_snap, "oldName") == null);
 }
 
-
 test "snapshot_json: snapshot builds and is valid JSON" {
     // Explorer uses arena for internal data
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -117,7 +115,6 @@ test "snapshot_json: snapshot builds and is valid JSON" {
     try testing.expect(symbol_index.contains("main"));
     try testing.expect(symbol_index.contains("version"));
 }
-
 
 test "issue-44: snapshot stale after working tree changes cause stale query results" {
     var tmp = testing.tmpDir(.{});
@@ -176,7 +173,6 @@ test "issue-44: snapshot stale after working tree changes cause stale query resu
     try testing.expect(results.len == 1);
 }
 
-
 test "issue-46: empty-repo snapshot rejected on load" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -203,7 +199,6 @@ test "issue-46: empty-repo snapshot rejected on load" {
     try testing.expect(!loaded);
     try testing.expect(exp2.outlines.count() == 0);
 }
-
 
 test "issue-220: snapshot fast load restores outlines and lazily rebuilds word index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -254,7 +249,6 @@ test "issue-220: snapshot fast load restores outlines and lazily rebuilds word i
     try testing.expect(exp2.wordIndexIsComplete());
     try testing.expect(exp2.wordIndexNeedsPersist());
 }
-
 
 test "snapshot: writer streams uncached file contents for large repos" {
     var tmp = testing.tmpDir(.{});
@@ -313,6 +307,76 @@ test "snapshot: writer streams uncached file contents for large repos" {
     try testing.expect(loaded.wordIndexIsComplete());
 }
 
+test "issue-p2-dep: snapshot restore resolves relative imports and dedupes forward deps" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "src/features");
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "src/util.zig",
+        .data = "pub fn helper() void {}\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "src/features/worker.zig",
+        .data =
+        \\const util = @import("../util.zig");
+        \\const alias = @import("../util.zig");
+        \\pub fn work() void {
+        \\    util.helper();
+        \\    alias.helper();
+        \\}
+        \\
+        ,
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+
+    var exp = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp.deinit();
+    exp.setRoot(io, dir_path);
+    try exp.indexFile("src/util.zig", "pub fn helper() void {}\n");
+    try exp.indexFile("src/features/worker.zig",
+        \\const util = @import("../util.zig");
+        \\const alias = @import("../util.zig");
+        \\pub fn work() void {
+        \\    util.helper();
+        \\    alias.helper();
+        \\}
+        \\
+    );
+
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/deps-fast.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var exp2 = Explorer.init(arena2.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    exp2.setRoot(io, dir_path);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, arena2.allocator());
+    try testing.expect(loaded);
+
+    const importers = try exp2.getImportedBy("src/util.zig", testing.allocator);
+    defer {
+        for (importers) |dep| testing.allocator.free(dep);
+        testing.allocator.free(importers);
+    }
+    try testing.expectEqual(@as(usize, 1), importers.len);
+    try testing.expectEqualStrings("src/features/worker.zig", importers[0]);
+
+    exp2.mu.lockShared();
+    const fwd_opt = exp2.dep_graph.getForwardDeps("src/features/worker.zig");
+    exp2.mu.unlockShared();
+    try testing.expect(fwd_opt != null);
+    const fwd = fwd_opt.?;
+    try testing.expectEqual(@as(usize, 1), fwd.len);
+    try testing.expectEqualStrings("src/util.zig", fwd[0]);
+}
 
 test "issue-220: partial word index state rebuilds before search" {
     var tmp = testing.tmpDir(.{});
@@ -356,7 +420,6 @@ test "issue-220: partial word index state rebuilds before search" {
     try testing.expect(exp2.wordIndexNeedsPersist());
 }
 
-
 test "issue-220: word index persistence tracking skips redundant rewrites" {
     var exp = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer exp.deinit();
@@ -380,7 +443,6 @@ test "issue-220: word index persistence tracking skips redundant rewrites" {
     exp.markWordIndexPersisted(second_gen);
     try testing.expect(!exp.wordIndexNeedsPersist());
 }
-
 
 test "issue-45: snapshot written in non-git directory cannot be loaded" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -412,7 +474,6 @@ test "issue-45: snapshot written in non-git directory cannot be loaded" {
     const snap_head = snapshot_mod.readSnapshotGitHead(io, snap_path);
     try testing.expect(snap_head == null);
 }
-
 
 test "issue-47: concurrent snapshot writes from parallel instances corrupt file" {
     // BUG: Two codedb instances indexing the same repo write codedb.snapshot
@@ -483,7 +544,6 @@ test "issue-47: concurrent snapshot writes from parallel instances corrupt file"
     try testing.expect(loaded);
 }
 
-
 test "issue-42: scan thread is joined before allocator-backed state is freed" {
     var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -514,7 +574,6 @@ test "issue-42: scan thread is joined before allocator-backed state is freed" {
     allocator.free(data_dir);
     _ = gpa.deinit();
 }
-
 
 test "issue-40: truncated snapshot silently loads partial data" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -556,7 +615,6 @@ test "issue-40: truncated snapshot silently loads partial data" {
     try testing.expect(!loaded);
 }
 
-
 test "issue-41: snapshot not validated against repo identity allows cross-project loading" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -585,29 +643,24 @@ test "issue-41: snapshot not validated against repo identity allows cross-projec
     try testing.expect(!loaded);
 }
 
-
-test "snapshot: symbol detail longer than 4096 bytes survives round-trip" {
-    // Regression for readSectionString rejecting names/details > 4096 bytes.
-    // Before the fix max_len was 4096; any detail longer than that triggered
-    // error.InvalidData and loadSnapshot returned false.
+test "snapshot: oversized symbol detail is truncated and survives round-trip" {
+    // Regression coverage for two cases:
+    // 1. loadSnapshot must still accept detail lengths above 4096 bytes.
+    // 2. writeSnapshot must not panic when a parser emits detail > u16 max.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
 
-    // Build a Zig source whose first function line exceeds 4 096 characters.
-    var src: std.ArrayList(u8) = .empty;
-    defer src.deinit(testing.allocator);
-    try src.appendSlice(testing.allocator, "pub fn bigSig(");
-    var param_i: usize = 0;
-    while (src.items.len < 5000) : (param_i += 1) {
-        var pb: [20]u8 = undefined;
-        const ps = std.fmt.bufPrint(&pb, "p{d}: u8, ", .{param_i}) catch break;
-        try src.appendSlice(testing.allocator, ps);
-    }
-    try src.appendSlice(testing.allocator, ") void {}\n");
-    try testing.expect(src.items.len > 4096); // guard: ensure we actually generated a long line
     var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
-    try exp.indexFile("src/big.zig", src.items);
+    try exp.indexFile("src/big.zig", "pub fn bigSig() void {}\n");
+
+    const outline = exp.outlines.getPtr("src/big.zig") orelse return error.TestUnexpectedResult;
+    try testing.expect(outline.symbols.items.len >= 1);
+
+    const max_detail_len = @as(usize, std.math.maxInt(u16));
+    const oversized_detail = try aa.alloc(u8, max_detail_len + 1024);
+    @memset(oversized_detail, 'x');
+    outline.symbols.items[0].detail = oversized_detail;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -624,14 +677,19 @@ test "snapshot: symbol detail longer than 4096 bytes survives round-trip" {
     defer store2.deinit();
 
     const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store2, testing.allocator);
-    try testing.expect(loaded); // must survive long detail
+    try testing.expect(loaded);
+
+    const loaded_outline = exp2.outlines.get("src/big.zig") orelse return error.TestUnexpectedResult;
+    try testing.expect(loaded_outline.symbols.items.len >= 1);
+    const loaded_detail = loaded_outline.symbols.items[0].detail orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(max_detail_len, loaded_detail.len);
+    try testing.expect(std.mem.eql(u8, oversized_detail[0..max_detail_len], loaded_detail));
 
     var sym_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer sym_arena.deinit();
     const results = try exp2.findAllSymbols("bigSig", sym_arena.allocator());
     try testing.expect(results.len >= 1);
 }
-
 
 test "snapshot: corrupted OUTLINE_STATE section falls back to CONTENT load" {
     // Regression for the codedb 0.2.56 writer u16 overflow bug: when OUTLINE_STATE
@@ -684,7 +742,6 @@ test "snapshot: corrupted OUTLINE_STATE section falls back to CONTENT load" {
     try testing.expect(results.len >= 1);
 }
 
-
 test "issue-379: snapshot loader returns true with zero outlines for empty-explorer snapshot" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -711,4 +768,39 @@ test "issue-379: snapshot loader returns true with zero outlines for empty-explo
     if (loaded) {
         try testing.expect(exp2.outlines.count() > 0);
     }
+}
+
+test "issue-p0-2: corrupt META offset beyond EOF returns false without panicking" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/bad-meta-offset.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    {
+        const file = try std.Io.Dir.cwd().openFile(io, snap_path, .{ .mode = .read_write });
+        defer file.close(io);
+        const stat = try file.stat(io);
+        var offset_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &offset_buf, stat.size + 1, .little);
+        try file.writePositionalAll(io, &offset_buf, 52 + 4);
+    }
+
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store2 = Store.init(testing.allocator);
+    defer store2.deinit();
+
+    const loaded = snapshot_mod.loadSnapshotValidated(io, snap_path, dir_path, &exp2, &store2, testing.allocator);
+    try testing.expect(!loaded);
 }

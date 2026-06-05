@@ -1,4 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.fs.max_path_bytes;
 
 pub fn isPathSafe(path: []const u8) bool {
     if (path.len == 0) return false;
@@ -37,12 +40,19 @@ pub fn isSensitivePath(path: []const u8) bool {
 
     const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
     if (basename.len == 0) return false;
+    if (endsWithIgnoreCase(basename, ".env")) return true;
 
     const sensitive_names = [_][]const u8{
         ".dev.vars",
+        ".envrc",
         ".npmrc",
         ".pypirc",
         ".netrc",
+        ".pgpass",
+        ".htpasswd",
+        "application.properties",
+        "application.yml",
+        "application.yaml",
         "credentials.json",
         "service-account.json",
         "secrets.json",
@@ -61,6 +71,10 @@ pub fn isSensitivePath(path: []const u8) bool {
         ".p12",
         ".pfx",
         ".jks",
+        ".crt",
+        ".cer",
+        ".der",
+        ".crl",
     };
     for (sensitive_extensions) |ext| {
         if (endsWithIgnoreCase(basename, ext)) return true;
@@ -106,7 +120,7 @@ pub fn openSafeFile(
     real_root: []const u8,
     path: []const u8,
 ) !std.Io.File {
-    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var real_buf: [max_path_bytes]u8 = undefined;
     _ = try realPathWithinRoot(io, dir, real_root, path, &real_buf);
     return dir.openFile(io, path, .{
         .allow_directory = false,

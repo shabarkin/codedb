@@ -1,0 +1,61 @@
+# Changelog
+
+## devel
+
+- Integers and complex numbers with a leading decimal, such as `.1L` and `.1i`, now parse correctly (#190).
+
+- Hexadecimal constants with decimals are now supported (#191).
+
+- `return` is no longer considered a keyword with its own special node. It is now a standard `identifier`. This is in line with R, where `?Reserved` documents the full set of R keywords, and `return` is noticeably absent from this list. This change puts tree-sitter-r fully in line with R's set of keywords, with no special cases, and fixes some bugs related to an inability to parse `return` in function parameter or call argument positions. `highlights.scm` retains special support for marking the `return` of `return()` as a `@keyword`, since most users expect `return()` to highlight differently than other function calls (#189).
+
+## 1.2.0
+
+- Added `"open"` and `"close"` fields to single and double quoted `string`s (#139).
+
+- Fixed an issue related to closing brackets in raw strings (#162).
+
+- Binary exponents are now supported in hexadecimal constants (#159).
+
+- `NULL` is now allowed as a function call argument name (#164).
+
+- `...` and `..1` are now supported in more places, such as `x$...` and `x@..1` (#148).
+
+- `fn(a b)` is now correctly parsed as an error rather than as two sequential arguments (#140).
+
+- Fixed another issue where the `program` node didn't start at `(0, 0)` if there was leading whitespace before the first token (#151).
+
+- Newlines after `function` but before the `()` are again allowed (#145).
+
+- Newlines are now allowed after an `else` but before the `alternative` (#141).
+
+- `parenthesized_expression` has been simplified to better align with R's parser. Specifically, it now expects exactly 1 required `body` expression, rather than allowing zero or more optional expressions (#144).
+
+- `highlights.scm` now includes `!` as an `@operator`.
+
+- `tags.scm` now tags function definitions with a string name as `@definition.function` (#147, @MichaelChirico).
+
+- Removed an unnecessary `optional()` from `_parameter_with_default` (#161).
+
+- The internal `_hex_literal` rule was simplified slightly (#138).
+
+- Changed a number of internal files to match tree-sitter v0.24.7 recommendations (#169).
+
+## 1.1.0
+
+- Switched to using `tree-sitter-language` in the Rust bindings to remove a dependency on a specific `tree-sitter` crate version (#133).
+
+- Fixed an issue where the `program` node didn't always start at `(0, 0)` (#134).
+
+- To align better with the R grammar and to greatly simplify the possible states in the tree-sitter grammar, some fields are no longer optional (#132).
+  - The `"body"` field of `function_definition`, `for_statement`, `while_statement`, and `repeat_statement`.
+  - The `"close"` field of `braced_expression` and `parenthesized_expression`.
+
+## 1.0.1
+
+- Changed tree-sitter dependency from `0.22.6` to `>=0.21.0` to match other grammars and be less restrictive.
+
+## 1.0.0
+
+- This release incorporates a complete rewrite of the grammar which has been incubating on the `next` branch for the past two years. It contains many bug fixes and improvements. If you still need to use the previous version, you can pin to the `main-old` branch, which is the commit just before the `next` branch was merged in.
+
+- Added a `CHANGELOG.md` to track changes.

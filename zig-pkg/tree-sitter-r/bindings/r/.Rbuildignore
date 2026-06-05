@@ -1,0 +1,16 @@
+^LICENSE\.md$
+^.cache$
+^.clang-format$
+^compile_commands.json$
+^.vscode$
+^bootstrap.R$
+^codecov\.yml$
+^README\.Rmd$
+^tools$
+^.github$
+^_pkgdown\.yml$
+^docs$
+^pkgdown$
+^cran-comments\.md$
+^[\.]?air\.toml$
+^\.vscode$

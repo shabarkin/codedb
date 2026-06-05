@@ -10,6 +10,7 @@ const AgentRegistry = @import("agent.zig").AgentRegistry;
 const mcp_mod = @import("mcp.zig");
 const main_mod = @import("main.zig");
 const nuke_mod = @import("nuke.zig");
+const server_mod = @import("server.zig");
 const update_mod = @import("update.zig");
 const Config = @import("config.zig").Config;
 const root_policy = @import("root_policy.zig");
@@ -19,6 +20,7 @@ const watcher = @import("watcher.zig");
 const WordIndex = @import("index.zig").WordIndex;
 const TrigramIndex = @import("index.zig").TrigramIndex;
 const SparseNgramIndex = @import("index.zig").SparseNgramIndex;
+const mcp_json = @import("mcp").json;
 comptime {
     _ = @import("config.zig");
 }
@@ -71,6 +73,13 @@ test "issue-93: isSensitivePath blocks .env and credentials" {
     try testing.expect(watcher.isSensitivePath(".env"));
     try testing.expect(watcher.isSensitivePath(".env.local"));
     try testing.expect(watcher.isSensitivePath(".env.production"));
+    try testing.expect(watcher.isSensitivePath("config/prod.env"));
+    try testing.expect(watcher.isSensitivePath(".envrc"));
+    try testing.expect(watcher.isSensitivePath(".pgpass"));
+    try testing.expect(watcher.isSensitivePath(".htpasswd"));
+    try testing.expect(watcher.isSensitivePath("config/application.properties"));
+    try testing.expect(watcher.isSensitivePath("config/application.yml"));
+    try testing.expect(watcher.isSensitivePath("config/application.yaml"));
     try testing.expect(watcher.isSensitivePath("credentials.json"));
     try testing.expect(watcher.isSensitivePath("service-account.json"));
     try testing.expect(watcher.isSensitivePath("id_rsa"));
@@ -78,6 +87,10 @@ test "issue-93: isSensitivePath blocks .env and credentials" {
     try testing.expect(watcher.isSensitivePath("config/secrets.yml"));
     try testing.expect(watcher.isSensitivePath("server.key"));
     try testing.expect(watcher.isSensitivePath("cert.pem"));
+    try testing.expect(watcher.isSensitivePath("cert.crt"));
+    try testing.expect(watcher.isSensitivePath("cert.cer"));
+    try testing.expect(watcher.isSensitivePath("cert.der"));
+    try testing.expect(watcher.isSensitivePath("cert.crl"));
     try testing.expect(watcher.isSensitivePath("keystore.jks"));
     try testing.expect(watcher.isSensitivePath("identity.pfx"));
     try testing.expect(watcher.isSensitivePath(".ssh/known_hosts"));
@@ -86,6 +99,8 @@ test "issue-93: isSensitivePath blocks .env and credentials" {
     try testing.expect(watcher.isSensitivePath(".SSH/known_hosts"));
     // Normal files should NOT be blocked
     try testing.expect(!watcher.isSensitivePath(".envoy.json"));
+    try testing.expect(!watcher.isSensitivePath(".environment"));
+    try testing.expect(!watcher.isSensitivePath("report.crtx"));
     try testing.expect(!watcher.isSensitivePath("main.zig"));
     try testing.expect(!watcher.isSensitivePath("src/server.zig"));
     try testing.expect(!watcher.isSensitivePath("README.md"));
@@ -164,6 +179,40 @@ test "issue-150: -h prints usage" {
     try testing.expect(result.term.Exited == 0);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "usage:") != null or
         std.mem.indexOf(u8, result.stderr, "usage:") != null);
+}
+
+test "issue-b1: bindListener returns AddressInUse instead of crashing" {
+    if (cio.posixGetenv("CODEDB_ENABLE_NETWORK_TESTS") == null) return error.SkipZigTest;
+
+    var first = try server_mod.bindListener(io, 0);
+    defer first.deinit(io);
+
+    const port = first.socket.address.getPort();
+    try testing.expect(port != 0);
+    try testing.expectError(error.AddressInUse, server_mod.bindListener(io, port));
+}
+
+test "issue-b4: connection limiter enforces the configured cap" {
+    var limiter = server_mod.ConnectionLimiter.init(2);
+    try testing.expect(limiter.tryAcquire());
+    try testing.expectEqual(@as(usize, 1), limiter.activeCount());
+    try testing.expect(limiter.tryAcquire());
+    try testing.expectEqual(@as(usize, 2), limiter.activeCount());
+    try testing.expect(!limiter.tryAcquire());
+    try testing.expectEqual(@as(usize, 2), limiter.activeCount());
+    limiter.release();
+    try testing.expectEqual(@as(usize, 1), limiter.activeCount());
+    try testing.expect(limiter.tryAcquire());
+    try testing.expectEqual(@as(usize, 2), limiter.activeCount());
+    limiter.release();
+    limiter.release();
+    try testing.expectEqual(@as(usize, 0), limiter.activeCount());
+}
+
+test "issue-b5: defaultServePort falls back to 7719" {
+    try testing.expectEqual(@as(u16, 7719), main_mod.defaultServePort(null));
+    try testing.expectEqual(@as(u16, 7719), main_mod.defaultServePort("not-a-port"));
+    try testing.expectEqual(@as(u16, 9911), main_mod.defaultServePort("9911"));
 }
 
 test "nuke: commandTargetsBinary only matches the current install path" {
@@ -299,6 +348,40 @@ test "issue-148: dead MCP clients are polled every second" {
     try testing.expectEqual(@as(u64, 1000), mcp.dead_client_poll_ms);
 }
 
+test "issue-p0-3: oversized MCP line drains and preserves the next message" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(testing.allocator);
+    try payload.appendNTimes(testing.allocator, 'x', mcp_json.MAX_LINE + 1);
+    try payload.append(testing.allocator, '\n');
+    try payload.appendSlice(testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n");
+
+    {
+        var file = try tmp.dir.createFile(io, "oversize-lines.txt", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, payload.items);
+    }
+
+    const file = try tmp.dir.openFile(io, "oversize-lines.txt", .{});
+    defer file.close(io);
+
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.readerStreaming(io, &read_buf);
+
+    var oversize = false;
+    const first = mcp_json.readLineBufOversize(testing.allocator, &reader.interface, &oversize) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(first);
+    try testing.expect(oversize);
+    try testing.expectEqual(@as(usize, 0), first.len);
+
+    const second = mcp_json.readLineBufOversize(testing.allocator, &reader.interface, &oversize) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(second);
+    try testing.expect(!oversize);
+    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}", second);
+}
+
 test "issue-148: POLLHUP detects closed pipe" {
     // Verify the polling infrastructure works for pipe-based transports
     const pipe = try cio.makePipe();
@@ -401,9 +484,28 @@ test "issue-148: open pipe does not trigger HUP" {
 }
 
 test "issue-148: codedb mcp exits when stdin is closed" {
-    // Integration test: spawn codedb mcp, close stdin, verify it exits
+    var tmp_name_buf: [128]u8 = undefined;
+    const tmp_name = try std.fmt.bufPrint(&tmp_name_buf, "codedb-issue-148-{d}", .{@as(i64, @intCast(@divTrunc(cio.nanoTimestamp(), 1000)))});
+    const tmp_root = try std.fs.path.join(testing.allocator, &.{ "/private/tmp", tmp_name });
+    defer testing.allocator.free(tmp_root);
+
+    std.Io.Dir.cwd().createDirPath(io, tmp_root) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_root) catch {};
+
+    const source_path = try std.fs.path.join(testing.allocator, &.{ tmp_root, "sample.zig" });
+    defer testing.allocator.free(source_path);
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, source_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "pub fn sample() void {}\n");
+    }
+
+    // Integration test: spawn codedb mcp against a tiny project root, close stdin, verify it exits.
     var child = std.process.spawn(io, .{
-        .argv = &.{ "zig", "build", "run", "--", "--mcp" },
+        .argv = &.{ "zig", "build", "run", "--", tmp_root, "mcp" },
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -885,6 +987,53 @@ test "issue-bug11: codedb_bundle marks isError when all ops fail" {
     bench_ctx.runDispatch(io, testing.allocator, .codedb_bundle, &parsed.value.object, &out, &store, &explorer, &agents);
 
     try testing.expect(std.mem.startsWith(u8, out.items, "error:"));
+}
+
+test "issue-p2-query: codedb_query marks MCP isError when a later step fails" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const call_json =
+        \\{"params":{"name":"codedb_query","arguments":{"pipeline":[
+        \\  {"op":"find","query":"main"},
+        \\  {"op":"search"}
+        \\]}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, call_json, .{});
+    defer parsed.deinit();
+
+    const pipe = try cio.makePipe();
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
+
+    bench_ctx.runHandleCall(
+        io,
+        testing.allocator,
+        &parsed.value.object,
+        .{ .handle = pipe[1] },
+        std.json.Value{ .integer = 1 },
+        &store,
+        &explorer,
+        &agents,
+    );
+
+    var response_buf: [16 * 1024]u8 = undefined;
+    const n = try std.posix.read(pipe[0], &response_buf);
+    const response = response_buf[0..n];
+
+    try testing.expect(std.mem.indexOf(u8, response, "\"isError\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "src/main.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "--- partial ---") != null);
 }
 
 test "issue-387: appendId preserves JSON-RPC numeric and number_string ids" {

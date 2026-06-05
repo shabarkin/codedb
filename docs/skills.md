@@ -158,7 +158,7 @@ profile file teaches the agent **how** to use it — e.g.:
   on an unfamiliar area — one call replaces 3–5 search/word/symbol calls.
 - Use `codedb_symbol` for exact definition lookups, `codedb_search` for
   substring matches, `codedb_word` for single-identifier lookups.
-- Use `codedb_callers` to find every usage of a symbol before refactoring.
+- Use `codedb_callers` to find likely call sites of a symbol before refactoring.
 ```
 
 The combination — codedb providing the **engine**, the agent profile

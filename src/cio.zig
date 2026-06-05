@@ -8,15 +8,94 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-extern "c" fn write(fd: c_int, ptr: [*]const u8, len: usize) isize;
-extern "c" fn read(fd: c_int, ptr: [*]u8, len: usize) isize;
-extern "c" fn isatty(fd: c_int) c_int;
-extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-extern "c" fn clock_gettime(id: c_int, ts: *std.c.timespec) c_int;
-extern "c" fn pipe(fds: *[2]c_int) c_int;
-extern "c" fn close(fd: c_int) c_int;
+const is_freestanding = builtin.os.tag == .freestanding;
+
+const Os = if (is_freestanding) struct {
+    fn write(fd: c_int, ptr: [*]const u8, len: usize) isize {
+        _ = fd;
+        _ = ptr;
+        _ = len;
+        return -1;
+    }
+
+    fn read(fd: c_int, ptr: [*]u8, len: usize) isize {
+        _ = fd;
+        _ = ptr;
+        _ = len;
+        return -1;
+    }
+
+    fn isatty(fd: c_int) c_int {
+        _ = fd;
+        return 0;
+    }
+
+    fn getenv(name: [*:0]const u8) ?[*:0]const u8 {
+        _ = name;
+        return null;
+    }
+
+    fn pipe(fds: *[2]c_int) c_int {
+        _ = fds;
+        return -1;
+    }
+
+    fn close(fd: c_int) c_int {
+        _ = fd;
+        return 0;
+    }
+} else struct {
+    extern "c" fn write(fd: c_int, ptr: [*]const u8, len: usize) isize;
+    extern "c" fn read(fd: c_int, ptr: [*]u8, len: usize) isize;
+    extern "c" fn isatty(fd: c_int) c_int;
+    extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+    extern "c" fn pipe(fds: *[2]c_int) c_int;
+    extern "c" fn close(fd: c_int) c_int;
+};
+
+const Clock = if (is_freestanding) struct {
+    fn gettime(id: c_int, ts: *std.c.timespec) c_int {
+        _ = id;
+        ts.* = .{ .sec = 0, .nsec = 0 };
+        return 0;
+    }
+} else struct {
+    extern "c" fn clock_gettime(id: c_int, ts: *std.c.timespec) c_int;
+
+    fn gettime(id: c_int, ts: *std.c.timespec) c_int {
+        return clock_gettime(id, ts);
+    }
+};
+
+const DarwinArgs = if (is_freestanding) struct {} else struct {
+    extern "c" fn _NSGetArgc() *c_int;
+    extern "c" fn _NSGetArgv() *[*][*:0]u8;
+    extern "c" fn _NSGetEnviron() *[*:null]?[*:0]u8;
+};
+
+const PosixSpawnFileActions = opaque {};
+const PosixSpawnAttr = opaque {};
+const pid_t = c_int;
+
+const Spawn = if (is_freestanding) struct {} else struct {
+    extern "c" fn posix_spawnp(
+        pid: *pid_t,
+        path: [*:0]const u8,
+        file_actions: ?*const PosixSpawnFileActions,
+        attrp: ?*const PosixSpawnAttr,
+        argv: [*:null]const ?[*:0]const u8,
+        envp: [*:null]const ?[*:0]const u8,
+    ) c_int;
+    extern "c" fn posix_spawn_file_actions_init(fa: *PosixSpawnFileActions) c_int;
+    extern "c" fn posix_spawn_file_actions_destroy(fa: *PosixSpawnFileActions) c_int;
+    extern "c" fn posix_spawn_file_actions_adddup2(fa: *PosixSpawnFileActions, fd: c_int, newfd: c_int) c_int;
+    extern "c" fn posix_spawn_file_actions_addclose(fa: *PosixSpawnFileActions, fd: c_int) c_int;
+    extern "c" fn posix_spawn_file_actions_addchdir_np(fa: *PosixSpawnFileActions, path: [*:0]const u8) c_int;
+    extern "c" fn waitpid(pid: pid_t, status: *c_int, options: c_int) pid_t;
+};
 
 pub fn ignoreSigpipe() void {
+    if (is_freestanding) return;
     var act: std.posix.Sigaction = .{
         .handler = .{ .handler = std.posix.SIG.IGN },
         .mask = std.posix.sigemptyset(),
@@ -44,13 +123,13 @@ pub const File = struct {
     }
 
     pub fn isTty(self: File) bool {
-        return isatty(self.handle) != 0;
+        return Os.isatty(self.handle) != 0;
     }
 
     pub fn writeAll(self: File, data: []const u8) !void {
         var rem = data;
         while (rem.len > 0) {
-            const n = write(self.handle, rem.ptr, rem.len);
+            const n = Os.write(self.handle, rem.ptr, rem.len);
             if (n <= 0) return error.WriteFailed;
             rem = rem[@intCast(n)..];
         }
@@ -69,7 +148,13 @@ pub const File = struct {
 
 // ── Threads / Sync ───────────────────────────────────────────────────────
 
-pub const Mutex = struct {
+pub const Mutex = if (is_freestanding) struct {
+    pub fn lock(_: *@This()) void {}
+    pub fn unlock(_: *@This()) void {}
+    pub fn tryLock(_: *@This()) bool {
+        return true;
+    }
+} else struct {
     inner: std.c.pthread_mutex_t = .{},
 
     pub fn lock(self: *Mutex) void {
@@ -83,7 +168,15 @@ pub const Mutex = struct {
     }
 };
 
-pub const RwLock = struct {
+pub const RwLock = if (is_freestanding) struct {
+    pub fn lock(_: *@This()) void {}
+    pub fn unlock(_: *@This()) void {}
+    pub fn lockShared(_: *@This()) void {}
+    pub fn unlockShared(_: *@This()) void {}
+    pub fn tryLock(_: *@This()) bool {
+        return true;
+    }
+} else struct {
     inner: std.c.pthread_rwlock_t = .{},
 
     pub fn lock(self: *RwLock) void {
@@ -106,14 +199,16 @@ pub const RwLock = struct {
 // ── Time ─────────────────────────────────────────────────────────────────
 
 pub fn nanoTimestamp() i128 {
+    if (is_freestanding) return 0;
     var ts: std.c.timespec = undefined;
-    _ = clock_gettime(CLOCK_REALTIME, &ts);
+    _ = Clock.gettime(CLOCK_REALTIME, &ts);
     return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
 }
 
 pub fn milliTimestamp() i64 {
+    if (is_freestanding) return 0;
     var ts: std.c.timespec = undefined;
-    _ = clock_gettime(CLOCK_REALTIME, &ts);
+    _ = Clock.gettime(CLOCK_REALTIME, &ts);
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1_000_000);
 }
 
@@ -121,21 +216,24 @@ pub const Timer = struct {
     start_ns: i128,
 
     pub fn start() !Timer {
+        if (is_freestanding) return .{ .start_ns = 0 };
         var ts: std.c.timespec = undefined;
-        _ = clock_gettime(CLOCK_MONOTONIC, &ts);
+        _ = Clock.gettime(CLOCK_MONOTONIC, &ts);
         return .{ .start_ns = @as(i128, ts.sec) * 1_000_000_000 + ts.nsec };
     }
 
     pub fn read(self: *Timer) u64 {
+        if (is_freestanding) return 0;
         var ts: std.c.timespec = undefined;
-        _ = clock_gettime(CLOCK_MONOTONIC, &ts);
+        _ = Clock.gettime(CLOCK_MONOTONIC, &ts);
         const now = @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
         return @intCast(now - self.start_ns);
     }
 
     pub fn lap(self: *Timer) u64 {
+        if (is_freestanding) return 0;
         var ts: std.c.timespec = undefined;
-        _ = clock_gettime(CLOCK_MONOTONIC, &ts);
+        _ = Clock.gettime(CLOCK_MONOTONIC, &ts);
         const now = @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
         const delta: u64 = @intCast(now - self.start_ns);
         self.start_ns = now;
@@ -149,9 +247,18 @@ pub const Timer = struct {
 /// Replaces `std.crypto.random.int(u64)` (removed in 0.16) for tmp-file
 /// suffix collision avoidance. Thread-safe: each thread gets a unique
 /// mix per-call even at the same nanosecond.
+var freestanding_rand_state: u64 = 0x9e3779b97f4a7c15;
+
 pub fn randU64() u64 {
+    if (is_freestanding) {
+        freestanding_rand_state ^= freestanding_rand_state >> 12;
+        freestanding_rand_state ^= freestanding_rand_state << 25;
+        freestanding_rand_state ^= freestanding_rand_state >> 27;
+        freestanding_rand_state *%= 0x2545F4914F6CDD1D;
+        return freestanding_rand_state;
+    }
     var ts: std.c.timespec = undefined;
-    _ = clock_gettime(CLOCK_REALTIME, &ts);
+    _ = Clock.gettime(CLOCK_REALTIME, &ts);
     const ns = @as(u64, @intCast(ts.nsec));
     const sec = @as(u64, @intCast(ts.sec));
     const tid = std.Thread.getCurrentId();
@@ -167,6 +274,9 @@ pub fn randU64() u64 {
 }
 
 pub fn sleepMs(ms: u64) void {
+    if (is_freestanding) {
+        return;
+    }
     var ts: std.c.timespec = .{
         .sec = @intCast(ms / 1000),
         .nsec = @intCast((ms % 1000) * 1_000_000),
@@ -176,17 +286,19 @@ pub fn sleepMs(ms: u64) void {
 
 pub const PipeError = error{PipeFailed};
 pub fn makePipe() PipeError![2]c_int {
+    if (is_freestanding) return error.PipeFailed;
     var fds: [2]c_int = .{ -1, -1 };
-    if (pipe(&fds) != 0) return error.PipeFailed;
+    if (Os.pipe(&fds) != 0) return error.PipeFailed;
     return fds;
 }
 
 pub fn posixGetenv(name: []const u8) ?[]const u8 {
+    if (is_freestanding) return null;
     var buf: [256]u8 = undefined;
     if (name.len >= buf.len) return null;
     @memcpy(buf[0..name.len], name);
     buf[name.len] = 0;
-    const ptr = getenv(@ptrCast(&buf)) orelse return null;
+    const ptr = Os.getenv(@ptrCast(&buf)) orelse return null;
     return std.mem.span(ptr);
 }
 
@@ -195,9 +307,6 @@ pub fn posixGetenv(name: []const u8) ?[]const u8 {
 // Darwin: argv lives in __NSGetArgv() (libc, from <crt_externs.h>).
 // Linux/other POSIX: 0.16 doesn't expose argv globally — main() must call
 // `setProcessArgs(argv_slice)` once at startup to populate `process_args`.
-extern "c" fn _NSGetArgc() *c_int;
-extern "c" fn _NSGetArgv() *[*][*:0]u8;
-
 var process_args: ?[]const [*:0]const u8 = null;
 
 /// Called once by `pub fn main` to register the argv slice on non-Darwin
@@ -209,8 +318,9 @@ pub fn setProcessArgs(args: []const [*:0]const u8) void {
 /// Shim for cio.argsAlloc (removed in 0.16). Returns a duplicated
 /// slice of argv strings owned by the allocator; free with argsFree.
 pub fn argsAlloc(alloc: std.mem.Allocator) ![][:0]u8 {
+    if (is_freestanding) return alloc.alloc([:0]u8, 0);
     const argc: usize = if (builtin.os.tag == .macos)
-        @intCast(_NSGetArgc().*)
+        @intCast(DarwinArgs._NSGetArgc().*)
     else
         (process_args orelse return error.ProcessArgsNotSet).len;
     const out = try alloc.alloc([:0]u8, argc);
@@ -222,7 +332,7 @@ pub fn argsAlloc(alloc: std.mem.Allocator) ![][:0]u8 {
     }
     while (filled < argc) : (filled += 1) {
         const cstr: [*:0]const u8 = if (builtin.os.tag == .macos)
-            _NSGetArgv().*[filled]
+            DarwinArgs._NSGetArgv().*[filled]
         else
             process_args.?[filled];
         const s = std.mem.span(cstr);
@@ -287,30 +397,6 @@ pub const RunOptions = struct {
     cwd: ?[]const u8 = null,
     max_output_bytes: usize = 50 * 1024 * 1024,
 };
-extern "c" fn _NSGetEnviron() *[*:null]?[*:0]u8;
-
-// posix_spawn family — declared directly via extern "c" so this builds on
-// both Darwin and Linux. (std.c.posix_spawnp is gated to .isDarwin() in 0.16
-// and would fail to compile on Linux even though glibc/musl provide it.)
-const PosixSpawnFileActions = opaque {};
-const PosixSpawnAttr = opaque {};
-const pid_t = c_int;
-
-extern "c" fn posix_spawnp(
-    pid: *pid_t,
-    path: [*:0]const u8,
-    file_actions: ?*const PosixSpawnFileActions,
-    attrp: ?*const PosixSpawnAttr,
-    argv: [*:null]const ?[*:0]const u8,
-    envp: [*:null]const ?[*:0]const u8,
-) c_int;
-extern "c" fn posix_spawn_file_actions_init(fa: *PosixSpawnFileActions) c_int;
-extern "c" fn posix_spawn_file_actions_destroy(fa: *PosixSpawnFileActions) c_int;
-extern "c" fn posix_spawn_file_actions_adddup2(fa: *PosixSpawnFileActions, fd: c_int, newfd: c_int) c_int;
-extern "c" fn posix_spawn_file_actions_addclose(fa: *PosixSpawnFileActions, fd: c_int) c_int;
-extern "c" fn posix_spawn_file_actions_addchdir_np(fa: *PosixSpawnFileActions, path: [*:0]const u8) c_int;
-extern "c" fn waitpid(pid: pid_t, status: *c_int, options: c_int) pid_t;
-
 // posix_spawn_file_actions_t is a struct of unknown size on each libc. We
 // allocate a generously-sized buffer and cast to the opaque pointer type.
 const PosixSpawnFAStorage = [256]u8;
@@ -320,6 +406,7 @@ const PosixSpawnFAStorage = [256]u8;
 /// a background thread to avoid pipe-buffer deadlock when the child writes
 /// substantially to either stream).
 pub fn runCapture(opts: RunOptions) !CaptureResult {
+    if (is_freestanding) return error.UnsupportedTarget;
     if (opts.argv.len == 0) return error.EmptyArgv;
     const alloc = opts.allocator;
 
@@ -342,21 +429,21 @@ pub fn runCapture(opts: RunOptions) !CaptureResult {
 
     var out_pipe: [2]c_int = .{ -1, -1 };
     var err_pipe: [2]c_int = .{ -1, -1 };
-    if (pipe(&out_pipe) != 0) return error.PipeFailed;
+    if (Os.pipe(&out_pipe) != 0) return error.PipeFailed;
     errdefer {
-        if (out_pipe[0] >= 0) _ = close(out_pipe[0]);
-        if (out_pipe[1] >= 0) _ = close(out_pipe[1]);
+        if (out_pipe[0] >= 0) _ = Os.close(out_pipe[0]);
+        if (out_pipe[1] >= 0) _ = Os.close(out_pipe[1]);
     }
-    if (pipe(&err_pipe) != 0) return error.PipeFailed;
+    if (Os.pipe(&err_pipe) != 0) return error.PipeFailed;
     errdefer {
-        if (err_pipe[0] >= 0) _ = close(err_pipe[0]);
-        if (err_pipe[1] >= 0) _ = close(err_pipe[1]);
+        if (err_pipe[0] >= 0) _ = Os.close(err_pipe[0]);
+        if (err_pipe[1] >= 0) _ = Os.close(err_pipe[1]);
     }
 
     var fa_storage: PosixSpawnFAStorage = undefined;
     const fa: *PosixSpawnFileActions = @ptrCast(&fa_storage);
-    if (posix_spawn_file_actions_init(fa) != 0) return error.SpawnInitFailed;
-    defer _ = posix_spawn_file_actions_destroy(fa);
+    if (Spawn.posix_spawn_file_actions_init(fa) != 0) return error.SpawnInitFailed;
+    defer _ = Spawn.posix_spawn_file_actions_destroy(fa);
 
     if (opts.cwd) |cwd| {
         var cwd_buf: [4096]u8 = undefined;
@@ -365,30 +452,30 @@ pub fn runCapture(opts: RunOptions) !CaptureResult {
         cwd_buf[cwd.len] = 0;
         // posix_spawn_file_actions_addchdir_np is glibc 2.29+ / macOS 10.15+.
         // Returns ENOSYS on older systems — caller treats that as fatal here.
-        if (posix_spawn_file_actions_addchdir_np(fa, @ptrCast(&cwd_buf)) != 0) {
+        if (Spawn.posix_spawn_file_actions_addchdir_np(fa, @ptrCast(&cwd_buf)) != 0) {
             return error.CwdNotSupported;
         }
     }
 
-    _ = posix_spawn_file_actions_adddup2(fa, out_pipe[1], 1);
-    _ = posix_spawn_file_actions_adddup2(fa, err_pipe[1], 2);
-    _ = posix_spawn_file_actions_addclose(fa, out_pipe[0]);
-    _ = posix_spawn_file_actions_addclose(fa, out_pipe[1]);
-    _ = posix_spawn_file_actions_addclose(fa, err_pipe[0]);
-    _ = posix_spawn_file_actions_addclose(fa, err_pipe[1]);
+    _ = Spawn.posix_spawn_file_actions_adddup2(fa, out_pipe[1], 1);
+    _ = Spawn.posix_spawn_file_actions_adddup2(fa, err_pipe[1], 2);
+    _ = Spawn.posix_spawn_file_actions_addclose(fa, out_pipe[0]);
+    _ = Spawn.posix_spawn_file_actions_addclose(fa, out_pipe[1]);
+    _ = Spawn.posix_spawn_file_actions_addclose(fa, err_pipe[0]);
+    _ = Spawn.posix_spawn_file_actions_addclose(fa, err_pipe[1]);
 
     const envp: [*:null]const ?[*:0]const u8 = if (builtin.os.tag == .macos)
-        @ptrCast(_NSGetEnviron().*)
+        @ptrCast(DarwinArgs._NSGetEnviron().*)
     else
         @ptrCast(std.c.environ);
 
     var pid: pid_t = 0;
-    if (posix_spawnp(&pid, c_argv[0].?, fa, null, c_argv_z, envp) != 0)
+    if (Spawn.posix_spawnp(&pid, c_argv[0].?, fa, null, c_argv_z, envp) != 0)
         return error.SpawnFailed;
 
-    _ = close(out_pipe[1]);
+    _ = Os.close(out_pipe[1]);
     out_pipe[1] = -1;
-    _ = close(err_pipe[1]);
+    _ = Os.close(err_pipe[1]);
     err_pipe[1] = -1;
 
     // Drain stderr on a background thread so neither pipe can fill up and
@@ -404,7 +491,7 @@ pub fn runCapture(opts: RunOptions) !CaptureResult {
             var chunk: [64 * 1024]u8 = undefined;
             while (self.out.items.len < self.cap) {
                 const want = @min(chunk.len, self.cap - self.out.items.len);
-                const n = read(self.fd, &chunk, want);
+                const n = Os.read(self.fd, &chunk, want);
                 if (n <= 0) break;
                 self.out.appendSlice(self.alloc, chunk[0..@intCast(n)]) catch |e| {
                     self.err = e;
@@ -422,15 +509,15 @@ pub fn runCapture(opts: RunOptions) !CaptureResult {
     var chunk: [64 * 1024]u8 = undefined;
     while (out.items.len < opts.max_output_bytes) {
         const want = @min(chunk.len, opts.max_output_bytes - out.items.len);
-        const n = read(out_pipe[0], &chunk, want);
+        const n = Os.read(out_pipe[0], &chunk, want);
         if (n <= 0) break;
         try out.appendSlice(alloc, chunk[0..@intCast(n)]);
     }
-    _ = close(out_pipe[0]);
+    _ = Os.close(out_pipe[0]);
     out_pipe[0] = -1;
 
     err_thread.join();
-    _ = close(err_pipe[0]);
+    _ = Os.close(err_pipe[0]);
     err_pipe[0] = -1;
     if (err_ctx.err) |e| {
         err_ctx.out.deinit(alloc);
@@ -438,7 +525,7 @@ pub fn runCapture(opts: RunOptions) !CaptureResult {
     }
 
     var status: c_int = 0;
-    _ = waitpid(pid, &status, 0);
+    _ = Spawn.waitpid(pid, &status, 0);
 
     const term: CaptureResult.Term = if ((status & 0x7f) == 0)
         .{ .Exited = @intCast((status >> 8) & 0xff) }
