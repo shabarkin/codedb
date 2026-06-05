@@ -1823,3 +1823,35 @@ test "issue-XX: codedb_glob list cut at max_results carries a truncation marker"
 
     try testing.expect(std.mem.indexOf(u8, out.items, "more") != null);
 }
+
+test "issue-G1-7.2: codedb_glob character-class pattern must not silently return bare 'no matches'" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("apple.zig", "pub fn a() void {}\n");
+    try explorer.indexFile("zebra.zig", "pub fn z() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"pattern":"[az]*.zig"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_glob, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // '[az]*.zig' matches both indexed files under zsh/fd/rg semantics.
+    // codedb must either reject the unsupported class with a diagnostic or
+    // match it — a bare "no matches" is indistinguishable from the files
+    // not existing.
+    try testing.expect(std.mem.indexOf(u8, out.items, "no matches") == null);
+}
