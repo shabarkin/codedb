@@ -1855,3 +1855,33 @@ test "issue-G1-7.2: codedb_glob character-class pattern must not silently return
     // not existing.
     try testing.expect(std.mem.indexOf(u8, out.items, "no matches") == null);
 }
+
+test "issue-G2-7.6: codedb_glob nested brace pattern must not silently return bare 'no matches'" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn a() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"pattern":"**/*.{z{ig,on}}"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_glob, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // '**/*.{z{ig,on}}' means '**/*.{zig,zon}' under fd and rg globset and
+    // matches src/a.zig. codedb must either expand the nested brace or
+    // reject it with a diagnostic — not silently answer "no matches".
+    try testing.expect(std.mem.indexOf(u8, out.items, "no matches") == null);
+}
