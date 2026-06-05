@@ -1704,3 +1704,22 @@ test "issue-G5: tier-0 per-file collection cap must not starve max_results when 
 
     try testing.expectEqual(@as(usize, 50), results.len);
 }
+
+test "issue-514: regex ^ anchor matches line 1 of UTF-8 BOM file" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    try explorer.indexFile("encodings/bom.txt", "\xEF\xBB\xBFbom line one\nbom line two\n");
+
+    const results = try explorer.searchContentRegex("^bom line one", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expectEqual(@as(u32, 1), results[0].line_num);
+}
