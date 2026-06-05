@@ -1658,7 +1658,6 @@ test "issue-451: scope=true search surfaces skip-trigram files" {
     try testing.expect(found_canonical);
 }
 
-
 test "issue-R1: regex backref '(a)\\1' silently demoted to literal, matches 'a1' not 'aa'" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1678,4 +1677,30 @@ test "issue-R1: regex backref '(a)\\1' silently demoted to literal, matches 'a1'
     } else |err| {
         try testing.expect(err == error.InvalidPattern);
     }
+}
+
+test "issue-G5: tier-0 per-file collection cap must not starve max_results when matches remain" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(testing.allocator);
+    var line_buf: [64]u8 = undefined;
+    for (0..100) |i| {
+        const line = try std.fmt.bufPrint(&line_buf, "const v{d} = capneedle;\n", .{i});
+        try content.appendSlice(testing.allocator, line);
+    }
+    try explorer.indexFile("src/dense.zig", content.items);
+    try explorer.indexFile("src/sparse.zig", "pub const capneedle = 1;\n");
+
+    const results = try explorer.searchContent("capneedle", testing.allocator, 50);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expectEqual(@as(usize, 50), results.len);
 }
