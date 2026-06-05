@@ -11,7 +11,8 @@ const std = @import("std");
 const cio = @import("cio.zig");
 const Store = @import("store.zig").Store;
 const AgentRegistry = @import("agent.zig").AgentRegistry;
-const Explorer = @import("explore.zig").Explorer;
+const explore_mod = @import("explore.zig");
+const Explorer = explore_mod.Explorer;
 const snapshot_json = @import("snapshot_json.zig");
 const watcher = @import("watcher.zig");
 const edit_mod = @import("edit.zig");
@@ -776,7 +777,23 @@ fn handleConnection(
             return;
         };
         defer allocator.free(query);
-        const results = explorer.searchContent(query, allocator, 50) catch {
+        const max_results_raw = extractQueryParamInt(request, "max_results") orelse 50;
+        const max_results = @as(usize, @intCast(@min(max_results_raw, 1000)));
+        var path_glob_storage: ?[]u8 = null;
+        defer if (path_glob_storage) |glob| allocator.free(glob);
+        var path_glob_buf: [256]u8 = undefined;
+        const path_glob: ?[]const u8 = if (extractQueryParam(request, "path_glob")) |path_glob_raw| blk: {
+            const decoded = percentDecode(allocator, path_glob_raw) catch {
+                respondJson(&conn, "500 Internal Server Error", "{\"error\":\"decode failed\"}");
+                return;
+            };
+            path_glob_storage = decoded;
+            break :blk normalizeGlobPattern(decoded, &path_glob_buf);
+        } else null;
+        const results = explorer.searchContentWithOptions(query, allocator, .{
+            .max_results = max_results,
+            .path_glob = path_glob,
+        }) catch {
             respondJson(&conn, "500 Internal Server Error", "{\"error\":\"search failed\"}");
             return;
         };
@@ -981,6 +998,13 @@ fn extractQueryParamInt(request: []const u8, key: []const u8) ?u64 {
     return std.fmt.parseInt(u64, val, 10) catch null;
 }
 
+fn normalizeGlobPattern(pattern: []const u8, buf: *[256]u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, pattern, '/') == null and pattern.len + 3 < buf.len) {
+        return std.fmt.bufPrint(buf, "**/{s}", .{pattern}) catch pattern;
+    }
+    return pattern;
+}
+
 fn extractBody(request: []const u8) []const u8 {
     if (std.mem.indexOf(u8, request, "\r\n\r\n")) |pos| {
         return request[pos + 4 ..];
@@ -1063,4 +1087,10 @@ test "loadOrCreateAuthToken fails when HOME cannot hold the token file" {
         error.CannotPersistAuthToken,
         loadOrCreateAuthTokenFromHome(std.testing.io, std.testing.allocator, 7719, home),
     );
+}
+
+test "server: basename glob normalization matches nested files" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("**/*.ts", normalizeGlobPattern("*.ts", &buf));
+    try std.testing.expectEqualStrings("src/**/*.ts", normalizeGlobPattern("src/**/*.ts", &buf));
 }

@@ -1474,18 +1474,14 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     const is_regex = getBool(args, "regex");
     const path_glob_raw = getStr(args, "path_glob");
     const regex_engine_max_per_file = requested_max_per_file orelse max_results;
-    // Auto-promote basename-only patterns ('*.zig') to '**/*.zig' so they match
-    // nested files. Without this the matcher rejects 'src/main.zig' because
-    // '*' doesn't cross '/' (see explore.zig:matchGlob). Issue surfaced by the
-    // recall eval — agents reach for '*.zig' first.
     var pg_buf: [256]u8 = undefined;
-    const path_glob: ?[]const u8 = if (path_glob_raw) |g| blk: {
-        if (std.mem.indexOfScalar(u8, g, '/') == null and g.len + 3 < pg_buf.len) {
-            const promoted = std.fmt.bufPrint(&pg_buf, "**/{s}", .{g}) catch break :blk g;
-            break :blk promoted;
-        }
-        break :blk g;
-    } else null;
+    const path_glob: ?[]const u8 = if (path_glob_raw) |g| normalizeGlobPattern(g, &pg_buf) else null;
+    const literal_options = explore_mod.SearchOptions{
+        .max_results = max_results,
+        .max_per_file = requested_max_per_file,
+        .path_glob = path_glob,
+        .compact = compact,
+    };
 
     if (scope and is_regex) {
         const results = explorer.searchContentRegexWithScopeCapped(query, alloc, max_results, regex_engine_max_per_file) catch |err| {
@@ -1553,7 +1549,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     } else if (scope) {
-        const results = explorer.searchContentWithScope(query, alloc, max_results) catch {
+        const results = explorer.searchContentWithScopeOptions(query, alloc, literal_options) catch {
             out.appendSlice(alloc, "error: search failed") catch {};
             return;
         };
@@ -1680,7 +1676,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             if (rendered) return;
         }
 
-        const results = explorer.searchContent(query, alloc, max_results) catch {
+        const results = explorer.searchContentWithOptions(query, alloc, literal_options) catch {
             out.appendSlice(alloc, "error: search failed") catch {};
             return;
         };
@@ -3698,7 +3694,9 @@ fn handleGlob(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
         else => 200,
     } else 200;
 
-    const matches = explorer.globPaths(alloc, pattern, max_results) catch {
+    var pattern_buf: [256]u8 = undefined;
+    const normalized_pattern = normalizeGlobPattern(pattern, &pattern_buf);
+    const matches = explorer.globPaths(alloc, normalized_pattern, max_results) catch {
         out.appendSlice(alloc, "error: glob failed") catch {};
         return;
     };
@@ -3946,10 +3944,12 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 failure_step_args = step;
                 break;
             }
+            var glob_buf: [256]u8 = undefined;
+            const normalized_pattern = normalizeGlobPattern(pattern, &glob_buf);
             if (have_set) {
                 var wr: usize = 0;
                 for (file_set.items) |path| {
-                    if (globMatch(pattern, path)) {
+                    if (globMatch(normalized_pattern, path)) {
                         file_set.items[wr] = path;
                         wr += 1;
                     } else {
@@ -3959,7 +3959,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 file_set.items.len = wr;
             } else {
                 const max: usize = if (getInt(step, "max_results")) |n| @intCast(@max(1, @min(n, 5000))) else 200;
-                const matches = explorer.globPaths(alloc, pattern, max) catch {
+                const matches = explorer.globPaths(alloc, normalized_pattern, max) catch {
                     w.print("error: glob failed\n", .{}) catch {};
                     had_failure = true;
                     failure_step = step_i;
@@ -3992,7 +3992,9 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             const is_regex = getBool(step, "regex");
             const compact = getBool(step, "compact");
             const paths_only = getBool(step, "paths_only");
-            const path_glob = getStr(step, "path_glob");
+            const path_glob_raw = getStr(step, "path_glob");
+            var step_pg_buf: [256]u8 = undefined;
+            const path_glob = if (path_glob_raw) |g| normalizeGlobPattern(g, &step_pg_buf) else null;
             const regex_engine_max_per_file = requested_max_per_file orelse max;
 
             var path_set = std.StringHashMap(void).init(alloc);
@@ -4000,6 +4002,13 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             if (have_set) {
                 for (file_set.items) |p| path_set.put(p, {}) catch {};
             }
+            const literal_options = explore_mod.SearchOptions{
+                .max_results = max,
+                .max_per_file = requested_max_per_file,
+                .path_glob = path_glob,
+                .path_set = if (have_set) &path_set else null,
+                .compact = compact,
+            };
             var hit_set = std.StringHashMap(void).init(alloc);
             defer hit_set.deinit();
             var seen = std.StringHashMap(void).init(alloc);
@@ -4048,7 +4057,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                     }
                 }
             } else if (scope) {
-                const results = explorer.searchContentWithScope(query, alloc, max) catch {
+                const results = explorer.searchContentWithScopeOptions(query, alloc, literal_options) catch {
                     w.print("error: search failed\n", .{}) catch {};
                     had_failure = true;
                     failure_step = step_i;
@@ -4121,7 +4130,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                     }
                 }
             } else {
-                const results = explorer.searchContent(query, alloc, max) catch {
+                const results = explorer.searchContentWithOptions(query, alloc, literal_options) catch {
                     w.print("error: search failed\n", .{}) catch {};
                     had_failure = true;
                     failure_step = step_i;
@@ -4663,7 +4672,15 @@ fn logFileAccess(io: std.Io, tool: []const u8, file_path: []const u8, latency_ns
     appendToWal(io, line);
 }
 pub fn globMatch(pattern: []const u8, path: []const u8) bool {
-    return explore_mod.matchGlob(pattern, path);
+    var buf: [256]u8 = undefined;
+    return explore_mod.matchGlob(normalizeGlobPattern(pattern, &buf), path);
+}
+
+fn normalizeGlobPattern(pattern: []const u8, buf: *[256]u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, pattern, '/') == null and pattern.len + 3 < buf.len) {
+        return std.fmt.bufPrint(buf, "**/{s}", .{pattern}) catch pattern;
+    }
+    return pattern;
 }
 
 pub fn isPathSafe(path: []const u8) bool {

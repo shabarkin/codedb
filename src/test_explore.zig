@@ -166,6 +166,39 @@ test "explorer: findAllSymbols returns multiple" {
     try testing.expect(results.len == 2);
 }
 
+test "issue-recall: symbol lookup ranks primary definition before imports and tests" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/uses.zig", "const Widget = @import(\"widget.zig\").Widget;\n");
+    try explorer.indexFile("tests/widget_test.zig", "pub const Widget = struct {};\n");
+    try explorer.indexFile("docs/widget.md", "pub const Widget = struct {};\n");
+    try explorer.indexFile("src/widget.zig", "pub const Widget = struct {};\n");
+
+    const result = try explorer.findSymbol("Widget", testing.allocator);
+    try testing.expect(result != null);
+    const r = result.?;
+    defer {
+        testing.allocator.free(r.path);
+        testing.allocator.free(r.symbol.name);
+        if (r.symbol.detail) |d| testing.allocator.free(d);
+    }
+    try testing.expectEqualStrings("src/widget.zig", r.path);
+
+    const all = try explorer.findAllSymbols("Widget", testing.allocator);
+    defer {
+        for (all) |s| {
+            testing.allocator.free(s.path);
+            testing.allocator.free(s.symbol.name);
+            if (s.symbol.detail) |d| testing.allocator.free(d);
+        }
+        testing.allocator.free(all);
+    }
+    try testing.expect(all.len >= 3);
+    try testing.expectEqualStrings("src/widget.zig", all[0].path);
+}
+
 test "explorer: searchContent with trigram acceleration" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1439,6 +1472,28 @@ test "issue-p2-dep: rust super use resolves relative to the current module" {
     }
     try testing.expectEqual(@as(usize, 1), util_importers.len);
     try testing.expectEqualStrings("src/sub/child.rs", util_importers[0]);
+}
+
+test "issue-recall: rust re-export resolves to the re-exported module file" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/parent/shared.rs", "pub struct Thing;\n");
+    try explorer.indexFile("src/parent/mod.rs",
+        \\pub mod shared;
+        \\pub use self::shared::Thing;
+        \\
+    );
+
+    const importers = try explorer.getImportedBy("src/parent/shared.rs", testing.allocator);
+    defer {
+        for (importers) |p| testing.allocator.free(p);
+        testing.allocator.free(importers);
+    }
+
+    try testing.expectEqual(@as(usize, 1), importers.len);
+    try testing.expectEqualStrings("src/parent/mod.rs", importers[0]);
 }
 
 test "issue-p2-dep: typescript relative imports resolve and bare specifiers stay external" {

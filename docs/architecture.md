@@ -49,7 +49,7 @@ The central struct. Holds all indexed data behind a single mutex.
 - `removeFile(path)` — clean removal from all maps and indexes
 - `getTree()` — sorted file tree with directory nodes and symbol counts
 - `findSymbol(name)` / `findAllSymbols(name)` — symbol lookup across all files
-- `searchContent(query, max)` — trigram-accelerated full-text search
+- `searchContent(query, max)` — high-recall, trigram-accelerated full-text search
 - `searchWord(word)` — O(1) inverted index lookup
 - `getImportedBy(path)` — reverse dependency lookup
 - `getHotFiles(store, limit)` — files sorted by most recent change sequence
@@ -58,7 +58,7 @@ The central struct. Holds all indexed data behind a single mutex.
 
 **WordIndex** — inverted index mapping words to `(path, line_num)` hits. Tokenizes content into identifiers, skipping single-character tokens. Supports efficient re-indexing via per-file word tracking. Deduplicates results by `(path, line)`.
 
-**TrigramIndex** — maps 3-byte character sequences to file sets. Used to narrow full-text search candidates before brute-force scanning. Queries < 3 chars fall back to brute force. Intersection of trigram sets gives candidate files.
+**TrigramIndex** — maps 3-byte character sequences to file sets. Used to narrow full-text search candidates before brute-force scanning. Queries < 3 chars fall back to brute force. Intersection of trigram sets gives candidate files. Literal search treats recall as the default contract for indexed, non-sensitive files: if accelerated candidates produce a partial eligible result set, `Explorer` scans remaining indexed files before ranking and truncating to `max_results`. Sensitive paths, ignored files, compact filtering, `max_results`, and `max_per_file` still bound the visible result set.
 
 ### `store.zig` — Version Store
 

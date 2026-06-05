@@ -37,6 +37,133 @@ fn expectNoOutlineSymbol(outline: *const explore.FileOutline, name: []const u8) 
     }
 }
 
+fn expectParseWarning(outline: *const explore.FileOutline) !void {
+    if (!build_options.tree_sitter) return;
+    const warning = outline.parse_warning orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, warning, "conservative fallback") != null);
+}
+
+fn expectMalformedOutlineFallback(path: []const u8, content: []const u8, fake_symbol: ?[]const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile(path, content);
+
+    var outline = (try explorer.getOutline(path, testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    if (fake_symbol) |name| {
+        try expectNoOutlineSymbol(&outline, name);
+    }
+    try expectParseWarning(&outline);
+}
+
+test "issue-recall: malformed TypeScript unterminated string does not leak fake symbol" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/bad.ts",
+        \\const payload = "
+        \\function FakeFromString() {}
+        \\
+    );
+
+    var outline = (try explorer.getOutline("src/bad.ts", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectNoOutlineSymbol(&outline, "FakeFromString");
+    try expectParseWarning(&outline);
+}
+
+test "issue-recall: malformed C unterminated comment does not leak fake symbol" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/bad.c",
+        \\/*
+        \\void FakeFromComment(void) {}
+        \\
+    );
+
+    var outline = (try explorer.getOutline("src/bad.c", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectNoOutlineSymbol(&outline, "FakeFromComment");
+    try expectParseWarning(&outline);
+}
+
+test "issue-recall: malformed PHP unterminated comment does not leak fake symbol" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/bad.php",
+        \\<?php
+        \\/*
+        \\function FakeFromComment() {}
+        \\
+    );
+
+    var outline = (try explorer.getOutline("src/bad.php", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectNoOutlineSymbol(&outline, "FakeFromComment");
+    try expectParseWarning(&outline);
+}
+
+test "issue-recall: malformed Go unterminated comment does not leak fake symbol" {
+    try expectMalformedOutlineFallback("src/bad.go",
+        \\package main
+        \\/*
+        \\func FakeFromComment() {}
+        \\
+    , "FakeFromComment");
+}
+
+test "issue-recall: malformed Python unterminated docstring does not leak fake symbol" {
+    try expectMalformedOutlineFallback("src/bad.py",
+        \\payload = """
+        \\def FakeFromDocstring():
+        \\    pass
+        \\
+    , "FakeFromDocstring");
+}
+
+test "issue-recall: malformed Ruby unterminated =begin block does not leak fake symbol" {
+    try expectMalformedOutlineFallback("src/bad.rb",
+        \\=begin
+        \\def FakeFromComment
+        \\
+    , "FakeFromComment");
+}
+
+test "issue-recall: malformed HCL unterminated comment does not leak fake symbol" {
+    try expectMalformedOutlineFallback("src/bad.tf",
+        \\/*
+        \\resource "aws_instance" "fake" {}
+        \\
+    , "fake");
+}
+
+test "issue-recall: malformed Dart unterminated comment does not leak fake symbol" {
+    try expectMalformedOutlineFallback("src/bad.dart",
+        \\/*
+        \\class FakeFromComment {}
+        \\
+    , "FakeFromComment");
+}
+
+test "issue-recall: malformed R parse error falls back conservatively" {
+    try expectMalformedOutlineFallback("src/bad.R",
+        \\broken <- c(1,
+        \\2
+        \\
+    , null);
+}
+
 test "issue-ts-0: tree-sitter rust smoke parses and walks named nodes" {
     if (!build_options.tree_sitter) return error.SkipZigTest;
 

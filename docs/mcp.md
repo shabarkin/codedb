@@ -8,6 +8,12 @@ context, etc. — backed by the indexes in `~/.codedb/projects/<hash>/`.
 This guide covers per-client setup, how codedb decides which project to
 scan, and the most common failure modes.
 
+`codedb_search` is high-recall for indexed, non-sensitive files. Literal
+search uses word/trigram indexes for speed, but falls back to unvisited
+eligible files when the accelerated candidates do not fill `max_results`.
+MCP `path_glob`, `codedb_glob`, and `codedb_query` glob filters promote bare
+basename patterns like `*.ts` to `**/*.ts`, so nested files match by default.
+
 ---
 
 ## 1. Build codedb

@@ -159,6 +159,13 @@ zig-out/bin/codedb /path/to/project hot
 | `codedb_ls` | List immediate children of a directory — dirs first, then files with language + counts |
 | `codedb_query` | Composable pipeline — chain `find`, `search`, `filter`, `deps`, `outline`, `read`, `sort`, `limit` in one request |
 
+Search is high-recall by default for indexed, non-sensitive files: accelerated
+literal search expands to remaining eligible files when candidates do not fill
+`max_results`, then ranks the collected hits. Results are still bounded by
+`max_results`, `max_per_file`, ignore rules, compact filtering, and the
+sensitive-file policy. Basename globs such as `*.ts` are promoted to `**/*.ts`
+in MCP search/glob/query filters so nested files are included by default.
+
 ### `codedb_remote` — Cloud Intelligence
 
 Query any indexed public GitHub repo without cloning it. `codedb_remote` always uses `api.wiki.codes`; the old `codegraff` backend name is no longer a supported route. Omit `backend`, or keep `backend="wiki"` only for older prompts.

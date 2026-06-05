@@ -1323,6 +1323,67 @@ test "issue-p2-query: codedb_query glob op filters existing file set" {
     try testing.expect(std.mem.indexOf(u8, files_tail, "docs/auth.md") == null);
 }
 
+test "issue-recall: codedb_glob promotes basename glob to nested files" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/nested/workflow.ts", "export const enabled = true;\n");
+    try explorer.indexFile("src/nested/workflow.js", "export const enabled = true;\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const glob_json =
+        \\{"pattern":"*.ts"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glob_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_glob, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/nested/workflow.ts") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/nested/workflow.js") == null);
+}
+
+test "issue-recall: codedb_query search path_glob is applied before max_results budget" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/decoy.js", "export const GITHUB_ACTIONS = true;\n");
+    try explorer.indexFile("src/nested/workflow.ts", "export const GITHUB_ACTIONS = true;\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const pipe_json =
+        \\{"pipeline":[{"op":"search","query":"GITHUB_ACTIONS","max_results":1,"path_glob":"*.ts"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, pipe_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_query, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/nested/workflow.ts:1") != null);
+    const files_idx = std.mem.indexOf(u8, out.items, "--- files ---") orelse return error.TestUnexpectedResult;
+    const files_tail = out.items[files_idx..];
+    try testing.expect(std.mem.indexOf(u8, files_tail, "src/nested/workflow.ts") != null);
+    try testing.expect(std.mem.indexOf(u8, files_tail, "src/decoy.js") == null);
+}
+
 test "issue-p2-query: codedb_query read honors line_start and line_end" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();

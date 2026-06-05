@@ -52,6 +52,7 @@ extern fn ts_node_end_byte(self: TSNode) u32;
 extern fn ts_node_end_point(self: TSNode) TSPoint;
 extern fn ts_node_is_null(self: TSNode) bool;
 extern fn ts_node_is_named(self: TSNode) bool;
+extern fn ts_node_has_error(self: TSNode) bool;
 extern fn ts_node_named_child_count(self: TSNode) u32;
 extern fn ts_node_named_child(self: TSNode, child_index: u32) TSNode;
 extern fn ts_node_child_by_field_name(self: TSNode, name: [*]const u8, name_length: u32) TSNode;
@@ -260,6 +261,10 @@ pub fn nodeEndPoint(node: TSNode) TSPoint {
 
 pub fn nodeIsNull(node: TSNode) bool {
     return ts_node_is_null(node);
+}
+
+pub fn nodeHasError(node: TSNode) bool {
+    return ts_node_has_error(node);
 }
 
 pub fn namedChildCount(node: TSNode) u32 {
