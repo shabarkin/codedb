@@ -1657,3 +1657,25 @@ test "issue-451: scope=true search surfaces skip-trigram files" {
     }
     try testing.expect(found_canonical);
 }
+
+
+test "issue-R1: regex backref '(a)\\1' silently demoted to literal, matches 'a1' not 'aa'" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer.indexFile("traps.txt", "aa backref-target\na1 backref-literal-trap\n");
+
+    if (explorer.searchContentRegexCapped("(a)\\1", testing.allocator, 10, 10)) |results| {
+        defer {
+            for (results) |r| {
+                testing.allocator.free(r.path);
+                testing.allocator.free(r.line_text);
+            }
+            testing.allocator.free(results);
+        }
+        try testing.expectEqual(@as(usize, 1), results.len);
+        try testing.expectEqual(@as(u32, 1), results[0].line_num);
+    } else |err| {
+        try testing.expect(err == error.InvalidPattern);
+    }
+}
