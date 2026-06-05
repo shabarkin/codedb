@@ -2933,3 +2933,44 @@ test "issue-447: searchContent surfaces large (>64KB) skip-trigram files for com
     }
     try testing.expect(found_canonical);
 }
+
+
+test "issue-1: mmap trigram index preserves heap candidates across writeToDisk round-trip" {
+    const alloc = testing.allocator;
+    var ti = TrigramIndex.init(alloc);
+    ti.owns_paths = true;
+    defer ti.deinit();
+
+    var name_buf: [64]u8 = undefined;
+    var content_buf: [128]u8 = undefined;
+    for (0..64) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "src/file_{d}.zig", .{i});
+        const content = if (i % 2 == 0)
+            try std.fmt.bufPrint(&content_buf, "const alpha_{d} = 1; // alphaomega marker\n", .{i})
+        else
+            try std.fmt.bufPrint(&content_buf, "const alpha_{d} = 1;\n", .{i});
+        try ti.indexFile(name, content);
+    }
+
+    const heap_cands = ti.candidates("alphaomega", alloc);
+    defer if (heap_cands) |c| alloc.free(c);
+    try testing.expect(heap_cands != null);
+    try testing.expectEqual(@as(usize, 32), heap_cands.?.len);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+
+    try ti.writeToDisk(io, dir_path, null);
+
+    var mmap_idx = MmapTrigramIndex.initFromDisk(io, dir_path, alloc) orelse
+        return error.MmapLoadFailed;
+    defer mmap_idx.deinit();
+
+    const mmap_cands = mmap_idx.candidates("alphaomega", alloc);
+    defer if (mmap_cands) |c| alloc.free(c);
+    try testing.expect(mmap_cands != null);
+    try testing.expectEqual(heap_cands.?.len, mmap_cands.?.len);
+}
