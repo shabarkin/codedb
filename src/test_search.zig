@@ -1705,6 +1705,36 @@ test "issue-G5: tier-0 per-file collection cap must not starve max_results when 
     try testing.expectEqual(@as(usize, 50), results.len);
 }
 
+test "issue-513: search hit line in NUL-past-sniff file is retrievable via read" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(testing.allocator);
+    try content.appendNTimes(testing.allocator, 'x', 600);
+    try content.appendSlice(testing.allocator, "\x00\npost-null NEEDLE_NULLAT600_LATE token\n");
+    try explorer.indexFile("sizes/null-at-600.txt", content.items);
+
+    const results = try explorer.searchContent("NEEDLE_NULLAT600_LATE", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expectEqual(@as(usize, 1), results.len);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const served = try explorer.renderCachedRead("sizes/null-at-600.txt", testing.allocator, &out, .{
+        .line_start = results[0].line_num,
+        .line_end = results[0].line_num,
+    });
+    try testing.expect(served);
+    try testing.expect(std.mem.indexOf(u8, out.items, "NEEDLE_NULLAT600_LATE") != null);
+}
+
 test "issue-514: regex ^ anchor matches line 1 of UTF-8 BOM file" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
