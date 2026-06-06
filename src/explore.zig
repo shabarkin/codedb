@@ -3753,7 +3753,12 @@ pub const Explorer = struct {
         // BM25 constants.
         const k1: f32 = 1.2;
         const b: f32 = 0.75;
-        const N = self.word_index.rankedDocCount();
+        // Fall back to the total indexed-doc count when the per-doc length
+        // table is empty (the bulk `codedb index` path writes the disk word
+        // index without doc lengths) so ranked search still returns idf-weighted
+        // results instead of nothing. avgDocLength() already returns a safe 1.0.
+        const ranked_n = self.word_index.rankedDocCount();
+        const N: u32 = if (ranked_n > 0) ranked_n else @intCast(self.word_index.id_to_path.items.len);
         if (N == 0) return try allocator.alloc(SearchResult, 0);
         const avgdl = self.word_index.avgDocLength();
 

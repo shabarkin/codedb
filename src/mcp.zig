@@ -279,6 +279,10 @@ fn shouldLoadWordIndexForSearch(args: *const std.json.ObjectMap) bool {
     const query = getStr(args, "query") orelse return false;
     if (query.len < 2 or query.len > 256) return false;
 
+    // Single identifiers (legacy) AND multi-word / natural-language queries
+    // (which route to the BM25 ranked path) both resolve through the word
+    // index, so allow spaces between terms. Reject other punctuation so plain
+    // literal-substring searches still skip the load.
     var saw_word_char = false;
     for (query) |c| {
         const is_word_char =
@@ -286,8 +290,8 @@ fn shouldLoadWordIndexForSearch(args: *const std.json.ObjectMap) bool {
             (c >= 'A' and c <= 'Z') or
             (c >= '0' and c <= '9') or
             c == '_';
-        if (!is_word_char) return false;
-        if (c != '_') saw_word_char = true;
+        if (!is_word_char and c != ' ') return false;
+        if (is_word_char and c != '_') saw_word_char = true;
     }
     return saw_word_char;
 }
@@ -1289,7 +1293,7 @@ fn dispatch(
         waitForScanReady(scan_wait_timeout_ms);
     }
 
-    if (tool == .codedb_word or (tool == .codedb_search and shouldLoadWordIndexForSearch(args))) {
+    if (tool == .codedb_word or tool == .codedb_context or (tool == .codedb_search and shouldLoadWordIndexForSearch(args))) {
         const effective_project = project_path orelse cache.default_path;
         loadProjectWordIndexFromDiskIfPresent(io, ctx.explorer, effective_project, alloc);
     }
@@ -1680,7 +1684,15 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             if (rendered) return;
         }
 
-        const results = explorer.searchContentWithOptions(query, alloc, literal_options) catch {
+        // Multi-word queries express natural-language / conceptual intent —
+        // rank them by BM25 (relevance) instead of raw substring order, which
+        // returns nothing for a phrase. Single-token queries keep literal
+        // substring matching so exact-identifier lookups still work.
+        const multiword = std.mem.indexOfScalar(u8, query, ' ') != null;
+        const results = (if (multiword)
+            explorer.searchContentRanked(query, alloc, max_results)
+        else
+            explorer.searchContentWithOptions(query, alloc, literal_options)) catch {
             out.appendSlice(alloc, "error: search failed") catch {};
             return;
         };
@@ -2100,7 +2112,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
         } else |_| {}
 
         // Content search — small per-keyword cap keeps the arena lean.
-        const hits = explorer.searchContent(kw, A, CONTEXT_MAX_RESULTS_PER_KW) catch continue;
+        const hits = explorer.searchContentRanked(kw, A, CONTEXT_MAX_RESULTS_PER_KW) catch continue;
         for (hits) |h| {
             const gop = by_file.getOrPut(h.path) catch continue;
             if (!gop.found_existing) gop.value_ptr.* = .{};

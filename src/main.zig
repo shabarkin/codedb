@@ -353,7 +353,11 @@ fn mainImpl() !void {
         const snapshot_loaded = loadBestSnapshot(io, &explorer, &store, abs_root, data_dir, git_head, allocator);
         const snapshot_elapsed = cio.nanoTimestamp() - snapshot_t0;
 
-        const needs_word_index = std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine");
+        // The word index powers codedb_word and BM25 ranked search. It must be
+        // built + persisted for `index` (so a later `mcp` can load it) and for
+        // `mcp` itself (so ranked/NL search works in the running server).
+        const needs_word_index = std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine") or
+            std.mem.eql(u8, cmd, "index") or std.mem.eql(u8, cmd, "mcp");
         if (snapshot_loaded) {
             if (std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "bench-engine")) {
                 loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
