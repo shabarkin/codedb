@@ -2933,3 +2933,91 @@ test "issue-447: searchContent surfaces large (>64KB) skip-trigram files for com
     }
     try testing.expect(found_canonical);
 }
+
+test "issue-1: mmap trigram index preserves heap candidates across writeToDisk round-trip" {
+    const alloc = testing.allocator;
+    var ti = TrigramIndex.init(alloc);
+    ti.owns_paths = true;
+    defer ti.deinit();
+
+    var name_buf: [64]u8 = undefined;
+    var content_buf: [128]u8 = undefined;
+    for (0..64) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "src/file_{d}.zig", .{i});
+        const content = if (i % 2 == 0)
+            try std.fmt.bufPrint(&content_buf, "const alpha_{d} = 1; // alphaomega marker\n", .{i})
+        else
+            try std.fmt.bufPrint(&content_buf, "const alpha_{d} = 1;\n", .{i});
+        try ti.indexFile(name, content);
+    }
+
+    const heap_cands = ti.candidates("alphaomega", alloc);
+    defer if (heap_cands) |c| alloc.free(c);
+    try testing.expect(heap_cands != null);
+    try testing.expectEqual(@as(usize, 32), heap_cands.?.len);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+
+    try ti.writeToDisk(io, dir_path, null);
+
+    var mmap_idx = MmapTrigramIndex.initFromDisk(io, dir_path, alloc) orelse
+        return error.MmapLoadFailed;
+    defer mmap_idx.deinit();
+
+    const mmap_cands = mmap_idx.candidates("alphaomega", alloc);
+    defer if (mmap_cands) |c| alloc.free(c);
+    try testing.expect(mmap_cands != null);
+    try testing.expectEqual(heap_cands.?.len, mmap_cands.?.len);
+}
+
+test "issue-PERSIST-1: snapshot fast restore keeps unmodified files searchable after another file changes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/test.snapshot", .{dir_path});
+    defer testing.allocator.free(snap_path);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "stable.zig", .data = "pub fn quietNeedleFn() void {}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "control.zig", .data = "pub fn controlFn() void {}\n" });
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var exp = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+        defer exp.deinit();
+        exp.setRoot(io, dir_path);
+        try exp.indexFile("stable.zig", "pub fn quietNeedleFn() void {}\n");
+        try exp.indexFile("control.zig", "pub fn controlFn() void {}\n");
+        try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, arena.allocator());
+    }
+
+    cio.sleepMs(10);
+    try tmp.dir.writeFile(io, .{ .sub_path = "control.zig", .data = "pub fn controlFn() void {} // touched\n" });
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var exp2 = Explorer.init(arena2.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    exp2.setRoot(io, dir_path);
+    var store2 = Store.init(testing.allocator);
+    defer store2.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store2, arena2.allocator()));
+
+    try testing.expect(exp2.outlines.contains("stable.zig"));
+
+    const results = try exp2.searchContent("quietNeedleFn", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len >= 1);
+}

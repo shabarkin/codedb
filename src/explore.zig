@@ -650,6 +650,7 @@ pub const Explorer = struct {
     allocator: std.mem.Allocator,
     word_index_complete: bool = true,
     word_index_can_load_from_disk: bool = false,
+    trigram_index_partial: bool = false,
     word_index_generation: u64 = 0,
     word_index_persisted_generation: u64 = 0,
     mu: cio.RwLock = .{},
@@ -2561,6 +2562,18 @@ pub const Explorer = struct {
         self.word_index = WordIndex.init(self.allocator);
         self.word_index_complete = false;
         self.word_index_can_load_from_disk = can_load_from_disk;
+    }
+
+    pub fn markTrigramIndexPartial(self: *Explorer) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.trigram_index_partial = true;
+    }
+
+    pub fn trigramIndexPartial(self: *Explorer) bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        return self.trigram_index_partial;
     }
 
     /// Declare that the current in-memory word_index holds the complete,

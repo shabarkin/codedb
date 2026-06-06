@@ -1357,22 +1357,92 @@ fn getDataDir(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8) ![
     return dir;
 }
 
+fn pruneCoveredSkipTrigramFilesLocked(explorer: *Explorer, allocator: std.mem.Allocator) bool {
+    var retained = std.StringHashMap(void).init(allocator);
+    var iter = explorer.skip_trigram_files.keyIterator();
+    while (iter.next()) |path_ptr| {
+        if (!explorer.trigram_index.containsFile(path_ptr.*)) {
+            retained.put(path_ptr.*, {}) catch {
+                retained.deinit();
+                return false;
+            };
+        }
+    }
+    explorer.skip_trigram_files.deinit();
+    explorer.skip_trigram_files = retained;
+    return true;
+}
+
+fn reindexPartialHeapIntoLoadedLocked(explorer: *Explorer, loaded: *TrigramIndex) void {
+    const OverlaySource = struct {
+        fn copy(ex: *Explorer, src: *TrigramIndex, dst: *TrigramIndex) void {
+            var iter = src.file_trigrams.keyIterator();
+            while (iter.next()) |path_ptr| {
+                const path = path_ptr.*;
+                const content = ex.contents.get(path) orelse continue;
+                dst.indexFile(path, content) catch {
+                    ex.skip_trigram_files.put(path, {}) catch {};
+                };
+            }
+        }
+    };
+
+    switch (explorer.trigram_index) {
+        .heap => |*heap| OverlaySource.copy(explorer, heap, loaded),
+        .mmap_overlay => |*mo| OverlaySource.copy(explorer, &mo.overlay, loaded),
+        .mmap => {},
+    }
+}
+
 fn loadTrigramFromDiskIfPresent(io: std.Io, explorer: *Explorer, data_dir: []const u8, allocator: std.mem.Allocator) void {
     explorer.mu.lockShared();
-    const already_loaded = explorer.trigram_index.fileCount() > 0;
+    const already_loaded = explorer.trigram_index.fileCount() > 0 and !explorer.trigram_index_partial;
     explorer.mu.unlockShared();
     if (already_loaded) return;
 
     if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.mu.lock();
         defer explorer.mu.unlock();
-        explorer.trigram_index.deinit();
-        explorer.trigram_index = .{ .mmap = loaded };
+        if (explorer.trigram_index_partial) {
+            switch (explorer.trigram_index) {
+                .heap => {
+                    const overlay = explorer.trigram_index.heap;
+                    explorer.trigram_index = .{ .mmap_overlay = .{
+                        .base = loaded,
+                        .overlay = overlay,
+                    } };
+                },
+                else => {
+                    explorer.trigram_index.deinit();
+                    explorer.trigram_index = .{ .mmap = loaded };
+                },
+            }
+            if (pruneCoveredSkipTrigramFilesLocked(explorer, allocator)) {
+                explorer.trigram_index_partial = false;
+            }
+        } else {
+            explorer.trigram_index.deinit();
+            explorer.trigram_index = .{ .mmap = loaded };
+        }
     } else if (TrigramIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
+        var heap_loaded = loaded;
         explorer.mu.lock();
-        defer explorer.mu.unlock();
+        if (explorer.trigram_index_partial) {
+            reindexPartialHeapIntoLoadedLocked(explorer, &heap_loaded);
+        }
         explorer.trigram_index.deinit();
-        explorer.trigram_index = .{ .heap = loaded };
+        explorer.trigram_index = .{ .heap = heap_loaded };
+        const should_clear_partial = explorer.trigram_index_partial and pruneCoveredSkipTrigramFilesLocked(explorer, allocator);
+        if (should_clear_partial) explorer.trigram_index_partial = false;
+        explorer.mu.unlock();
+
+        const disk_git_head = blk: {
+            const header = TrigramIndex.readDiskHeader(io, data_dir, allocator) catch null;
+            break :blk if (header) |h| h.git_head else null;
+        };
+        explorer.mu.lockShared();
+        explorer.trigram_index.writeToDisk(io, data_dir, disk_git_head) catch {};
+        explorer.mu.unlockShared();
     }
 }
 

@@ -1330,20 +1330,11 @@ pub const TrigramIndex = struct {
         var disk_path_to_id = std.StringHashMap(u32).init(self.allocator);
         defer disk_path_to_id.deinit();
 
-        if (self.file_trigrams.count() > 0) {
-            var ft_iter = self.file_trigrams.keyIterator();
-            while (ft_iter.next()) |path_ptr| {
-                const id: u32 = @intCast(file_table.items.len);
-                try file_table.append(self.allocator, path_ptr.*);
-                try disk_path_to_id.put(path_ptr.*, id);
-            }
-        } else {
-            for (self.id_to_path.items) |path| {
-                if (path.len == 0) continue;
-                const id: u32 = @intCast(file_table.items.len);
-                try file_table.append(self.allocator, path);
-                try disk_path_to_id.put(path, id);
-            }
+        for (self.id_to_path.items) |path| {
+            if (path.len == 0) continue;
+            const id: u32 = @intCast(file_table.items.len);
+            try file_table.append(self.allocator, path);
+            try disk_path_to_id.put(path, id);
         }
 
         const file_count: u32 = @intCast(file_table.items.len);
@@ -1817,6 +1808,23 @@ pub const MmapTrigramIndex = struct {
             if (i > 0 and tri <= prev_tri) return null;
             prev_tri = tri;
             if (@as(u64, offset) + @as(u64, count) > total_postings) return null;
+
+            var prev_file_id: ?u32 = null;
+            for (0..count) |j| {
+                const posting_index: usize = @as(usize, offset) + j;
+                const pb_off = postings_start + posting_index * posting_size;
+                if (pb_off + posting_size > postings_data.len) return null;
+                const raw = postings_data[pb_off..][0..posting_size];
+                const file_id: u32 = if (post_version >= 3)
+                    std.mem.readInt(u32, raw[0..4], .little)
+                else
+                    std.mem.readInt(u16, raw[0..2], .little);
+                if (file_id >= file_count) return null;
+                if (prev_file_id) |prev| {
+                    if (file_id <= prev) return null;
+                }
+                prev_file_id = file_id;
+            }
         }
 
         return MmapTrigramIndex{
