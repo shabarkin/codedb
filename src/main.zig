@@ -1436,6 +1436,13 @@ fn loadTrigramFromDiskIfPresent(io: std.Io, explorer: *Explorer, data_dir: []con
         if (should_clear_partial) explorer.trigram_index_partial = false;
         explorer.mu.unlock();
 
+        const disk_git_head = blk: {
+            const header = TrigramIndex.readDiskHeader(io, data_dir, allocator) catch null;
+            break :blk if (header) |h| h.git_head else null;
+        };
+        explorer.mu.lockShared();
+        explorer.trigram_index.writeToDisk(io, data_dir, disk_git_head) catch {};
+        explorer.mu.unlockShared();
     }
 }
 
