@@ -647,6 +647,71 @@ test "issue-M3: status files count excludes never-indexed files after initial sc
     try testing.expectEqual(explorer.outlines.count(), store.files.count());
 }
 
+test "watcher: parallel word-index shards match sequential (skip_file_words)" {
+    // Exercises the per-worker WordIndex shard + serial mergeShard path
+    // (use_shards requires word_index.enabled and skip_file_words). Asserts the
+    // sharded parallel build is byte-identical to the single-worker serial build
+    // for both raw word hits and BM25 ranked results.
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(io, "src");
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "src/a.zig", .data = "const std = @import(\"std\");\npub fn parseToken() void {}\n// TODO alpha\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "src/b.zig", .data = "pub fn parseToken() void {}\npub fn handleRequest() void {}\n// TODO beta\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "src/c.py", .data = "def parse_token():\n    return handle_request()\n# TODO gamma\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "src/d.md", .data = "# parseToken and handleRequest notes\nTODO delta\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "src/e.zig", .data = "pub fn handleRequest() void { parseToken(); }\n" });
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPathFile(io, ".", &root_buf);
+    const root = root_buf[0..root_len];
+
+    var store_seq = Store.init(testing.allocator);
+    defer store_seq.deinit();
+    var explorer_seq = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_seq.deinit();
+    explorer_seq.word_index.skip_file_words = true;
+    explorer_seq.setRoot(io, root);
+    try watcher.initialScanWithWorkerCount(io, &store_seq, &explorer_seq, root, testing.allocator, false, 1);
+
+    var store_par = Store.init(testing.allocator);
+    defer store_par.deinit();
+    var explorer_par = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_par.deinit();
+    explorer_par.word_index.skip_file_words = true;
+    explorer_par.setRoot(io, root);
+    try watcher.initialScanWithWorkerCount(io, &store_par, &explorer_par, root, testing.allocator, false, 4);
+
+    // Word-index structural parity.
+    try testing.expectEqual(explorer_seq.word_index.id_to_path.items.len, explorer_par.word_index.id_to_path.items.len);
+    try testing.expectEqual(explorer_seq.word_index.total_tokens, explorer_par.word_index.total_tokens);
+    for ([_][]const u8{ "parsetoken", "parse", "token", "handlerequest", "handle", "request", "todo", "std" }) |term| {
+        try testing.expectEqual(explorer_seq.word_index.search(term).len, explorer_par.word_index.search(term).len);
+    }
+
+    // BM25 ranked-search parity: identical ordered result set (path + line).
+    const r_seq = try explorer_seq.searchContentRanked("parseToken handleRequest", testing.allocator, 10);
+    defer {
+        for (r_seq) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(r_seq);
+    }
+    const r_par = try explorer_par.searchContentRanked("parseToken handleRequest", testing.allocator, 10);
+    defer {
+        for (r_par) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(r_par);
+    }
+    try testing.expectEqual(r_seq.len, r_par.len);
+    for (r_seq, r_par) |a, b| {
+        try testing.expectEqualStrings(a.path, b.path);
+        try testing.expectEqual(a.line_num, b.line_num);
+    }
+}
 
 test "edit: range_start zero is invalid" {
     var tmp = testing.tmpDir(.{});

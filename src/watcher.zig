@@ -4,6 +4,7 @@ const cio = @import("cio.zig");
 const Store = @import("store.zig").Store;
 const Explorer = @import("explore.zig").Explorer;
 const TrigramIndex = @import("index.zig").TrigramIndex;
+const WordIndex = @import("index.zig").WordIndex;
 const explore_mod = @import("explore.zig");
 const git_mod = @import("git.zig");
 const path_security = @import("path_security.zig");
@@ -532,12 +533,37 @@ fn parseInitialScanEntry(io: std.Io, root: []const u8, entry: InitialScanEntry, 
     };
 }
 
-fn initialScanWorker(io: std.Io, results: *WorkerParsedResults, root: []const u8, entries: []const InitialScanEntry) void {
-    const arena_alloc = results.arena.allocator();
+fn initialScanWorker(io: std.Io, results: *WorkerParsedResults, root: []const u8, entries: []const InitialScanEntry, word_shard: ?*WordIndex) void {
+    const persist = results.arena.allocator();
+    // Parse each file in a per-file scratch arena that is reset between files,
+    // then copy only the keep-data (content + outline) into the persistent
+    // results arena. parseContentForIndexing allocates large transient parse
+    // state (AST/token buffers) that is not part of the returned content/outline;
+    // without resetting per file, a worker's arena retains every file's
+    // transients chunk-wide (high-water-mark, never reclaimed), which dominated
+    // initial-scan RSS on large repos (~4.3GB -> contents+outline only).
+    // The results arena (and thus the clone) is touched by this worker only, so
+    // the copy is race-free; commit on the main thread re-dups both anyway.
+    //
+    // When word_shard is set, also build the WordIndex for this chunk in parallel
+    // here (lock-free, content is hot) instead of on the serial commit thread.
+    // Files are indexed in chunk order, matching the order commit/mergeShard will
+    // assign global doc_ids, so the merged index is identical to the serial path.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
     for (entries) |entry| {
-        const parsed = parseInitialScanEntry(io, root, entry, arena_alloc) catch null;
+        _ = scratch.reset(.retain_capacity);
+        const parsed = parseInitialScanEntry(io, root, entry, scratch.allocator()) catch null;
         if (parsed) |file| {
-            results.items.append(arena_alloc, file) catch return;
+            const content_copy = persist.dupe(u8, file.content) catch continue;
+            const outline_copy = explore_mod.Explorer.cloneOutline(&file.outline, persist) catch continue;
+            results.items.append(persist, .{
+                .path = file.path,
+                .content = content_copy,
+                .outline = outline_copy,
+                .skip_trigram = file.skip_trigram,
+            }) catch continue;
+            if (word_shard) |ws| ws.indexFile(file.path, content_copy) catch {};
         }
     }
 }
@@ -578,6 +604,18 @@ pub fn initialScanWithWorkerCount(io: std.Io, store: *Store, explorer: *Explorer
     const threads = try allocator.alloc(std.Thread, n_workers);
     defer allocator.free(threads);
 
+    // When the word index is enabled (cold `index`/`mcp` path), build it in
+    // parallel per-worker shards backed by each worker's arena, then merge the
+    // shards on the main thread after commit. This moves the word-index build —
+    // the dominant cost of the otherwise-serial commit loop — into the parallel
+    // region. Gated on skip_file_words because shards intentionally omit the
+    // per-file word set (file_words), so they only fit the bulk cold-index build
+    // (which never needs incremental removeFile); main.zig always sets it. Other
+    // paths keep the old serial behavior with zero overhead.
+    const use_shards = explorer.word_index.enabled and explorer.word_index.skip_file_words;
+    const shards: ?[]WordIndex = if (use_shards) try allocator.alloc(WordIndex, n_workers) else null;
+    defer if (shards) |sh| allocator.free(sh);
+
     const chunk_size = entries.items.len / n_workers;
     const remainder = entries.items.len % n_workers;
     var offset: usize = 0;
@@ -587,16 +625,29 @@ pub fn initialScanWithWorkerCount(io: std.Io, store: *Store, explorer: *Explorer
         const count = chunk_size + extra;
         const chunk = entries.items[offset .. offset + count];
         offset += count;
-        threads[i] = try std.Thread.spawn(.{}, initialScanWorker, .{ io, worker, root, chunk });
+        var shard_ptr: ?*WordIndex = null;
+        if (shards) |sh| {
+            sh[i] = WordIndex.init(worker.arena.allocator());
+            sh[i].skip_file_words = true;
+            shard_ptr = &sh[i];
+        }
+        threads[i] = try std.Thread.spawn(.{}, initialScanWorker, .{ io, worker, root, chunk, shard_ptr });
     }
     for (threads) |thread| thread.join();
 
-    for (workers) |*worker| {
+    // Commit outlines/contents/deps/symbol serially (those mutate shared maps);
+    // word indexing is deferred and folded in per worker via mergeShard, so the
+    // global doc_ids land in chunk order — identical to the single-worker path.
+    if (use_shards) explorer.defer_word_index = true;
+    defer explorer.defer_word_index = false;
+    for (workers, 0..) |*worker, wi| {
         for (worker.items.items) |file| {
             try explorer.commitParsedFileOwnedOutline(file.path, file.content, file.outline, true, file.skip_trigram);
         }
+        if (shards) |sh| try explorer.word_index.mergeShard(&sh[wi]);
         // Free this worker's arena immediately — releases pages to OS,
-        // prevents holding all workers' content simultaneously.
+        // prevents holding all workers' content simultaneously. (This also
+        // frees the worker's word shard, which mergeShard has copied out.)
         worker.deinit(allocator);
         workers_committed += 1;
     }
@@ -899,7 +950,7 @@ pub fn initialScanWithTrigrams(
             const count = chunk_size + extra;
             const chunk = entries.items[offset .. offset + count];
             offset += count;
-            threads[i] = try std.Thread.spawn(.{}, initialScanWorker, .{ io, worker, root, chunk });
+            threads[i] = try std.Thread.spawn(.{}, initialScanWorker, .{ io, worker, root, chunk, null });
         }
         for (threads) |thread| thread.join();
 

@@ -254,6 +254,50 @@ pub const WordIndex = struct {
         self.total_tokens += doc_token_count;
     }
 
+    /// Fold a shard (a WordIndex built in parallel over a disjoint, contiguous
+    /// set of documents) into self. The shard's local doc_ids [0, shard.len)
+    /// are remapped to global ids [base, base + shard.len), where base is self's
+    /// current doc count — so merging shards in worker order reproduces the exact
+    /// doc_id assignment of the serial (single-worker) path. Keys/paths are
+    /// re-duped into self.allocator since the shard is arena-backed and freed
+    /// after merge. Postings stay doc_id-ascending (shard lists are ascending and
+    /// each shard's global range follows the previous one). See the per-worker
+    /// shard build in watcher.initialScanWithWorkerCount.
+    pub fn mergeShard(self: *WordIndex, shard: *WordIndex) !void {
+        const base: u32 = @intCast(self.id_to_path.items.len);
+
+        // Paths + per-doc lengths.
+        for (shard.id_to_path.items, 0..) |path, local| {
+            const global_id: u32 = base + @as(u32, @intCast(local));
+            const duped = try self.allocator.dupe(u8, path);
+            errdefer self.allocator.free(duped);
+            try self.id_to_path.append(self.allocator, duped);
+            try self.path_to_id.put(duped, global_id);
+            if (shard.doc_lengths.get(@intCast(local))) |len| {
+                try self.doc_lengths.put(global_id, len);
+            }
+        }
+
+        // Postings: append each shard term's hits with doc_id offset by base.
+        var it = shard.index.iterator();
+        while (it.next()) |entry| {
+            const term = entry.key_ptr.*;
+            const shard_hits = entry.value_ptr.items;
+            const gop = try self.index.getOrPut(term);
+            if (!gop.found_existing) {
+                const dterm = try self.allocator.dupe(u8, term);
+                gop.key_ptr.* = dterm;
+                gop.value_ptr.* = .empty;
+            }
+            try gop.value_ptr.ensureUnusedCapacity(self.allocator, shard_hits.len);
+            for (shard_hits) |h| {
+                gop.value_ptr.appendAssumeCapacity(.{ .doc_id = base + h.doc_id, .line_num = h.line_num });
+            }
+        }
+
+        self.total_tokens += shard.total_tokens;
+    }
+
     /// Look up all hits for a word. O(1) lookup + O(hits) iteration.
     /// Query is normalized to lowercase (all index keys are stored lowercase).
     pub fn search(self: *WordIndex, word: []const u8) []const WordHit {
@@ -1166,35 +1210,39 @@ pub const TrigramIndex = struct {
             if (write == 0) break; // early exit if intersection is empty
         }
 
+        // Bloom-filter refinement. Hoist the per-consecutive-pair trigram packing
+        // and posting-list hash probes out of the per-candidate loop — they depend
+        // only on the query, not on doc_id — leaving just the two getByDocId binary
+        // searches per candidate. Result set is bit-identical to the inline version.
+        const Pair = struct { list_a: ?*PostingList, list_b: ?*PostingList, next_bit: u8 };
+        var pairs: []Pair = &.{};
+        defer if (pairs.len > 0) allocator.free(pairs);
+        if (tri_count >= 2) {
+            pairs = allocator.alloc(Pair, tri_count - 1) catch return null;
+            for (pairs, 0..) |*pair, j| {
+                pair.* = .{
+                    .list_a = self.index.getPtr(packTrigram(normalizeChar(query[j]), normalizeChar(query[j + 1]), normalizeChar(query[j + 2]))),
+                    .list_b = self.index.getPtr(packTrigram(normalizeChar(query[j + 1]), normalizeChar(query[j + 2]), normalizeChar(query[j + 3]))),
+                    .next_bit = @as(u8, 1) << @intCast(normalizeChar(query[j + 3]) % 8),
+                };
+            }
+        }
+
         var result: std.ArrayList([]const u8) = .empty;
         errdefer result.deinit(allocator);
         result.ensureTotalCapacity(allocator, result_ids.items.len) catch return null;
 
         next_cand: for (result_ids.items) |doc_id| {
-            // Bloom-filter check for consecutive trigram pairs
-            if (tri_count >= 2) {
-                for (0..tri_count - 1) |j| {
-                    const tri_a = packTrigram(
-                        normalizeChar(query[j]),
-                        normalizeChar(query[j + 1]),
-                        normalizeChar(query[j + 2]),
-                    );
-                    const tri_b = packTrigram(
-                        normalizeChar(query[j + 1]),
-                        normalizeChar(query[j + 2]),
-                        normalizeChar(query[j + 3]),
-                    );
-                    const list_a = self.index.getPtr(tri_a) orelse continue;
-                    const list_b = self.index.getPtr(tri_b) orelse continue;
-                    const mask_a = list_a.getByDocId(doc_id) orelse continue;
-                    const mask_b = list_b.getByDocId(doc_id) orelse continue;
+            for (pairs) |pair| {
+                const list_a = pair.list_a orelse continue;
+                const list_b = pair.list_b orelse continue;
+                const mask_a = list_a.getByDocId(doc_id) orelse continue;
+                const mask_b = list_b.getByDocId(doc_id) orelse continue;
 
-                    const next_bit: u8 = @as(u8, 1) << @intCast(normalizeChar(query[j + 3]) % 8);
-                    if ((mask_a.next_mask & next_bit) == 0) continue :next_cand;
+                if ((mask_a.next_mask & pair.next_bit) == 0) continue :next_cand;
 
-                    const rotated = (mask_a.loc_mask << 1) | (mask_a.loc_mask >> 7);
-                    if ((rotated & mask_b.loc_mask) == 0) continue :next_cand;
-                }
+                const rotated = (mask_a.loc_mask << 1) | (mask_a.loc_mask >> 7);
+                if ((rotated & mask_b.loc_mask) == 0) continue :next_cand;
             }
 
             if (doc_id < self.id_to_path.items.len) {

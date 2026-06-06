@@ -52,6 +52,22 @@ pub fn approxIndexSizeBytes(explorer: *const Explorer) u64 {
     return total;
 }
 
+/// Fast hash context for u32-keyed maps on hot paths (ranked search aggregation).
+/// Zig's AutoHashMap runs the 4 key bytes through Wyhash even for an integer key;
+/// std.hash.int is a couple of multiply/shift/xor ops with full avalanche. Pure
+/// Context swap — identical map semantics, behavior-preserving. (FxHash precedent.)
+const U32Context = struct {
+    pub fn hash(_: U32Context, k: u32) u64 {
+        return std.hash.int(@as(u64, k));
+    }
+    pub fn eql(_: U32Context, a: u32, b: u32) bool {
+        return a == b;
+    }
+};
+fn U32HashMap(comptime V: type) type {
+    return std.HashMap(u32, V, U32Context, std.hash_map.default_max_load_percentage);
+}
+
 pub const SymbolKind = enum(u8) {
     function,
     struct_def,
@@ -753,6 +769,10 @@ pub const Explorer = struct {
     trigram_index_partial: bool = false,
     word_index_generation: u64 = 0,
     word_index_persisted_generation: u64 = 0,
+    /// When true, commitParsedFileOwnedOutline skips word_index.indexFile — the
+    /// caller is building the word index in parallel per-worker shards and will
+    /// merge them after the commit loop (see watcher.initialScanWithWorkerCount).
+    defer_word_index: bool = false,
     mu: cio.RwLock = .{},
     root_dir: ?std.Io.Dir = null,
     root_real: []u8 = &.{},
@@ -910,7 +930,7 @@ pub const Explorer = struct {
             if (!self.word_index_complete) {
                 self.word_index_can_load_from_disk = false;
             }
-            try self.word_index.indexFile(stable_path, content);
+            if (!self.defer_word_index) try self.word_index.indexFile(stable_path, content);
             // If trigram indexing fails below, restore word_index to its previous state
             // to prevent word_index and trigram_index from diverging.
             errdefer if (prior_content) |old| {
@@ -949,7 +969,7 @@ pub const Explorer = struct {
         }
 
         try self.rebuildDepsFor(stable_path, &persistent_outline);
-        self.rebuildSymbolIndexFor(stable_path, &persistent_outline);
+        self.rebuildSymbolIndexFor(stable_path, &persistent_outline, !is_new);
 
         outline_gop.value_ptr.* = persistent_outline;
         if (prior_outline) |*old_outline| old_outline.deinit();
@@ -2905,7 +2925,7 @@ pub const Explorer = struct {
         }
     }
 
-    fn cloneOutline(src: *const FileOutline, allocator: std.mem.Allocator) !FileOutline {
+    pub fn cloneOutline(src: *const FileOutline, allocator: std.mem.Allocator) !FileOutline {
         const copied_path = try allocator.dupe(u8, src.path);
         // No errdefer here: dst.deinit() below handles freeing copied_path via owns_path.
 
@@ -3781,6 +3801,11 @@ pub const Explorer = struct {
         // BM25 constants.
         const k1: f32 = 1.2;
         const b: f32 = 0.75;
+        // BM25+ (Lv & Zhai 2011) lower-bound on the TF term: every matching term
+        // contributes at least idf*delta regardless of length normalization, so
+        // long source files that genuinely match aren't penalized toward zero
+        // (a known BM25 weakness). delta=0.5 matches bm25s's BM25+/BM25L default.
+        const bm25_plus_delta: f32 = 0.5;
         // Fall back to the total indexed-doc count when the per-doc length
         // table is empty (the bulk `codedb index` path writes the disk word
         // index without doc lengths) so ranked search still returns idf-weighted
@@ -3797,7 +3822,7 @@ pub const Explorer = struct {
             best_line: u32,
             best_line_hits: u32,
         };
-        var per_doc = std.AutoHashMap(u32, DocAgg).init(ta);
+        var per_doc = U32HashMap(DocAgg).init(ta);
 
         // For each unique query term, look up its posting list once,
         // compute df and per-doc tf in a single pass.
@@ -3810,8 +3835,8 @@ pub const Explorer = struct {
             // df: distinct doc_ids in this posting list. tf: count of (term,doc)
             // entries (each entry is a distinct line per indexFile dedup).
             // line_hits: per-doc map of line_num → count for best-line picking.
-            var doc_tf = std.AutoHashMap(u32, u32).init(ta);
-            var doc_best_line = std.AutoHashMap(u32, struct { line: u32, count: u32 }).init(ta);
+            var doc_tf = U32HashMap(u32).init(ta);
+            var doc_best_line = U32HashMap(struct { line: u32, count: u32 }).init(ta);
             for (hits) |h| {
                 const tf_gop = try doc_tf.getOrPut(h.doc_id);
                 if (!tf_gop.found_existing) tf_gop.value_ptr.* = 0;
@@ -3842,7 +3867,8 @@ pub const Explorer = struct {
                 const dl_raw = self.word_index.docLength(doc_id);
                 const dl: f32 = if (dl_raw == 0) 1.0 else @floatFromInt(dl_raw);
                 const norm = 1.0 - b + b * (dl / avgdl);
-                const term_score = idf * (tf * (k1 + 1.0)) / (tf + k1 * norm);
+                const tf_sat = (tf * (k1 + 1.0)) / (tf + k1 * norm);
+                const term_score = idf * (tf_sat + bm25_plus_delta);
 
                 const ln_info = doc_best_line.get(doc_id) orelse continue;
                 const agg_gop = try per_doc.getOrPut(doc_id);
@@ -3879,12 +3905,19 @@ pub const Explorer = struct {
                 .best_line = entry.value_ptr.best_line,
             });
         }
-        std.sort.block(Cand, cands.items, {}, struct {
-            pub fn lt(_: void, a: Cand, b_: Cand) bool {
-                if (a.score != b_.score) return a.score > b_.score;
-                return a.doc_id < b_.doc_id;
+        // Lazy top-k via a max-heap: pop candidates in (score desc, doc_id asc)
+        // order and materialize until max_results survive. Same ordering and
+        // skip-and-continue semantics as a full sort over all candidates, but only
+        // pops ~max_results of them — O(C + (k+skips)·log C) instead of O(C·log C)
+        // for the common case k ≪ C (bm25s-style top-k retrieval).
+        const candLess = struct {
+            fn order(_: void, a: Cand, b_: Cand) std.math.Order {
+                if (a.score != b_.score) return if (a.score > b_.score) .lt else .gt;
+                return std.math.order(a.doc_id, b_.doc_id);
             }
-        }.lt);
+        }.order;
+        var heap = std.PriorityQueue(Cand, void, candLess).fromOwnedSlice(try cands.toOwnedSlice(ta), {});
+        defer heap.deinit(ta);
 
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer {
@@ -3894,10 +3927,10 @@ pub const Explorer = struct {
             }
             result_list.deinit(allocator);
         }
-        try result_list.ensureTotalCapacity(allocator, @min(max_results, cands.items.len));
+        try result_list.ensureTotalCapacity(allocator, @min(max_results, heap.count()));
 
-        for (cands.items) |c| {
-            if (result_list.items.len >= max_results) break;
+        while (result_list.items.len < max_results) {
+            const c = heap.pop() orelse break;
             const path = self.word_index.id_to_path.items[c.doc_id];
             if (path.len == 0) continue;
             const ref = self.readContentForSearch(path, allocator) orelse continue;
@@ -5319,8 +5352,12 @@ pub const Explorer = struct {
         try self.dep_graph.setOwnedDeps(path, deps);
     }
 
-    fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline) void {
-        self.removeSymbolIndexFor(path);
+    fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline, had_prior: bool) void {
+        // removeSymbolIndexFor scans the entire global symbol index, so calling
+        // it per file makes a cold scan O(files * total_symbols). A brand-new
+        // path has no prior entries to evict, so skip the scan entirely — only
+        // re-indexed (already-present) files need the removal.
+        if (had_prior) self.removeSymbolIndexFor(path);
         for (outline.symbols.items) |sym| {
             const gop = self.symbol_index.getOrPut(sym.name) catch continue;
             if (!gop.found_existing) {
