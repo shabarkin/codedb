@@ -3708,6 +3708,34 @@ pub const Explorer = struct {
     /// (k1=1.2, b=0.75), and emits one SearchResult per top-N document with
     /// the best-tf line for any query term in that doc. Existing scan-order
     /// `searchContent` is unaffected.
+    /// Relevance multiplier on BM25 scores for code-intelligence search: boost
+    /// files whose name/path matches a query term, and down-weight tests, docs,
+    /// and vendored copies (they still surface if strongly relevant).
+    fn pathRelevanceMultiplier(path: []const u8, terms: *const std.StringHashMap(void)) f32 {
+        var mult: f32 = 1.0;
+        const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
+        var lb: [256]u8 = undefined;
+        if (base.len <= lb.len) {
+            for (base, 0..) |c, i| lb[i] = std.ascii.toLower(c);
+            var it = terms.keyIterator();
+            while (it.next()) |t| {
+                if (t.*.len >= 3 and std.mem.indexOf(u8, lb[0..base.len], t.*) != null) {
+                    mult *= 1.6;
+                    break;
+                }
+            }
+        }
+        const is_test = std.mem.startsWith(u8, base, "test") or
+            std.mem.indexOf(u8, base, "_test") != null or
+            std.mem.indexOf(u8, path, "/test") != null;
+        if (is_test) mult *= 0.6;
+        if (std.mem.endsWith(u8, path, ".md") or std.mem.indexOf(u8, path, "/docs/") != null) mult *= 0.6;
+        if (std.mem.indexOf(u8, path, "node_modules") != null or
+            std.mem.indexOf(u8, path, "/vendor/") != null or
+            std.mem.indexOf(u8, path, "zig-pkg") != null) mult *= 0.4;
+        return mult;
+    }
+
     pub fn searchContentRanked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
         self.mu.lockShared();
         defer self.mu.unlockShared();
@@ -3843,9 +3871,11 @@ pub const Explorer = struct {
         try cands.ensureTotalCapacity(ta, per_doc.count());
         var pd_iter = per_doc.iterator();
         while (pd_iter.next()) |entry| {
+            const cand_doc_id = entry.key_ptr.*;
+            const cand_path = if (cand_doc_id < self.word_index.id_to_path.items.len) self.word_index.id_to_path.items[cand_doc_id] else "";
             cands.appendAssumeCapacity(.{
-                .doc_id = entry.key_ptr.*,
-                .score = entry.value_ptr.score,
+                .doc_id = cand_doc_id,
+                .score = entry.value_ptr.score * pathRelevanceMultiplier(cand_path, &terms_set),
                 .best_line = entry.value_ptr.best_line,
             });
         }

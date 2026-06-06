@@ -600,7 +600,7 @@ pub const tools_list =
     \\{"name":"codedb_tree","description":"Whole-repo file tree with per-file language, line counts, and symbol counts. Use to orient in an unfamiliar project.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_outline","description":"Symbol outline of one file: functions, structs, enums, imports, consts with line numbers. 4-15x smaller than reading the raw file. Run before codedb_read to find the lines you actually need.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_symbol","description":"Find where a named symbol is defined across the index. Returns file, line, and kind. Pass body=true for source. Pick this over codedb_search when you have an exact identifier.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
-    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 20, max: 10000 - higher values are clamped)"},"max_per_file":{"type":"integer","description":"Optional per-file result cap override. Default widens automatically when only one file matches."},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig', 'src/**/*.zig', or '**/*.{yaml,yml}'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
+    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Page size (default: 20, max: 10000 - higher values are clamped)"},"offset":{"type":"integer","description":"Pagination offset into ranked results (default: 0). When more results exist, the response ends with a 'more results ... offset=N' line; pass that offset to get the next page."},"max_per_file":{"type":"integer","description":"Optional per-file result cap override. Default widens automatically when only one file matches."},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig', 'src/**/*.zig', or '**/*.{yaml,yml}'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
     \\{"name":"codedb_word","description":"Identifier/sub-token lookup via inverted index — O(1) access to one token and its occurrences. Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Identifier or sub-token to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
     \\{"name":"codedb_callers","description":"Heuristic call-site finder for a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum likely call sites to return (default: 30, max: 10000)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
     \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
@@ -1470,6 +1470,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     const requested_max_results = getInt(args, "max_results");
     const max_results: usize = if (requested_max_results) |n| @intCast(@max(1, @min(n, 10000))) else 20;
     const requested_max_per_file: ?usize = if (getInt(args, "max_per_file")) |n| @intCast(@max(1, @min(n, 10000))) else null;
+    const offset_n: usize = if (getInt(args, "offset")) |n| @intCast(@max(0, @min(n, 100000))) else 0;
     const scope = getBool(args, "scope");
     const compact = getBool(args, "compact");
     const paths_only = getBool(args, "paths_only");
@@ -1676,7 +1677,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     } else {
-        if (path_glob == null and !compact) {
+        if (offset_n == 0 and path_glob == null and !compact) {
             const rendered = explorer.renderPlainSearch(query, alloc, out, max_results, paths_only, requested_max_per_file) catch {
                 out.appendSlice(alloc, "error: search failed") catch {};
                 return;
@@ -1689,20 +1690,30 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         // returns nothing for a phrase. Single-token queries keep literal
         // substring matching so exact-identifier lookups still work.
         const multiword = std.mem.indexOfScalar(u8, query, ' ') != null;
-        const results = (if (multiword)
-            explorer.searchContentRanked(query, alloc, max_results)
+        // Over-fetch by `offset` (+1) so we can page into a stable window and
+        // detect whether more results exist beyond this page. BM25 ranking is
+        // deterministic per query, so the offset is a stable, stateless cursor.
+        const fetch_count = @min(offset_n + max_results + 1, 100000);
+        var paged_literal_options = literal_options;
+        paged_literal_options.max_results = fetch_count;
+        const fetched = (if (multiword)
+            explorer.searchContentRanked(query, alloc, fetch_count)
         else
-            explorer.searchContentWithOptions(query, alloc, literal_options)) catch {
+            explorer.searchContentWithOptions(query, alloc, paged_literal_options)) catch {
             out.appendSlice(alloc, "error: search failed") catch {};
             return;
         };
         defer {
-            for (results) |r| {
+            for (fetched) |r| {
                 alloc.free(r.line_text);
                 alloc.free(r.path);
             }
-            alloc.free(results);
+            alloc.free(fetched);
         }
+        const page_lo = @min(offset_n, fetched.len);
+        const page_hi = @min(offset_n + max_results, fetched.len);
+        const results = fetched[page_lo..page_hi];
+        const has_more = fetched.len > page_hi;
 
         // Issue #422: header reflects post-filter count; "truncated" footer
         // only fires for per-file-cap, not for glob/compact filtering.
@@ -1719,6 +1730,9 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         out.ensureUnusedCapacity(alloc, 2048) catch {};
         const w = cio.listWriter(out, alloc);
         w.print("{d} results for '{s}':\n", .{ visible_total, query }) catch {};
+        if (has_more) {
+            w.print("  (more results — codedb_search query='{s}' offset={d} for the next page)\n", .{ query, page_hi }) catch {};
+        }
         if (simple_unfiltered and results.len <= 64) {
             const CountEntry = struct { path: []const u8, count: usize };
             var counts: [64]CountEntry = undefined;
