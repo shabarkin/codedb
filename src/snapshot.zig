@@ -782,6 +782,7 @@ fn insertRestoredFile(
     try explorer.contents.put(path, content);
 
     try rebuildDepsFromOutline(explorer, pending_outlines, path, &restored_outline, allocator);
+    try explorer.skip_trigram_files.put(outline_gop.key_ptr.*, {});
 }
 
 fn loadSnapshotFast(
@@ -810,6 +811,7 @@ fn loadSnapshotFast(
     const snap_mtime: i128 = @intCast(file_stat.mtime.nanoseconds);
     var bytes_read: u64 = 0;
     var file_count: u32 = 0;
+    var restored_file_count: u32 = 0;
     var word_index_can_load_from_disk = true;
     while (bytes_read < content_entry.length) {
         var pl_buf: [2]u8 = undefined;
@@ -892,6 +894,7 @@ fn loadSnapshotFast(
                 allocator.free(content);
                 continue;
             };
+            restored_file_count += 1;
             const hash = std.hash.Wyhash.hash(0, content);
             _ = store.recordSnapshot(removed.key, content.len, hash) catch {};
             allocator.free(content);
@@ -918,6 +921,7 @@ fn loadSnapshotFast(
 
     if (outline_states.count() != 0) return false;
 
+    if (restored_file_count > 0) explorer.markTrigramIndexPartial();
     explorer.markWordIndexIncomplete(word_index_can_load_from_disk);
 
     if (sections.get(@intFromEnum(SectionId.freq_table))) |freq_entry| {
