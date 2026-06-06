@@ -2637,6 +2637,7 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         return;
     };
     defer if (result.preview) |p| alloc.free(p);
+    defer if (result.health) |h| alloc.free(h);
 
     const w = cio.listWriter(out, alloc);
     if (req.dry_run) {
@@ -2647,6 +2648,10 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     } else {
         w.print("edit applied: seq={d}, size={d}, hash:{x}", .{ result.seq, result.new_size, result.new_hash }) catch {};
     }
+    // Advisory syntax-health warning (trial/graph-based-codedb): surface a
+    // mis-spliced multi-line edit so the agent can re-read and fix before
+    // declaring the task done, instead of shipping an unparseable file.
+    if (result.health) |h| out.appendSlice(alloc, h) catch {};
 }
 
 fn handleChanges(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store) void {

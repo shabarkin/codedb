@@ -380,6 +380,122 @@ test "issue-409: replacing whole file with empty content leaves a stray newline"
 }
 
 
+// ── Post-edit syntax health (trial/graph-based-codedb) ────────────────────
+
+test "edit-health: flags unmatched close from a mis-spliced import edit (httpx-style)" {
+    // Faithful to the real codedb httpx break: regenerating a
+    // `from x import (...)` block left a duplicate ')' after the close,
+    // making httpx/_models.py unparseable (SyntaxError: unmatched ')').
+    const broken =
+        \\from ._exceptions import (
+        \\    CookieConflict,
+        \\    DecodingError,
+        \\    StreamConsumed,
+        \\)
+        \\)
+        \\x = 1
+    ;
+    const msg = (try edit_mod.describeHealth(testing.allocator, broken, .python)).?;
+    defer testing.allocator.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "unmatched") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "line 6") != null);
+}
+
+test "edit-health: flags an unclosed opener (orphaned signature, narwhals-style)" {
+    // Faithful to narwhals _sql/expr.py: a regenerated body left the original
+    // signature open, so the '(' never closes.
+    const broken =
+        \\def rolling(
+        \\    window_size,
+        \\    min_samples,
+        \\:
+        \\    return window_size
+    ;
+    const msg = (try edit_mod.describeHealth(testing.allocator, broken, .python)).?;
+    defer testing.allocator.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "never closed") != null);
+}
+
+test "edit-health: no false positive on balanced python with brackets in strings/comments" {
+    const ok =
+        \\import re
+        \\x = f"{a}({b}"   # a comment with ) and ] and }
+        \\s = "a string with ( and { and ["
+        \\def g(n):
+        \\    return [i for i in range(n)]
+    ;
+    const msg = try edit_mod.describeHealth(testing.allocator, ok, .python);
+    try testing.expect(msg == null);
+}
+
+test "edit-health: stays silent on non-code content (unknown language)" {
+    const txt = "a note with ( an unbalanced paren which is perfectly fine\n";
+    const msg = try edit_mod.describeHealth(testing.allocator, txt, .unknown);
+    try testing.expect(msg == null);
+}
+
+test "edit-health: applyEdit surfaces a warning when an edit breaks a python file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/health.py", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    const original = "import os\n\n\ndef main():\n    return os.getcwd()\n";
+    var file = try tmp.dir.createFile(io, "health.py", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("edit-health-broken");
+
+    // Insert a stray unbalanced ')' after line 1 — a mis-spliced edit.
+    const result = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .insert,
+        .after = 1,
+        .content = ")",
+    });
+    defer if (result.health) |h| testing.allocator.free(h);
+    try testing.expect(result.health != null);
+    try testing.expect(std.mem.indexOf(u8, result.health.?, "unmatched") != null);
+}
+
+test "edit-health: a clean python edit produces no warning (happy path unchanged)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/clean.py", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    const original = "import os\n\n\ndef main():\n    return os.getcwd()\n";
+    var file = try tmp.dir.createFile(io, "clean.py", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("edit-health-clean");
+
+    // Insert a balanced statement — must not trip the syntax warning.
+    const result = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .insert,
+        .after = 1,
+        .content = "y = (1 + 2) * [3, 4][0]",
+    });
+    defer if (result.health) |h| testing.allocator.free(h);
+    try testing.expect(result.health == null);
+}
+
+
 test "issue-101: Store.max_versions is configurable (caps per-file history)" {
     // Default cap is 100. After setting max_versions = 3, writing 5 versions
     // of the same file must leave exactly 3 in-memory.

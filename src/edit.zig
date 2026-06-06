@@ -5,6 +5,8 @@ const AgentId = @import("agent.zig").AgentId;
 const Explorer = @import("explore.zig").Explorer;
 const Op = @import("version.zig").Op;
 const path_security = @import("path_security.zig");
+const Language = @import("explore.zig").Language;
+const detectLanguage = @import("explore.zig").detectLanguage;
 
 pub const EditRequest = struct {
     path: []const u8,
@@ -25,6 +27,10 @@ pub const EditResult = struct {
     /// Unified-diff-style preview of the change. Only populated when
     /// `dry_run = true`. Caller owns the slice and must free it.
     preview: ?[]u8 = null,
+    /// Advisory post-edit syntax warning (e.g. unbalanced delimiter) or null
+    /// when the edited content looks structurally clean. Caller owns the slice
+    /// and must free it. (trial/graph-based-codedb)
+    health: ?[]u8 = null,
 };
 
 pub fn applyEdit(
@@ -99,6 +105,9 @@ pub fn applyEdit(
                 };
             }
 
+            const health_msg = try describeHealth(allocator, fast_result, detectLanguage(req.path));
+            errdefer if (health_msg) |h| allocator.free(h);
+
             try writeAtomic(io, edit_dir, req.path, fast_result);
 
             const seq = try store.recordEdit(req.path, req.agent_id, req.op, hash, fast_result.len, req.content);
@@ -111,6 +120,7 @@ pub fn applyEdit(
                 .seq = seq,
                 .new_hash = hash,
                 .new_size = fast_result.len,
+                .health = health_msg,
             };
         }
     }
@@ -194,6 +204,13 @@ pub fn applyEdit(
         };
     }
 
+    // Post-edit syntax health (trial/graph-based-codedb): a cheap, advisory
+    // delimiter-balance scan so a mis-spliced multi-line edit (orphaned/
+    // duplicated bracket) surfaces back to the agent instead of shipping a
+    // file that no longer parses.
+    const health_msg = try describeHealth(allocator, result, detectLanguage(req.path));
+    errdefer if (health_msg) |h| allocator.free(h);
+
     if (req.dry_run) {
         // Preview-only: build a compact diff and skip disk write, store record,
         // and explorer indexing. Caller releases the lock via errdefer/return.
@@ -204,6 +221,7 @@ pub fn applyEdit(
             .new_hash = hash,
             .new_size = result.len,
             .preview = preview,
+            .health = health_msg,
         };
     }
 
@@ -223,6 +241,7 @@ pub fn applyEdit(
         .seq = seq,
         .new_hash = hash,
         .new_size = result.len,
+        .health = health_msg,
     };
 }
 
@@ -422,4 +441,207 @@ fn buildPreview(
     }
 
     return buf.toOwnedSlice(allocator);
+}
+
+// ── Post-edit syntax health check (trial/graph-based-codedb) ──────────────
+//
+// codedb_edit is a blind line-splice: historically it never checked whether
+// the resulting file still parsed. The deep-SWE benchmark showed Sonnet-4.6
+// routinely regenerates a multi-line bracketed region (a parenthesized import
+// block or a function signature + body) and mis-splices the hunk boundaries,
+// leaving an orphaned/duplicated delimiter — shipping a file that does not
+// even import. The scan below is a cheap, dependency-free, language-aware
+// delimiter-balance pass that surfaces such breaks back to the agent.
+
+const Imbalance = struct {
+    line: usize,
+    open_char: u8,
+    found_char: u8,
+    kind: enum { unmatched_close, unclosed_open, mismatched },
+};
+
+/// Languages where a ()/[]/{} balance scan is meaningful and low-noise.
+/// Deliberately excludes shell (case-pattern `)`), ruby (%w[] / heredocs),
+/// sql, css and markup, where false positives would be common.
+fn isCheckableCode(lang: Language) bool {
+    return switch (lang) {
+        .python, .javascript, .typescript, .zig, .c, .cpp, .rust, .go_lang, .java, .kotlin, .swift, .dart, .php => true,
+        else => false,
+    };
+}
+
+/// Scan `content` for the first unbalanced ()/[]/{} delimiter, skipping
+/// language-appropriate comments and string / char literals. Advisory only:
+/// returns null (stay silent) for unsupported languages or anything it cannot
+/// analyse confidently (nesting deeper than the fixed stack).
+fn scanDelimiterBalance(content: []const u8, language: Language) ?Imbalance {
+    if (!isCheckableCode(language)) return null;
+
+    const py = language == .python;
+    const php = language == .php;
+    const hash_comments = py or php;
+    const slash_comments = !py; // // line + /* */ block for every c-like lang here
+    const sq_is_string = py or php or language == .javascript or language == .typescript;
+    const backtick = language == .javascript or language == .typescript;
+    const zig_lang = language == .zig;
+
+    var stack: [512]struct { ch: u8, line: usize } = undefined;
+    var sp: usize = 0;
+    var line: usize = 1;
+    var i: usize = 0;
+    const n = content.len;
+
+    while (i < n) {
+        const ch = content[i];
+        if (ch == '\n') {
+            line += 1;
+            i += 1;
+            continue;
+        }
+
+        // Zig multi-line string: a `\\`-prefixed line runs to EOL with no closer.
+        if (zig_lang and ch == '\\' and i + 1 < n and content[i + 1] == '\\') {
+            while (i < n and content[i] != '\n') i += 1;
+            continue;
+        }
+
+        // Line comments.
+        if (hash_comments and ch == '#') {
+            while (i < n and content[i] != '\n') i += 1;
+            continue;
+        }
+        if (slash_comments and ch == '/' and i + 1 < n and content[i + 1] == '/') {
+            while (i < n and content[i] != '\n') i += 1;
+            continue;
+        }
+        // Block comment /* ... */
+        if (slash_comments and ch == '/' and i + 1 < n and content[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < n and !(content[i] == '*' and content[i + 1] == '/')) {
+                if (content[i] == '\n') line += 1;
+                i += 1;
+            }
+            i = @min(i + 2, n);
+            continue;
+        }
+
+        // Triple-quoted Python string.
+        if (py and (ch == '"' or ch == '\'') and i + 2 < n and content[i + 1] == ch and content[i + 2] == ch) {
+            const q = ch;
+            i += 3;
+            while (i + 2 < n and !(content[i] == q and content[i + 1] == q and content[i + 2] == q)) {
+                if (content[i] == '\n') line += 1;
+                if (content[i] == '\\') i += 1;
+                i += 1;
+            }
+            i = @min(i + 3, n);
+            continue;
+        }
+
+        // Backtick template literal (JS/TS): may span newlines; skip wholesale.
+        if (backtick and ch == '`') {
+            i += 1;
+            while (i < n and content[i] != '`') {
+                if (content[i] == '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (content[i] == '\n') line += 1;
+                i += 1;
+            }
+            i = @min(i + 1, n);
+            continue;
+        }
+
+        // Double-quoted string (single line).
+        if (ch == '"') {
+            i += 1;
+            while (i < n and content[i] != '"') {
+                if (content[i] == '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (content[i] == '\n') break; // unterminated; bail conservatively
+                i += 1;
+            }
+            if (i < n and content[i] == '"') i += 1;
+            continue;
+        }
+
+        // Single quote: a string (py/php/js/ts) or a char literal (c-family).
+        if (ch == '\'') {
+            if (sq_is_string) {
+                i += 1;
+                while (i < n and content[i] != '\'') {
+                    if (content[i] == '\\') {
+                        i += 2;
+                        continue;
+                    }
+                    if (content[i] == '\n') break;
+                    i += 1;
+                }
+                if (i < n and content[i] == '\'') i += 1;
+                continue;
+            }
+            // Char literal: only consume as a literal if a closing ' is near
+            // (<= 12 bytes). Otherwise it is a Rust lifetime (&'a) or a label —
+            // leave it as plain punctuation so we do not eat real delimiters.
+            var j = i + 1;
+            const cap = @min(n, i + 13);
+            var closed = false;
+            while (j < cap) {
+                if (content[j] == '\\') {
+                    j += 2;
+                    continue;
+                }
+                if (content[j] == '\'') {
+                    closed = true;
+                    break;
+                }
+                if (content[j] == '\n') break;
+                j += 1;
+            }
+            if (closed) {
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        switch (ch) {
+            '(', '[', '{' => {
+                if (sp == stack.len) return null; // too deep to analyse; stay silent
+                stack[sp] = .{ .ch = ch, .line = line };
+                sp += 1;
+            },
+            ')', ']', '}' => {
+                const want: u8 = switch (ch) {
+                    ')' => '(',
+                    ']' => '[',
+                    '}' => '{',
+                    else => 0,
+                };
+                if (sp == 0) return .{ .line = line, .open_char = 0, .found_char = ch, .kind = .unmatched_close };
+                if (stack[sp - 1].ch != want) return .{ .line = line, .open_char = stack[sp - 1].ch, .found_char = ch, .kind = .mismatched };
+                sp -= 1;
+            },
+            else => {},
+        }
+        i += 1;
+    }
+
+    if (sp > 0) return .{ .line = stack[sp - 1].line, .open_char = stack[sp - 1].ch, .found_char = 0, .kind = .unclosed_open };
+    return null;
+}
+
+/// Returns an owned advisory message when the edited content has a delimiter
+/// imbalance, else null. Caller frees. Pure helper — exposed for tests.
+pub fn describeHealth(allocator: std.mem.Allocator, content: []const u8, language: Language) !?[]u8 {
+    const imb = scanDelimiterBalance(content, language) orelse return null;
+    return switch (imb.kind) {
+        .unmatched_close => try std.fmt.allocPrint(allocator, "\n⚠ syntax check: unmatched '{c}' at line {d} — this edit may have broken the file; re-read and verify before continuing.", .{ imb.found_char, imb.line }),
+        .mismatched => try std.fmt.allocPrint(allocator, "\n⚠ syntax check: '{c}' at line {d} closes the wrong delimiter (open '{c}') — possible broken edit; re-read and verify.", .{ imb.found_char, imb.line, imb.open_char }),
+        .unclosed_open => try std.fmt.allocPrint(allocator, "\n⚠ syntax check: '{c}' opened at line {d} is never closed — possible broken edit; re-read and verify.", .{ imb.open_char, imb.line }),
+    };
 }
