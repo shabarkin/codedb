@@ -578,6 +578,37 @@ test "issue-207: ScanState.name covers all states" {
     try testing.expectEqualStrings("ready", mcp_mod.ScanState.ready.name());
 }
 
+test "issue-PERSIST-3: status warns when trigram coverage diverges from outline count" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("a.zig", "pub fn alpha() void {}\n");
+    try explorer.indexFile("b.zig", "pub fn beta() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{}", .{});
+    defer parsed.deinit();
+
+    var out_ok: std.ArrayList(u8) = .empty;
+    defer out_ok.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_status, &parsed.value.object, &out_ok, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, out_ok.items, "warning: trigram index covers") == null);
+
+    explorer.trigram_index.removeFile("a.zig");
+
+    var out_warn: std.ArrayList(u8) = .empty;
+    defer out_warn.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_status, &parsed.value.object, &out_warn, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, out_warn.items, "warning: trigram index covers 1 of 2 indexed files") != null);
+}
+
 test "issue-346: root_policy rejects dangerous ambient cwd roots" {
     try testing.expect(!root_policy.isIndexableRoot("/"));
     try testing.expect(!root_policy.isIndexableRoot("/Applications"));
