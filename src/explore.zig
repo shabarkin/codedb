@@ -16,6 +16,17 @@ const tree_sitter_mod = @import("tree_sitter.zig");
 
 const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.fs.max_path_bytes;
 
+pub const binary_sniff_len: usize = 512;
+
+pub fn looksBinary(content: []const u8) bool {
+    const probe_len = @min(content.len, binary_sniff_len);
+    return std.mem.indexOfScalar(u8, content[0..probe_len], 0) != null;
+}
+
+fn stripLeadingUtf8Bom(content: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, content, "\xEF\xBB\xBF")) content[3..] else content;
+}
+
 pub fn approxIndexSizeBytes(explorer: *const Explorer) u64 {
     // Aggregate-only estimate. Keep this O(1): status calls this on hot paths,
     // and exact allocator accounting would require walking all word/trigram
@@ -222,6 +233,19 @@ pub const SearchOptions = struct {
     compact: bool = false,
     reliability_fallback: bool = true,
 };
+
+fn removeSearchResultsForPath(results: *std.ArrayList(SearchResult), allocator: std.mem.Allocator, path: []const u8) void {
+    var i: usize = 0;
+    while (i < results.items.len) {
+        if (std.mem.eql(u8, results.items[i].path, path)) {
+            const removed = results.swapRemove(i);
+            allocator.free(removed.path);
+            allocator.free(removed.line_text);
+        } else {
+            i += 1;
+        }
+    }
+}
 
 pub const DependencyGraph = struct {
     forward: std.StringHashMap(std.ArrayList([]const u8)),
@@ -2759,8 +2783,7 @@ pub const Explorer = struct {
         out: *std.ArrayList(u8),
         opts: ReadRenderOptions,
     ) !void {
-        const probe_len = @min(content.len, 8 * 1024);
-        if (std.mem.indexOfScalar(u8, content[0..probe_len], 0) != null) {
+        if (looksBinary(content)) {
             const w0 = cio.listWriter(out, allocator);
             const hash_b = std.hash.Wyhash.hash(0, content);
             try w0.print("binary file: {d} bytes  hash:{x}\n", .{ content.len, hash_b });
@@ -3088,6 +3111,8 @@ pub const Explorer = struct {
         // searched tracks which paths have been scanned — shared across all tiers.
         var searched = std.StringHashMap(void).init(allocator);
         defer searched.deinit();
+        var tier0_capped_paths: std.ArrayList([]const u8) = .empty;
+        defer tier0_capped_paths.deinit(allocator);
 
         // Tier 0: word index direct lookup — O(1) hash lookup plus bounded
         // content extraction. A per-file cap forces diversity so a single hot
@@ -3144,6 +3169,7 @@ pub const Explorer = struct {
 
             const tier0_per_file_cap: usize = options.max_per_file orelse
                 if (tier0_files.items.len <= 1) max_results else @max(1, max_results / 5);
+            const track_tier0_caps = options.max_per_file == null and tier0_per_file_cap < max_results;
             var tier0_exact_capacity: usize = 0;
             for (tier0_files.items) |stats| {
                 tier0_exact_capacity += @min(@as(usize, stats.count), tier0_per_file_cap);
@@ -3167,10 +3193,16 @@ pub const Explorer = struct {
                         }
                     }
                     try appendTargetLineHitsWithOptions(stats.path, ref.data, allocator, target_lines[0..target_count], options, &result_list);
+                    if (track_tier0_caps and stats.count > tier0_per_file_cap) {
+                        try tier0_capped_paths.append(allocator, stats.path);
+                    }
                     if (result_list.items.len < max_results) searched.put(stats.path, {}) catch {};
                 } else {
                     searched.put(stats.path, {}) catch {};
                     try searchInContentWithOptions(stats.path, ref.data, query, allocator, tier0_per_file_cap, options, &result_list);
+                    if (track_tier0_caps and stats.count > tier0_per_file_cap) {
+                        try tier0_capped_paths.append(allocator, stats.path);
+                    }
                 }
             }
             if (result_list.items.len >= max_results) {
@@ -3315,6 +3347,17 @@ pub const Explorer = struct {
                 defer ref.deinit();
                 try searchInContentWithOptions(key_ptr.*, ref.data, query, allocator, options.max_per_file orelse max_results, options, &result_list);
                 if (result_list.items.len >= max_results) break;
+            }
+        }
+
+        if (result_list.items.len < max_results and tier0_capped_paths.items.len > 0) {
+            for (tier0_capped_paths.items) |path| {
+                if (result_list.items.len >= max_results) break;
+                if (!searchPathEligible(path, options)) continue;
+                removeSearchResultsForPath(&result_list, allocator, path);
+                const ref = self.readContentForSearch(path, allocator) orelse continue;
+                defer ref.deinit();
+                try searchInContentWithOptions(path, ref.data, query, allocator, max_results, options, &result_list);
             }
         }
 
@@ -3768,6 +3811,8 @@ pub const Explorer = struct {
     ) ![]const SearchResult {
         self.mu.lockShared();
         defer self.mu.unlockShared();
+
+        if (invalidEscapeIndex(pattern) != null) return error.InvalidPattern;
 
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer result_list.deinit(allocator);
@@ -5358,6 +5403,8 @@ pub const Explorer = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
+        if (invalidEscapeIndex(pattern) != null) return error.InvalidPattern;
+
         var result_list: std.ArrayList(ScopedSearchResult) = .empty;
         errdefer {
             for (result_list.items) |r| {
@@ -5461,9 +5508,10 @@ pub const Explorer = struct {
         max_results: usize,
         result_list: *std.ArrayList(ScopedSearchResult),
     ) !void {
+        const searchable_content = stripLeadingUtf8Bom(content);
         var line_num: u32 = 0;
         var file_matches: usize = 0;
-        var lines = std.mem.splitScalar(u8, content, '\n');
+        var lines = std.mem.splitScalar(u8, searchable_content, '\n');
         while (lines.next()) |line| {
             line_num += 1;
             if (rx.search(allocator, line) catch null) |m| {
@@ -5863,9 +5911,10 @@ fn searchInContentRegexCompiled(
     max_results: usize,
     result_list: *std.ArrayList(SearchResult),
 ) !void {
+    const searchable_content = stripLeadingUtf8Bom(content);
     var line_num: u32 = 0;
     var file_matches: usize = 0;
-    var lines = std.mem.splitScalar(u8, content, '\n');
+    var lines = std.mem.splitScalar(u8, searchable_content, '\n');
     while (lines.next()) |line| {
         line_num += 1;
         if (rx.search(allocator, line) catch null) |m| {
@@ -5886,7 +5935,32 @@ fn searchInContentRegexCompiled(
     }
 }
 
+fn isSupportedRegexEscape(c: u8) bool {
+    return switch (c) {
+        'd', 'D', 'w', 'W', 's', 'S', 'b', 'B', 'A', 'z', 'n', 't', 'r', '0' => true,
+        else => false,
+    };
+}
+
+pub fn invalidEscapeIndex(pattern: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < pattern.len) {
+        if (pattern[i] != '\\') {
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= pattern.len) return i;
+        const escaped = pattern[i + 1];
+        if (std.ascii.isAlphanumeric(escaped) and !isSupportedRegexEscape(escaped)) {
+            return i;
+        }
+        i += 2;
+    }
+    return null;
+}
+
 pub fn regexMatch(haystack: []const u8, pattern: []const u8) bool {
+    if (invalidEscapeIndex(pattern) != null) return false;
     var rx = nanoregex.Regex.compile(std.heap.smp_allocator, pattern) catch return false;
     defer rx.deinit();
     if (rx.search(std.heap.smp_allocator, haystack) catch null) |m| {
