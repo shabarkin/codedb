@@ -494,6 +494,7 @@ fn collectInitialScanEntries(io: std.Io, store: *Store, dir: std.Io.Dir, allocat
     const max_trigram_files: usize = 15_000;
     var file_count: usize = 0;
     while (try walker.next()) |entry| {
+        if (shouldSkipFile(entry.path)) continue;
         const stat = path_security.statSafeFile(io, dir, walker.real_root, entry.path) catch continue;
         _ = try store.recordSnapshot(entry.path, stat.size, 0);
         file_count += 1;
@@ -1049,10 +1050,12 @@ pub fn incrementalLoop(io: std.Io, store: *Store, explorer: *Explorer, queue: *E
             var file_count: usize = 0;
             while (walker.next() catch null) |entry| {
                 const stat = path_security.statSafeFile(io, dir, walker.real_root, entry.path) catch continue;
-                _ = store.recordSnapshot(entry.path, stat.size, 0) catch {};
-                file_count += 1;
-                const effective_skip = file_count > max_trigram_files;
-                indexFileContent(io, explorer, dir, entry.path, backing, effective_skip) catch {};
+                if (!shouldSkipFile(entry.path)) {
+                    _ = store.recordSnapshot(entry.path, stat.size, 0) catch {};
+                    file_count += 1;
+                    const effective_skip = file_count > max_trigram_files;
+                    indexFileContent(io, explorer, dir, entry.path, backing, effective_skip) catch {};
+                }
                 const mtime: i64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_ms));
                 const duped = backing.dupe(u8, entry.path) catch continue;
                 known.put(duped, .{ .mtime = mtime, .size = stat.size, .hash = 0, .seen = false }) catch backing.free(duped);

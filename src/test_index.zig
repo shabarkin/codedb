@@ -626,6 +626,28 @@ test "watcher: parallel initial scan matches sequential results" {
 }
 
 
+test "issue-M3: status files count excludes never-indexed files after initial scan" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "main.zig", .data = "pub fn alpha() void {}\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "Cargo.lock", .data = "[[package]]\nname = \"demo\"\n" });
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPathFile(io, ".", &root_buf);
+    const root = root_buf[0..root_len];
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    explorer.setRoot(io, root);
+    try watcher.initialScanWithWorkerCount(io, &store, &explorer, root, testing.allocator, false, 1);
+
+    try testing.expectEqual(explorer.outlines.count(), store.files.count());
+}
+
+
 test "edit: range_start zero is invalid" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

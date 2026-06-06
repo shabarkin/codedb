@@ -2709,6 +2709,7 @@ fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *Store
         .mmap_overlay => "mmap+overlay",
     };
     const trigram_files = explorer.trigram_index.fileCount();
+    const skip_count = explorer.skip_trigram_files.count();
     explorer.mu.unlockShared();
 
     out.ensureUnusedCapacity(alloc, 256) catch {};
@@ -2733,6 +2734,10 @@ fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *Store
         index_bytes / 1024,
         getScanState().name(),
     }) catch {};
+    const covered = @as(usize, trigram_files) + skip_count;
+    if (outline_count > 0 and covered < outline_count) {
+        w.print("  warning: trigram index covers {d} of {d} indexed files (index may be incomplete)\n", .{ covered, outline_count }) catch {};
+    }
 }
 
 fn handleSnapshot(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *Explorer, store: *Store, cache: *SnapshotCache) void {
