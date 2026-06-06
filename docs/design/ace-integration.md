@@ -99,12 +99,6 @@ codedb_skillbook_update(skills: [...], project?: <path>)
 
 ACE (or any other learner) calls this with synthesized skills. The skillbook becomes the *boundary* between learning and serving — codedb stays focused on milliseconds-per-query, ACE handles the slow, expensive reflection loop.
 
-### 4. Trace collection — already partially there
-
-codedb already logs `codedb_search` / `codedb_find` / `codedb_word` queries to a WAL (see `mcp.handleCall` L991-996, `logQuery`). The natural extension: also log which file:line snippets were SELECTED by the agent (i.e., subsequently passed to `codedb_read` / `codedb_edit`).
-
-That selection signal is what ACE needs to reflect on. The trace surface stays in codedb; the reflection stays in ACE.
-
 ## Why this earns its complexity
 
 | | without skillbook | with skillbook |

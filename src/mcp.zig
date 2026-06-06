@@ -582,7 +582,6 @@ pub const Tool = enum {
     codedb_status,
     codedb_snapshot,
     codedb_bundle,
-    codedb_remote,
     codedb_projects,
     codedb_index,
     codedb_find,
@@ -609,7 +608,6 @@ pub const tools_list =
     \\{"name":"codedb_status","description":"Current indexed-file count, sequence number, and scan phase.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_snapshot","description":"Pre-rendered JSON snapshot of the entire index — tree, outlines, symbols, deps. For caching or shipping to edge workers.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_bundle","description":"Run up to 20 codedb_* calls in one round-trip. Each op is either MCP-style {\"tool\":\"codedb_search\",\"arguments\":{\"query\":\"Agent\"}} or inline {\"tool\":\"codedb_search\",\"query\":\"Agent\"} — both are accepted. Example: {\"ops\":[{\"tool\":\"codedb_search\",\"arguments\":{\"query\":\"Agent\"}},{\"tool\":\"codedb_outline\",\"arguments\":{\"path\":\"src/main.zig\"}}]}. Best for parallel outline/symbol/search; avoid bundling large codedb_read calls — responses are not size-capped. If a sub-op reports `received keys: []`, the wrapper field is misnamed: use `arguments` (MCP spec), not `args`.","inputSchema":{"type":"object","properties":{"ops":{"type":"array","description":"Sub-tool calls to dispatch (max 20). Each item must have `tool` AND `arguments` (pass `{}` if the sub-tool takes none). Inline args alongside `tool` are still accepted as a fallback.","items":{"type":"object","properties":{"tool":{"type":"string","description":"codedb_* tool name to invoke (e.g. codedb_outline, codedb_symbol, codedb_search, codedb_word, codedb_callers, codedb_read, codedb_deps, codedb_tree, codedb_hot, codedb_status, codedb_changes). Required."},"arguments":{"type":"object","description":"Per-call args matching that tool's inputSchema. Field MUST be named `arguments` (MCP `tools/call` convention) — `args` is silently ignored. Pass `{}` only if the sub-tool takes no arguments. Required."}},"required":["tool","arguments"]}},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["ops"]}},
-    \\{"name":"codedb_remote","description":"Query indexed public repos via api.wiki.codes. Pass action= one of: tree, outline, search, read, symbol, deps, score, cves, commits, branches, dep-history, policy, actions. Use action=actions first if unsure what a repo supports.","inputSchema":{"type":"object","properties":{"repo":{"type":"string","description":"GitHub repo in owner/repo format (e.g. vercel/next.js) or a raw wiki slug such as chromium."},"action":{"type":"string","enum":["tree","outline","search","read","actions","symbol","policy","deps","score","cves","commits","branches","dep-history"],"description":"What to query from api.wiki.codes: actions, tree, search, outline, read, symbol, policy, deps, score, cves, commits, branches, dep-history."},"query":{"type":"string","description":"Action-specific argument. search: text query. symbol: identifier name. outline: file path."},"path":{"type":"string","description":"For action=read: the file path to fetch."},"lines":{"type":"string","description":"For action=read: line range like '10-60' (1-indexed, inclusive). Omit for full file."},"limit":{"type":"integer","description":"For search/tree/deps/commits/branches/dep-history: cap the number of items returned (server may enforce its own ceiling)."},"offset":{"type":"integer","description":"For tree/deps/commits/branches/dep-history: skip the first N items (pagination)."},"prefix":{"type":"string","description":"For tree: only return paths starting with this prefix (e.g. 'src/')."},"expand":{"type":"boolean","description":"For tree: when true, return the full file list. When false returns a compact directory summary when supported."},"since":{"type":"string","description":"For commits/dep-history: ISO timestamp or commit SHA to start from."},"scope":{"type":"string","enum":["runtime","all"],"description":"For score/cves only. Defaults to runtime; use all to include dev/tooling dependencies."},"backend":{"type":"string","enum":["wiki"],"description":"Deprecated compatibility field. Only 'wiki' is accepted; requests always use api.wiki.codes."}},"required":["repo","action"]}},
     \\{"name":"codedb_projects","description":"List every locally indexed project on this machine: path, data-dir hash, snapshot presence.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"codedb_index","description":"Index a local FOLDER (not a file). Builds outlines, trigrams, word index, and writes codedb.snapshot. After indexing, query it via the project= param on any other tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the FOLDER (not a file) to index, e.g. /Users/you/myproject"}},"required":["path"]}},
     \\{"name":"codedb_find","description":"Fuzzy FILE-NAME search ONLY — typo-tolerant subsequence match against indexed file paths. NOT a content/symbol search: 'rerank' will NOT find files containing rerankSignalScore unless the filename itself contains 'rerank'. For symbol lookups use codedb_word/codedb_symbol; for content use codedb_search.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Fuzzy filename query (e.g. 'authmidlware' for auth_middleware.go, 'test_auth', 'main.zig'). Matched against path basenames, not file contents."},"max_results":{"type":"integer","description":"Maximum results to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
@@ -1134,19 +1132,6 @@ fn handleCall(
     const elapsed = cio.nanoTimestamp() - t0;
 
     const is_error = std.mem.startsWith(u8, out.items, "error:");
-
-    // Query + file access tracking WAL
-    if (!is_error) {
-        if (std.mem.eql(u8, name, "codedb_search") or std.mem.eql(u8, name, "codedb_find") or std.mem.eql(u8, name, "codedb_word")) {
-            if (getStr(args, "query") orelse getStr(args, "word")) |q| {
-                logQuery(io, name, q, out.items.len, elapsed);
-            }
-        } else if (std.mem.eql(u8, name, "codedb_read") or std.mem.eql(u8, name, "codedb_outline")) {
-            if (getStr(args, "path")) |p| {
-                logFileAccess(io, name, p, elapsed);
-            }
-        }
-    }
     if (is_notification) return;
 
     const lean = mcpLeanMode();
@@ -1324,10 +1309,9 @@ fn dispatch(
         .codedb_status => handleStatus(alloc, out, ctx.store, ctx.explorer),
         .codedb_snapshot => handleSnapshot(alloc, out, ctx.explorer, ctx.store, ctx.snapshot_cache),
         .codedb_bundle => handleBundle(io, alloc, args, out, ctx.store, ctx.explorer, agents, cache, deferred_scan),
-        .codedb_remote => handleRemote(alloc, args, out),
         .codedb_projects => handleProjects(io, alloc, out),
         .codedb_index => handleIndex(io, alloc, args, out, cache, default_store, default_explorer, deferred_scan),
-        .codedb_find => handleFind(io, alloc, args, out, ctx.explorer),
+        .codedb_find => handleFind(alloc, args, out, ctx.explorer),
         .codedb_query => handleQuery(alloc, args, out, ctx.explorer, ctx.store),
         .codedb_glob => handleGlob(alloc, args, out, ctx.explorer),
         .codedb_ls => handleLs(alloc, args, out, ctx.explorer),
@@ -2917,8 +2901,8 @@ fn handleBundle(
     const w = cio.listWriter(out, alloc);
     out.ensureUnusedCapacity(alloc, @min(@as(usize, 200 * 1024), 1024 + ops.len * 8192)) catch {};
     // Refresh activity accounting as we start the bundle. Long bundles can
-    // include slow sub-ops, many ops, and remote fetches, so each completed
-    // sub-op updates the same timestamp. See #278.
+    // include slow sub-ops or many ops, so each completed sub-op updates the
+    // same timestamp. See #278.
     last_activity.store(cio.milliTimestamp(), .release);
     // Bug 11: track per-op outcome so the top-level envelope can flip
     // isError=true when no op succeeded — agents reading the previous
@@ -3049,383 +3033,6 @@ fn handleBundle(
         const prefix = std.fmt.bufPrint(&prefix_buf, "error: all {d} bundle op(s) failed\n", .{fail_count}) catch "error: all bundle ops failed\n";
         out.insertSlice(alloc, 0, prefix) catch {};
     }
-}
-
-fn isRemoteRepoChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.';
-}
-
-fn isRemoteRepoPart(part: []const u8) bool {
-    if (part.len == 0) return false;
-    if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
-    for (part) |c| {
-        if (!isRemoteRepoChar(c)) return false;
-    }
-    return true;
-}
-
-fn appendSlugChar(out: []u8, len: *usize, c: u8, last_dash: *bool) void {
-    const lower = std.ascii.toLower(c);
-    if ((lower >= 'a' and lower <= 'z') or (lower >= '0' and lower <= '9')) {
-        out[len.*] = lower;
-        len.* += 1;
-        last_dash.* = false;
-    } else if (!last_dash.* and len.* > 0) {
-        out[len.*] = '-';
-        len.* += 1;
-        last_dash.* = true;
-    }
-}
-
-fn ingestSlugForOwnerRepo(owner: []const u8, repo: []const u8, buf: []u8) ?[]const u8 {
-    if (!isRemoteRepoPart(owner) or !isRemoteRepoPart(repo)) return null;
-
-    var len: usize = 0;
-    var last_dash = false;
-    for (owner) |c| appendSlugChar(buf, &len, c, &last_dash);
-    appendSlugChar(buf, &len, '-', &last_dash);
-    for (repo) |c| appendSlugChar(buf, &len, c, &last_dash);
-    if (len > 0 and buf[len - 1] == '-') len -= 1;
-    if (len == 0) return null;
-    return buf[0..len];
-}
-
-fn wikiSlugForRepo(repo: []const u8, buf: []u8) ?[]const u8 {
-    if (repo.len == 0 or repo.len >= buf.len or repo[0] == '/') return null;
-    if (std.mem.indexOf(u8, repo, "..") != null or
-        std.mem.indexOf(u8, repo, "//") != null)
-    {
-        return null;
-    }
-
-    if (std.mem.indexOfScalar(u8, repo, '/')) |slash_pos| {
-        if (std.mem.indexOfScalarPos(u8, repo, slash_pos + 1, '/') != null) return null;
-        return ingestSlugForOwnerRepo(repo[0..slash_pos], repo[slash_pos + 1 ..], buf);
-    }
-
-    if (!isRemoteRepoPart(repo)) return null;
-    @memcpy(buf[0..repo.len], repo);
-    return buf[0..repo.len];
-}
-
-test "wikiSlugForRepo normalizes owner repo and raw slugs" {
-    var buf: [256]u8 = undefined;
-
-    try testing.expectEqualStrings("justrach-codedb", wikiSlugForRepo("justrach/codedb", buf[0..]).?);
-    try testing.expectEqualStrings("vercel-next-js", wikiSlugForRepo("vercel/next.js", buf[0..]).?);
-    try testing.expectEqualStrings("owner-repo-name", wikiSlugForRepo("OWNER/Repo.Name", buf[0..]).?);
-    try testing.expectEqualStrings("chromium", wikiSlugForRepo("chromium", buf[0..]).?);
-}
-
-test "remote repo validation rejects traversal and malformed paths" {
-    var buf: [256]u8 = undefined;
-
-    try testing.expect(wikiSlugForRepo("chromium", buf[0..]) != null);
-    try testing.expect(wikiSlugForRepo("../codedb", buf[0..]) == null);
-    try testing.expect(wikiSlugForRepo("justrach//codedb", buf[0..]) == null);
-    try testing.expect(wikiSlugForRepo("justrach/codedb/extra", buf[0..]) == null);
-}
-
-const RemoteParam = struct { name: []const u8, value: []const u8 };
-
-/// Run `curl -G` against URL with optional query params. Caller frees result.stdout/stderr.
-const RemoteResponse = struct {
-    captured: cio.CaptureResult,
-    /// HTTP status code (0 = curl failed before -w fired / sentinel not found).
-    status: u16,
-    /// Length of the response body within `captured.stdout`. The body is
-    /// `captured.stdout[0..body_len]`; the suffix is the curl status sentinel.
-    body_len: usize,
-};
-
-const STATUS_SENTINEL = "[CODEDB-STATUS]";
-
-/// Run `curl -G` against URL with optional query params. Captures HTTP status
-/// via `-w` and lets non-2xx responses through (no `-f`) so callers can format
-/// detailed errors. Caller frees response.captured.stdout/stderr.
-fn fetchRemote(
-    alloc: std.mem.Allocator,
-    url: []const u8,
-    params: []const RemoteParam,
-) !RemoteResponse {
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(alloc);
-
-    try argv.append(alloc, "curl");
-    try argv.append(alloc, "-s");
-    try argv.append(alloc, "--max-time");
-    try argv.append(alloc, "30");
-    try argv.append(alloc, "-w");
-    try argv.append(alloc, "\n" ++ STATUS_SENTINEL ++ "%{http_code}");
-
-    var pair_bufs: std.ArrayList([]u8) = .empty;
-    defer {
-        for (pair_bufs.items) |b| alloc.free(b);
-        pair_bufs.deinit(alloc);
-    }
-
-    if (params.len > 0) {
-        try argv.append(alloc, "-G");
-        try pair_bufs.ensureTotalCapacity(alloc, params.len);
-        for (params) |p| {
-            const buf = try std.fmt.allocPrint(alloc, "{s}={s}", .{ p.name, p.value });
-            try pair_bufs.append(alloc, buf);
-            try argv.append(alloc, "--data-urlencode");
-            try argv.append(alloc, buf);
-        }
-    }
-    try argv.append(alloc, url);
-
-    const captured = try cio.runCapture(.{ .allocator = alloc, .argv = argv.items });
-
-    var status: u16 = 0;
-    var body_len: usize = captured.stdout.len;
-    if (std.mem.lastIndexOf(u8, captured.stdout, STATUS_SENTINEL)) |sentinel_idx| {
-        const status_str = std.mem.trim(u8, captured.stdout[sentinel_idx + STATUS_SENTINEL.len ..], " \r\n\t");
-        status = std.fmt.parseInt(u16, status_str, 10) catch 0;
-        // Strip the trailing "\n[CODEDB-STATUS]NNN" from the body view.
-        var end = sentinel_idx;
-        while (end > 0 and captured.stdout[end - 1] == '\n') end -= 1;
-        body_len = end;
-    }
-
-    return .{ .captured = captured, .status = status, .body_len = body_len };
-}
-
-fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
-    const repo = getStr(args, "repo") orelse {
-        out.appendSlice(alloc, "error: missing 'repo' (e.g. justrach/merjs)") catch {};
-        return;
-    };
-    const action = getStr(args, "action") orelse {
-        out.appendSlice(alloc, "error: missing 'action' (actions, tree, outline, search, read, symbol, policy, deps, score, cves, commits, branches, dep-history)") catch {};
-        return;
-    };
-
-    // api.wiki.codes is the remote backend. Keep backend=wiki as a tolerated
-    // compatibility arg, but never route elsewhere.
-    if (getStr(args, "backend")) |backend| {
-        if (!std.mem.eql(u8, backend, "wiki")) {
-            out.appendSlice(alloc, "error: invalid backend, only 'wiki' / api.wiki.codes is supported") catch {};
-            return;
-        }
-    }
-
-    const wiki_actions = [_][]const u8{
-        "tree",
-        "outline",
-        "search",
-        "read",
-        "symbol",
-        "policy",
-        "deps",
-        "score",
-        "cves",
-        "commits",
-        "branches",
-        "dep-history",
-        "actions",
-    };
-    var action_valid = false;
-    for (&wiki_actions) |va| {
-        if (std.mem.eql(u8, action, va)) {
-            action_valid = true;
-            break;
-        }
-    }
-    if (!action_valid) {
-        out.appendSlice(alloc, "error: action '") catch {};
-        out.appendSlice(alloc, action) catch {};
-        out.appendSlice(alloc, "' not supported by api.wiki.codes (supports: tree, outline, search, read, symbol, policy, deps, score, cves, commits, branches, dep-history, actions)") catch {};
-        return;
-    }
-
-    var wiki_slug_buf: [256]u8 = undefined;
-    const wiki_slug = wikiSlugForRepo(repo, wiki_slug_buf[0..]) orelse {
-        out.appendSlice(alloc, "error: invalid wiki repo, use owner/repo or raw wiki slug (e.g. vercel/next.js or chromium)") catch {};
-        return;
-    };
-
-    const query = getStr(args, "query");
-
-    // Require a non-empty 'query' for actions that consume it. Sending an
-    // empty value silently masked real user mistakes.
-    const needs_query = std.mem.eql(u8, action, "search") or
-        std.mem.eql(u8, action, "symbol") or
-        std.mem.eql(u8, action, "outline");
-    if (needs_query and (query == null or query.?.len == 0)) {
-        out.appendSlice(alloc, "error: action '") catch {};
-        out.appendSlice(alloc, action) catch {};
-        if (std.mem.eql(u8, action, "search")) {
-            out.appendSlice(alloc, "' requires a non-empty 'query' (the search text)") catch {};
-        } else if (std.mem.eql(u8, action, "symbol")) {
-            out.appendSlice(alloc, "' requires a non-empty 'query' (the identifier name to look up)") catch {};
-        } else {
-            out.appendSlice(alloc, "' requires a non-empty 'query' (the file path to outline)") catch {};
-        }
-        return;
-    }
-
-    // 'read' takes the file path via a dedicated `path` arg so the schema is
-    // explicit; outline keeps the legacy `query`-as-path overload.
-    const path_arg = getStr(args, "path");
-    if (std.mem.eql(u8, action, "read") and (path_arg == null or path_arg.?.len == 0)) {
-        out.appendSlice(alloc, "error: action 'read' requires a non-empty 'path' (the file path to fetch)") catch {};
-        return;
-    }
-
-    var scope_value: []const u8 = "runtime";
-    if (std.mem.eql(u8, action, "score") or std.mem.eql(u8, action, "cves")) {
-        scope_value = getStr(args, "scope") orelse query orelse "runtime";
-        if (!std.mem.eql(u8, scope_value, "runtime") and !std.mem.eql(u8, scope_value, "all")) {
-            out.appendSlice(alloc, "error: scope must be 'runtime' or 'all'") catch {};
-            return;
-        }
-    }
-
-    var url_buf: [512]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "https://api.wiki.codes/api/{s}/{s}", .{ wiki_slug, action }) catch {
-        out.appendSlice(alloc, "error: URL too long") catch {};
-        return;
-    };
-
-    // Build the URL params list. Action-specific arg first, then optional
-    // pagination/filter params. Server is free to ignore unknown keys.
-    var int_bufs: [4][32]u8 = undefined;
-    var int_slot: usize = 0;
-    var params: std.ArrayList(RemoteParam) = .empty;
-    defer params.deinit(alloc);
-
-    if (std.mem.eql(u8, action, "search")) {
-        if (query) |q| params.append(alloc, .{ .name = "q", .value = q }) catch {};
-    } else if (std.mem.eql(u8, action, "symbol")) {
-        if (query) |q| params.append(alloc, .{ .name = "name", .value = q }) catch {};
-    } else if (std.mem.eql(u8, action, "outline")) {
-        if (query) |q| params.append(alloc, .{ .name = "path", .value = q }) catch {};
-    } else if (std.mem.eql(u8, action, "read")) {
-        if (path_arg) |p| params.append(alloc, .{ .name = "path", .value = p }) catch {};
-        if (getStr(args, "lines")) |l| {
-            if (l.len > 0) params.append(alloc, .{ .name = "lines", .value = l }) catch {};
-        }
-    } else if (std.mem.eql(u8, action, "score") or std.mem.eql(u8, action, "cves")) {
-        params.append(alloc, .{ .name = "scope", .value = scope_value }) catch {};
-    }
-
-    // Optional pagination/filter params. Forward them consistently for every
-    // action whose wiki endpoint can page or cap large arrays.
-    const takes_limit = std.mem.eql(u8, action, "search") or
-        std.mem.eql(u8, action, "tree") or
-        std.mem.eql(u8, action, "deps") or
-        std.mem.eql(u8, action, "commits") or
-        std.mem.eql(u8, action, "branches") or
-        std.mem.eql(u8, action, "dep-history");
-    const takes_offset = std.mem.eql(u8, action, "tree") or
-        std.mem.eql(u8, action, "deps") or
-        std.mem.eql(u8, action, "commits") or
-        std.mem.eql(u8, action, "branches") or
-        std.mem.eql(u8, action, "dep-history");
-
-    if (takes_limit) {
-        if (getInt(args, "limit")) |n| {
-            const s = std.fmt.bufPrint(int_bufs[int_slot][0..], "{d}", .{@max(0, n)}) catch "0";
-            params.append(alloc, .{ .name = "limit", .value = s }) catch {};
-            int_slot += 1;
-        }
-    }
-    if (takes_offset) {
-        if (getInt(args, "offset")) |n| {
-            const s = std.fmt.bufPrint(int_bufs[int_slot][0..], "{d}", .{@max(0, n)}) catch "0";
-            params.append(alloc, .{ .name = "offset", .value = s }) catch {};
-            int_slot += 1;
-        }
-    }
-
-    if (std.mem.eql(u8, action, "tree")) {
-        if (getStr(args, "prefix")) |v| {
-            if (v.len > 0) params.append(alloc, .{ .name = "prefix", .value = v }) catch {};
-        }
-        if (args.get("expand")) |expand_val| {
-            switch (expand_val) {
-                .bool => |expand| {
-                    if (expand) {
-                        params.append(alloc, .{ .name = "expand", .value = "true" }) catch {};
-                    } else {
-                        params.append(alloc, .{ .name = "summary", .value = "true" }) catch {};
-                    }
-                },
-                else => {},
-            }
-        }
-    } else if (std.mem.eql(u8, action, "commits") or std.mem.eql(u8, action, "dep-history")) {
-        if (getStr(args, "since")) |v| {
-            if (v.len > 0) params.append(alloc, .{ .name = "since", .value = v }) catch {};
-        }
-    }
-
-    const remote = fetchRemote(alloc, url, params.items) catch {
-        out.appendSlice(alloc, "error: failed to fetch from api.wiki.codes") catch {};
-        return;
-    };
-    defer alloc.free(remote.captured.stdout);
-    defer alloc.free(remote.captured.stderr);
-
-    const body = remote.captured.stdout[0..remote.body_len];
-
-    // 2xx = success, anything else gets a status-tagged error so callers can
-    // tell 404 (slug missing this artifact) from 5xx (real server bug).
-    if (remote.status >= 200 and remote.status < 300) {
-        out.appendSlice(alloc, body) catch {};
-        return;
-    }
-
-    out.appendSlice(alloc, "error: ") catch {};
-    out.appendSlice(alloc, "api.wiki.codes") catch {};
-    if (remote.status == 0) {
-        out.appendSlice(alloc, " transport error for ") catch {};
-    } else {
-        var status_buf: [8]u8 = undefined;
-        const s = std.fmt.bufPrint(&status_buf, "{d}", .{remote.status}) catch "0";
-        out.appendSlice(alloc, " HTTP ") catch {};
-        out.appendSlice(alloc, s) catch {};
-        out.appendSlice(alloc, " for ") catch {};
-    }
-    out.appendSlice(alloc, wiki_slug) catch {};
-    out.appendSlice(alloc, "/") catch {};
-    out.appendSlice(alloc, action) catch {};
-    if (body.len > 0) {
-        out.appendSlice(alloc, " — ") catch {};
-        out.appendSlice(alloc, body[0..@min(body.len, 200)]) catch {};
-    } else if (remote.captured.stderr.len > 0) {
-        out.appendSlice(alloc, " — ") catch {};
-        out.appendSlice(alloc, remote.captured.stderr[0..@min(remote.captured.stderr.len, 200)]) catch {};
-    }
-
-    // #508: actionable hint based on the HTTP status / Cloudflare body.
-    // Distinguishes "service down" (530 + Cloudflare 1033/1034) from
-    // "repo or path not indexed" (404) from "rate limited" (429) so
-    // agents and humans can decide whether to retry or take a different
-    // path (e.g. clone the repo locally) without parsing the raw error.
-    appendRemoteErrorHint(alloc, out, remote.status, body);
-}
-
-pub fn appendRemoteErrorHint(alloc: std.mem.Allocator, out: *std.ArrayList(u8), status: u16, body: []const u8) void {
-    const has_cf_origin_down =
-        std.mem.indexOf(u8, body, "error code: 1033") != null or
-        std.mem.indexOf(u8, body, "error code: 1034") != null or
-        std.mem.indexOf(u8, body, "Argo Tunnel error") != null;
-
-    const hint: ?[]const u8 = switch (status) {
-        530 => if (has_cf_origin_down)
-            "\n  hint: api.wiki.codes origin is unreachable (Cloudflare). The service is temporarily down — retry in a few minutes, or query the repo locally via `codedb_index` after cloning."
-        else
-            "\n  hint: upstream returned 530. Retry in a few minutes; if it persists, the repo may not be indexed.",
-        404 => "\n  hint: repo or path not indexed by api.wiki.codes. Verify the slug, or clone + `codedb_index` locally.",
-        429 => "\n  hint: rate limited by api.wiki.codes. Wait and retry, or batch fewer requests.",
-        500, 502, 503 => "\n  hint: upstream server error. Retry — if it persists, the service is having a bad time.",
-        504 => "\n  hint: upstream gateway timeout. Retry; the wiki may still be indexing this repo.",
-        else => null,
-    };
-    if (hint) |h| out.appendSlice(alloc, h) catch {};
 }
 
 // ── Local project tools ─────────────────────────────────────────────────────
@@ -3608,7 +3215,7 @@ fn handleIndex(
     }
 }
 
-fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+fn handleFind(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     // Historical usage showed 71% of codedb_find calls were failing with
     // "missing 'query'" — agents were passing `name`/`path`/`pattern`/`q`
     // instead, misled by the "FILE-NAME search" framing. Accept aliases.
@@ -3659,9 +3266,6 @@ fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
             }
         }
     }
-    // Combo-boost: reward files that were previously opened after similar queries
-    applyComboBoosts(io, alloc, query, @constCast(matches));
-
     if (matches.len == 0) {
         out.appendSlice(alloc, "no matches") catch {};
         return;
@@ -3742,92 +3346,6 @@ fn handleLs(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std
             out.appendSlice(alloc, meta) catch {};
         }
     }
-}
-
-const COMBO_WINDOW_MS: i64 = 5000; // 5 second window between query and file open
-const COMBO_BOOST_PER_HIT: f32 = 5.0; // score boost per historical open
-
-fn applyComboBoosts(io: std.Io, alloc: std.mem.Allocator, query: []const u8, matches: []explore_mod.Explorer.FuzzyMatch) void {
-    const wal_path = query_log_path orelse return;
-    const data = std.Io.Dir.cwd().readFileAlloc(io, wal_path, alloc, .limited(512 * 1024)) catch return;
-    defer alloc.free(data);
-
-    // Scan WAL for query→access pairs within COMBO_WINDOW_MS
-    var boosts = std.StringHashMap(f32).init(alloc);
-    defer boosts.deinit();
-
-    var last_query_ts: i64 = 0;
-    var last_query_match = false;
-
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |line| {
-        if (line.len < 10) continue;
-
-        if (std.mem.indexOf(u8, line, "\"ev\":\"query\"")) |_| {
-            // Check if this query matches the current one (case-insensitive substring)
-            var qbuf: [256]u8 = undefined;
-            if (extractJsonStrLocal(line, "query", &qbuf)) |logged_query| {
-                last_query_match = std.mem.indexOf(u8, logged_query, query) != null or
-                    std.mem.indexOf(u8, query, logged_query) != null;
-            } else {
-                last_query_match = false;
-            }
-            last_query_ts = extractJsonIntLocal(line, "ts") orelse 0;
-        } else if (std.mem.indexOf(u8, line, "\"ev\":\"access\"")) |_| {
-            if (!last_query_match) continue;
-            const access_ts = extractJsonIntLocal(line, "ts") orelse continue;
-            if (access_ts - last_query_ts > COMBO_WINDOW_MS) continue;
-
-            var pbuf: [256]u8 = undefined;
-            if (extractJsonStrLocal(line, "path", &pbuf)) |path| {
-                const gop = boosts.getOrPut(path) catch continue;
-                if (!gop.found_existing) gop.value_ptr.* = 0;
-                gop.value_ptr.* += COMBO_BOOST_PER_HIT;
-            }
-        }
-    }
-
-    if (boosts.count() == 0) return;
-
-    // Apply boosts to matching results
-    var boosted = false;
-    for (matches) |*m| {
-        if (boosts.get(m.path)) |boost| {
-            m.score += boost;
-            boosted = true;
-        }
-    }
-
-    // Re-sort if any scores changed
-    if (boosted) {
-        std.mem.sort(explore_mod.Explorer.FuzzyMatch, matches, {}, struct {
-            fn lt(_: void, a: explore_mod.Explorer.FuzzyMatch, b: explore_mod.Explorer.FuzzyMatch) bool {
-                return a.score > b.score;
-            }
-        }.lt);
-    }
-}
-
-fn extractJsonIntLocal(line: []const u8, key: []const u8) ?i64 {
-    var search_buf: [64]u8 = undefined;
-    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
-    const pos = std.mem.indexOf(u8, line, needle) orelse return null;
-    const start = pos + needle.len;
-    var end = start;
-    while (end < line.len and (line[end] >= '0' and line[end] <= '9')) : (end += 1) {}
-    if (end == start) return null;
-    return std.fmt.parseInt(i64, line[start..end], 10) catch null;
-}
-
-fn extractJsonStrLocal(line: []const u8, key: []const u8, out: *[256]u8) ?[]const u8 {
-    var search_buf: [64]u8 = undefined;
-    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
-    const pos = std.mem.indexOf(u8, line, needle) orelse return null;
-    const start = pos + needle.len;
-    const end = std.mem.indexOfScalarPos(u8, line, start, '"') orelse return null;
-    const len = @min(end - start, out.len);
-    @memcpy(out[0..len], line[start..][0..len]);
-    return out[0..len];
 }
 
 fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer, store: *Store) void {
@@ -4609,68 +4127,6 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
     }
 }
 
-// Query tracking — append-only WAL in ~/.codedb/projects/<hash>/queries.log
-var query_log_path: ?[]const u8 = null;
-
-pub fn setQueryLogPath(path: []const u8) void {
-    query_log_path = path;
-}
-
-fn escapeJsonStr(input: []const u8, out: *[256]u8) usize {
-    var elen: usize = 0;
-    for (input) |c| {
-        if (elen >= out.len - 1) break;
-        if (c == '"') {
-            out[elen] = '\'';
-            elen += 1;
-        } else if (c == '\\') {
-            if (elen + 1 < out.len) {
-                out[elen] = '\\';
-                out[elen + 1] = '\\';
-                elen += 2;
-            }
-        } else if (c == '\n' or c == '\r' or c == '\t') {
-            out[elen] = ' ';
-            elen += 1;
-        } else {
-            out[elen] = c;
-            elen += 1;
-        }
-    }
-    return elen;
-}
-
-fn appendToWal(io: std.Io, line: []const u8) void {
-    const path = query_log_path orelse return;
-    const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .write_only }) catch blk: {
-        break :blk std.Io.Dir.cwd().createFile(io, path, .{}) catch return;
-    };
-    defer file.close(io);
-    const end_offset = file.length(io) catch return;
-    file.writePositionalAll(io, line, end_offset) catch {};
-}
-
-fn logQuery(io: std.Io, tool: []const u8, query: []const u8, result_bytes: usize, latency_ns: i128) void {
-    var escaped: [256]u8 = undefined;
-    const elen = escapeJsonStr(query, &escaped);
-    const latency_us: i64 = @intCast(@divTrunc(latency_ns, 1000));
-    var buf: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "{{\"ts\":{d},\"ev\":\"query\",\"tool\":\"{s}\",\"query\":\"{s}\",\"result_bytes\":{d},\"latency_us\":{d}}}\n", .{
-        cio.milliTimestamp(), tool, escaped[0..elen], result_bytes, latency_us,
-    }) catch return;
-    appendToWal(io, line);
-}
-
-fn logFileAccess(io: std.Io, tool: []const u8, file_path: []const u8, latency_ns: i128) void {
-    var escaped: [256]u8 = undefined;
-    const elen = escapeJsonStr(file_path, &escaped);
-    const latency_us: i64 = @intCast(@divTrunc(latency_ns, 1000));
-    var buf: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "{{\"ts\":{d},\"ev\":\"access\",\"tool\":\"{s}\",\"path\":\"{s}\",\"latency_us\":{d}}}\n", .{
-        cio.milliTimestamp(), tool, escaped[0..elen], latency_us,
-    }) catch return;
-    appendToWal(io, line);
-}
 pub fn globMatch(pattern: []const u8, path: []const u8) bool {
     var buf: [256]u8 = undefined;
     return explore_mod.matchGlob(normalizeGlobPattern(pattern, &buf), path);

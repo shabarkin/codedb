@@ -53,6 +53,54 @@ const SectionEntry = struct {
     length: u64,
 };
 
+fn isSnapshotContentPathAllowed(path: []const u8) bool {
+    return path_security.isPathSafe(path) and !path_security.isSensitivePath(path);
+}
+
+fn validateSnapshotContentPaths(io: std.Io, snapshot_path: []const u8, content_entry: SectionEntry, file_size: u64) bool {
+    if (content_entry.offset > file_size or content_entry.length > file_size - content_entry.offset) return false;
+
+    const file = std.Io.Dir.cwd().openFile(io, snapshot_path, .{}) catch return false;
+    defer file.close(io);
+
+    var read_pos: u64 = content_entry.offset;
+    var bytes_read: u64 = 0;
+    while (bytes_read < content_entry.length) {
+        if (content_entry.length - bytes_read < 2) return false;
+        var pl_buf: [2]u8 = undefined;
+        const pln = file.readPositionalAll(io, &pl_buf, read_pos) catch return false;
+        if (pln != 2) return false;
+        read_pos += 2;
+        bytes_read += 2;
+
+        const path_len = std.mem.readInt(u16, &pl_buf, .little);
+        if (path_len == 0 or path_len > 4096) return false;
+        if (content_entry.length - bytes_read < path_len) return false;
+
+        var path_buf: [4096]u8 = undefined;
+        const path = path_buf[0..path_len];
+        const prn = file.readPositionalAll(io, path, read_pos) catch return false;
+        if (prn != path_len) return false;
+        if (!isSnapshotContentPathAllowed(path)) return false;
+        read_pos += path_len;
+        bytes_read += path_len;
+
+        if (content_entry.length - bytes_read < 4) return false;
+        var cl_buf: [4]u8 = undefined;
+        const cln = file.readPositionalAll(io, &cl_buf, read_pos) catch return false;
+        if (cln != 4) return false;
+        read_pos += 4;
+        bytes_read += 4;
+
+        const content_len = std.mem.readInt(u32, &cl_buf, .little);
+        if (content_len > 64 * 1024 * 1024) return false;
+        if (content_entry.length - bytes_read < content_len) return false;
+        read_pos += content_len;
+        bytes_read += content_len;
+    }
+    return bytes_read == content_entry.length;
+}
+
 /// Write a portable `.codedb` snapshot file.
 pub fn writeSnapshot(
     io: std.Io,
@@ -477,6 +525,7 @@ pub fn loadSnapshotValidated(
 
     // Validate content section fits within actual file size (issue-40: truncation detection)
     if (content_entry.offset > file_size or content_entry.length > file_size - content_entry.offset) return false;
+    if (!validateSnapshotContentPaths(io, snapshot_path, content_entry, file_size)) return false;
 
     var read_pos: u64 = content_entry.offset;
     const snap_mtime: i128 = @intCast(file_stat.mtime.nanoseconds);
@@ -755,6 +804,7 @@ fn loadSnapshotFast(
 
     const file_stat = content_file.stat(io) catch return false;
     if (content_entry.offset + content_entry.length > file_stat.size) return false;
+    if (!validateSnapshotContentPaths(io, snapshot_path, content_entry, file_stat.size)) return false;
 
     var read_pos: u64 = content_entry.offset;
     const snap_mtime: i128 = @intCast(file_stat.mtime.nanoseconds);

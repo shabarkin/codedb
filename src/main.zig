@@ -334,14 +334,6 @@ fn mainImpl() !void {
     };
 
     var explorer = Explorer.init(allocator, cfg.max_cached);
-
-    const rerank_trace_path: ?[]u8 = if (cfg.rerank_trace)
-        (std.fmt.allocPrint(allocator, "{s}/rerank-traces.jsonl", .{data_dir}) catch null)
-    else
-        null;
-    defer if (rerank_trace_path) |p| allocator.free(p);
-    if (rerank_trace_path) |p| explorer.rerank_trace_path = p;
-
     explorer.setRoot(io, root);
     defer explorer.deinit();
 
@@ -1114,10 +1106,6 @@ fn mainImpl() !void {
         const root_from_cwd = mcp_deferred_root;
 
         saveProjectInfo(io, allocator, data_dir, abs_root) catch {};
-
-        // Set up query tracking WAL
-        const query_log = std.fmt.allocPrint(allocator, "{s}/queries.log", .{data_dir}) catch null;
-        if (query_log) |ql| mcp_server.setQueryLogPath(ql);
 
         var shutdown = std.atomic.Value(bool).init(false);
 

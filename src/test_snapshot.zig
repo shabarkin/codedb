@@ -250,6 +250,48 @@ test "issue-220: snapshot fast load restores outlines and lazily rebuilds word i
     try testing.expect(exp2.wordIndexNeedsPersist());
 }
 
+test "snapshot load rejects sensitive content paths before restore" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const original_path = "src/a.zig";
+    const sensitive_path = ".env.zigx";
+    try testing.expectEqual(original_path.len, sensitive_path.len);
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile(original_path, "pub const leaked_secret = 1;\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/sensitive.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    {
+        var sections = (try snapshot_mod.readSections(io, snap_path, testing.allocator)).?;
+        defer sections.deinit();
+        const content = sections.get(@intFromEnum(snapshot_mod.SectionId.content)) orelse return;
+        const file = try std.Io.Dir.cwd().openFile(io, snap_path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.writePositionalAll(io, sensitive_path, content.offset + 2);
+    }
+
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, testing.allocator);
+    try testing.expect(!loaded);
+    try testing.expectEqual(@as(usize, 0), exp2.outlines.count());
+    try testing.expectEqual(@as(u64, 0), store.currentSeq());
+}
+
 test "snapshot: writer streams uncached file contents for large repos" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

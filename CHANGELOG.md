@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Local-only hardening
+
+- Removed the old remote MCP tool and its API fetch path so MCP clients only
+  receive local-index tools.
+- Removed local query/access logging and the optional rerank trace writer;
+  current builds do not persist search queries or file-open records.
+- Removed release-binary publishing workflow material and kept `codedb update`
+  disabled for source-build-only usage.
+- Switched Zig package dependencies to vendored local paths and removed
+  project-facing remote intelligence badges from the README.
+- Hardened snapshot loading to reject unsafe or sensitive content paths before
+  restoring any indexed state.
+- The benchmark workflow no longer downloads Zig with `curl`; it now requires a
+  preinstalled local Zig 0.16 toolchain.
+
 
 ## 0.2.5823 - 2026-05-29
 
@@ -51,8 +68,8 @@ releases catch this exact client-wrapper failure mode.
 - `python3 scripts/e2e_mcp_test.py --binary zig-out/bin/codedb --project /Users/blackfloofie/codedb-release-0.2.5823`
   — **20/20 passed**
 - GitHub PR bench-regression for #513: **success**
-- Release asset workflow now builds the expected Linux ARM64 asset in addition
-  to macOS ARM64, macOS x86_64, and Linux x86_64.
+- Historical release-asset workflow notes are no longer applicable after codedb
+  moved to source-build-only distribution.
 
 See [`benchmarks/v0.2.5823-validation.md`](benchmarks/v0.2.5823-validation.md)
 for the release validation notes.
@@ -162,7 +179,8 @@ Bundle of seven fixes from the open-issue triage on 2026-05-28.
 - **#502 + #503 — arg parser overhaul.** `codedb mcp <path>` no longer hangs forever in deferred mode (it now honors the path as root). `codedb mcp --help` prints usage instead of starting the server. Unknown post-`mcp` flags (e.g. `codedb mcp --snapshot`) are now rejected with a listed-valid-flags error. `codedb mcp` from a git-repo subdirectory walks up to the repo root. The deferred-scan path can no longer hang in `loading_snapshot` forever when the cwd isn't indexable — gives up after 13 s and unblocks `scan_done`.
 - **#505 + #506 — MCP protocol version negotiation.** The server previously hardcoded `protocolVersion: "2025-06-18"`, which older Zed and certain opencode versions rejected with a startup timeout / "No MCP tools". Now echoes the client's version when it's one we've verified against (`2024-11-05`, `2025-03-26`, `2025-06-18`); for newer-than-known clients we return our latest known version.
 - **#507 — search misses content after snapshot rebuild.** Files routed through `indexFileOutlineOnly` (snapshot load fallback, watcher incremental updates, WASM fast-path) were registered in `outlines` and `contents` but not in any search index. They were invisible to every search tier — including the tier-5 full-scan fallback, which short-circuited because the trigram index returned a non-null empty candidate set. Fixed by registering outline-only files in `skip_trigram_files` so tier 3 substring-scans them.
-- **#508 — actionable `codedb_remote` errors.** The remote tool now distinguishes Cloudflare 530 / 1033 origin-unreachable from 404 (repo not indexed), 429 (rate limited), and 5xx (upstream error) with retry / local-fallback hints. The server-side outage at `api.wiki.codes` is not fixed by this change; the UX is.
+- **#508 — local fallback guidance.** The relevant local-index error paths now
+  point users back to local search and snapshot workflows.
 
 ### Startup / platform
 
@@ -244,7 +262,7 @@ Bundle of seven fixes from the open-issue triage on 2026-05-28.
 
 ## 0.2.5808 - 2026-05-06
 
-`0.2.5808` is a tool-schema fix for `codedb_bundle` plus an opt-in rerank-trace logger for offline ranking experiments. Three PRs ship together: [#435](https://github.com/justrach/codedb/pull/435) (Stage 1 of [#434](https://github.com/justrach/codedb/issues/434)), [#438](https://github.com/justrach/codedb/pull/438) (Stage 2 of [#437](https://github.com/justrach/codedb/issues/437)), and [#436](https://github.com/justrach/codedb/pull/436) (rerank-trace logger).
+`0.2.5808` is a tool-schema fix for `codedb_bundle` plus historical offline ranking instrumentation that has since been removed. Three PRs ship together: [#435](https://github.com/justrach/codedb/pull/435) (Stage 1 of [#434](https://github.com/justrach/codedb/issues/434)), [#438](https://github.com/justrach/codedb/pull/438) (Stage 2 of [#437](https://github.com/justrach/codedb/issues/437)), and [#436](https://github.com/justrach/codedb/pull/436).
 
 ### MCP ([#434](https://github.com/justrach/codedb/issues/434), [#437](https://github.com/justrach/codedb/issues/437))
 
@@ -255,8 +273,7 @@ Function-calling LLMs were emitting `{tool: "codedb_outline", arguments: {}}` an
 
 ### Search ([#436](https://github.com/justrach/codedb/pull/436))
 
-- **Opt-in rerank-trace logger for offline tuning.** A v0 JSONL trace logger is added behind `rerank_trace = true` in `.codedbrc`. When enabled, each `searchContent` invocation appends one line — `{ts, query, results:[{path, line, score}]}` — so the data can be analyzed offline before deciding whether online learning-to-rank from agent traces is worth building. Pure observation, disabled by default, no ranking-behavior change. Query is capped at 256 bytes, results at 50 entries, and the file rotates by truncate-clobber at 10 MB. All I/O errors are swallowed — logging never breaks a search.
-- **`rerankAndFinalize`: score-then-sort, even at len 1.** A pre-existing micro-optimization skipped multi-signal scoring when the result list had fewer than two entries. With the trace logger landed, single-result entries logged `score=0.0`, indistinguishable from genuinely zero-confidence matches. Scoring now always runs; only the sort is guarded behind `len > 1`. Cost is a few µs per single-result search.
+- **`rerankAndFinalize`: score-then-sort, even at len 1.** A pre-existing micro-optimization skipped multi-signal scoring when the result list had fewer than two entries. Scoring now always runs; only the sort is guarded behind `len > 1`. Cost is a few us per single-result search.
 
 ### Validation
 
@@ -430,7 +447,7 @@ The `received keys: [...]` diagnostic that landed in [#357](https://github.com/j
 
 - 10-minute idle timeout: MCP sessions that stop receiving input are reaped, preventing zombie processes on long-running Claude sessions. (#148)
 - POLLHUP detection: stdin is polled; a closed read-end triggers immediate clean shutdown instead of waiting for the next read timeout. (#148)
-- `codedb_status` memory and index diagnostics are unaffected by telemetry call-count race (atomic increment fix). (#179)
+- `codedb_status` memory and index diagnostics are unaffected by call-count races. (#179)
 
 ### Infrastructure
 
@@ -455,7 +472,7 @@ The `received keys: [...]` diagnostic that landed in [#357](https://github.com/j
 - [#255](https://github.com/justrach/codedb/pull/255) `fix: index growth, stale entries, atomics, git HEAD perf, snapshot robustness`
 - [#239](https://github.com/justrach/codedb/pull/239) `feat: expand nuke into a full codedb uninstall`
 - [#238](https://github.com/justrach/codedb/pull/238) `fix: restore help CLI build and exit behavior`
-- [#236](https://github.com/justrach/codedb/pull/236) `fix: 8 MB release stack (#223) + atomic call_count in telemetry (#179)`
+- [#236](https://github.com/justrach/codedb/pull/236) `fix: 8 MB release stack (#223) + atomic call_count (#179)`
 - [#233](https://github.com/justrach/codedb/pull/233) `fix: 10min idle timeout + poll stdin for dead clients (#148)`
 - [#221](https://github.com/justrach/codedb/pull/221) `perf: worker-local initial indexing with deterministic merge`
 
@@ -492,7 +509,7 @@ The `received keys: [...]` diagnostic that landed in [#357](https://github.com/j
 
 - Warm snapshot reopen now restores snapshot outline/state directly, reuses persisted trigram sidecars, and avoids redundant `word.index` rewrites. This closes [#220](https://github.com/justrach/codedb/issues/220).
 - `codedb_query` adds a composable MCP search pipeline so agents can do multi-step retrieval in one tool call. This closes [#168](https://github.com/justrach/codedb/issues/168).
-- Search ranking now learns from query-to-open history through WAL-backed combo boosts. This closes [#195](https://github.com/justrach/codedb/issues/195).
+- Historical query-to-open ranking experiments are obsolete in current builds. This closes [#195](https://github.com/justrach/codedb/issues/195).
 - MCP sessions now record real client identity and expose memory diagnostics in `codedb_status`. This closes [#37](https://github.com/justrach/codedb/issues/37).
 - Root policy now refuses to index the home directory itself, preventing the large MCP RAM spike reported in [#174](https://github.com/justrach/codedb/issues/174).
 
@@ -548,8 +565,8 @@ Warm RSS is materially lower because reopen no longer reconstructs the same larg
 
 - Added `codedb_query`, a composable search pipeline for agent-driven retrieval workflows, including chained `find`, `search`, `filter`, `outline`, `read`, and `limit` stages in one call.
 - `codedb_find` now retries delimiter-heavy queries more intelligently, truncates overly noisy per-file output, and skips more large generated directories by default.
-- Search and file-access activity now writes to a local WAL, enabling combo-boost ranking for files that were historically opened after similar queries.
-- WAL profiling now records latency and file-access patterns locally, and hashed telemetry upload preserves aggregation value without sending raw queries or file paths off-machine.
+- Historical query/open profiling is obsolete; current builds do not persist
+  query records or include upload paths.
 - `codedb_status` now reports client identity and index-memory diagnostics so MCP clients can see which kind of index is active and how much memory it is retaining.
 
 ### Distribution Reliability
@@ -558,7 +575,9 @@ Warm RSS is materially lower because reopen no longer reconstructs the same larg
 
 ### Parser And Correctness Fixes
 
-- Fixed five correctness bugs from [#179](https://github.com/justrach/codedb/issues/179), including large-repo mmap cache validation, ANSI escape stripping, block-comment handling, Python docstring detection, and a telemetry write-path race.
+- Fixed five correctness bugs from [#179](https://github.com/justrach/codedb/issues/179),
+  including large-repo mmap cache validation, ANSI escape stripping,
+  block-comment handling, and Python docstring detection.
 - Parsing now correctly resumes after single-line `/* ... */` comments instead of skipping subsequent code on the line.
 - Added regression coverage for the `#179` parser fixes so comment/docstring edge cases stay fixed.
 
@@ -568,24 +587,24 @@ Warm RSS is materially lower because reopen no longer reconstructs the same larg
 - [#204](https://github.com/justrach/codedb/pull/204) `test: regression tests for #179 parser fixes`
 - [#203](https://github.com/justrach/codedb/pull/203) `fix: parse code after single-line /* */ comments`
 - [#202](https://github.com/justrach/codedb/pull/202) `fix: 5 bugs from issue #179`
-- [#201](https://github.com/justrach/codedb/pull/201) `fix: install script downloads from GitHub releases`
-- [#200](https://github.com/justrach/codedb/pull/200) `feat: combo-boost ranking from WAL`
-- [#199](https://github.com/justrach/codedb/pull/199) `feat: cloud WAL sync — hashed profiling telemetry`
-- [#198](https://github.com/justrach/codedb/pull/198) `feat: WAL profiling — latency + file access logging`
-- [#194](https://github.com/justrach/codedb/pull/194) `feat: search UX — auto-retry, per-file truncation, query WAL, skip dirs`
+- [#201](https://github.com/justrach/codedb/pull/201) historical installer cleanup
+- [#200](https://github.com/justrach/codedb/pull/200) obsolete local ranking experiment
+- [#199](https://github.com/justrach/codedb/pull/199) obsolete local profiling experiment
+- [#198](https://github.com/justrach/codedb/pull/198) obsolete local profiling experiment
+- [#194](https://github.com/justrach/codedb/pull/194) `feat: search UX — auto-retry, per-file truncation, skip dirs`
 - [#192](https://github.com/justrach/codedb/pull/192) `feat: MCP client identity + memory diagnostics`
 - [#191](https://github.com/justrach/codedb/pull/191) `fix: mmap_overlay fail-safe on allocation pressure`
 - [#190](https://github.com/justrach/codedb/pull/190) `perf: mmap overlay pattern for zero-heap incremental updates`
 - [#189](https://github.com/justrach/codedb/pull/189) `fix: releaseContents reclaims HashMap bucket memory`
 - [#180](https://github.com/justrach/codedb/pull/180) `feat: composable search pipeline — codedb_query`
 - [#178](https://github.com/justrach/codedb/pull/178) `fix: block home directory indexing to prevent 17GB RAM spike`
-- [#177](https://github.com/justrach/codedb/pull/177) `fix: correct install URL in nuke output`
-- [#176](https://github.com/justrach/codedb/pull/176) `fix: codedb update downloads directly from GitHub releases`
+- [#177](https://github.com/justrach/codedb/pull/177) historical installer cleanup
+- [#176](https://github.com/justrach/codedb/pull/176) historical updater cleanup
 
 ### Issues Closed In This Release Window
 
 - [#220](https://github.com/justrach/codedb/issues/220) `perf: persist startup-critical indexes aggressively for mmap-backed warm reopen`
-- [#195](https://github.com/justrach/codedb/issues/195) `feat: combo-boost ranking from query WAL`
+- [#195](https://github.com/justrach/codedb/issues/195) obsolete local ranking experiment
 - [#174](https://github.com/justrach/codedb/issues/174) `MCP mode: 17GB RAM spike when Claude Code starts in home directory`
 - [#168](https://github.com/justrach/codedb/issues/168) `feat: agent-defined search — let agents compose custom search pipelines`
 - [#37](https://github.com/justrach/codedb/issues/37) `Add real MCP client identity instead of hardcoding all edits to agent 1`

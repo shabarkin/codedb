@@ -1717,41 +1717,6 @@ test "issue-506: negotiateProtocolVersion returns null on empty input" {
     try testing.expect(mcp_mod.negotiateProtocolVersion("") == null);
 }
 
-test "issue-508: appendRemoteErrorHint differentiates Cloudflare 530 from 404/429" {
-    {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(testing.allocator);
-        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 530, "error code: 1033");
-        try testing.expect(std.mem.indexOf(u8, out.items, "origin is unreachable") != null);
-        try testing.expect(std.mem.indexOf(u8, out.items, "codedb_index") != null);
-    }
-    {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(testing.allocator);
-        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 530, "");
-        try testing.expect(std.mem.indexOf(u8, out.items, "Retry") != null);
-        try testing.expect(std.mem.indexOf(u8, out.items, "origin is unreachable") == null);
-    }
-    {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(testing.allocator);
-        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 404, "");
-        try testing.expect(std.mem.indexOf(u8, out.items, "not indexed") != null);
-    }
-    {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(testing.allocator);
-        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 429, "");
-        try testing.expect(std.mem.indexOf(u8, out.items, "rate limited") != null);
-    }
-    {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(testing.allocator);
-        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 200, "");
-        try testing.expectEqual(@as(usize, 0), out.items.len);
-    }
-}
-
 test "issue-507: indexFileOutlineOnly files remain searchable via tier 3" {
     // Repro for #507: after a snapshot rebuild, certain files showed up in
     // `tree` and `read` but searchContent returned 0 hits for substrings

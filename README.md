@@ -2,15 +2,6 @@
   <img src="assets/codedb.png" alt="codedb" width="200" />
 </p>
 
-<p align="center">
-  <a href="https://github.com/justrach/codedb/blob/main/LICENSE"><img src="https://img.shields.io/github/license/justrach/codedb?style=flat-square" alt="License" /></a>
-  <img src="https://img.shields.io/badge/zig-0.16-f7a41d?style=flat-square" alt="Zig 0.16" />
-  <img src="https://img.shields.io/badge/status-alpha-orange?style=flat-square" alt="Alpha" />
-  <a href="https://deepwiki.com/justrach/codedb"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <br />
-  <a href="https://trendshift.io/repositories/26207" target="_blank"><img src="https://trendshift.io/api/badge/repositories/26207" alt="justrach%2Fcodedb | Trendshift" width="250" height="55" /></a>
-</p>
-
 <h1 align="center">codedb</h1>
 
 <h3 align="center">Code intelligence server for AI agents. Zig core. MCP native.</h3>
@@ -47,7 +38,7 @@
 |--------------------------------------------------------|------------------------------------------|
 | 22 MCP tools for full codebase intelligence            | Deeper parser coverage and edge-case handling |
 | Trigram v2: integer doc IDs, batch-accumulate, merge intersect | Incremental segment-based indexing |
-| Warm, pre-indexed MCP queries can be hundreds of times faster than one-shot ripgrep | WASM target for Cloudflare Workers       |
+| Warm, pre-indexed MCP queries can be hundreds of times faster than one-shot ripgrep | WASM target experiments                  |
 | O(1) inverted word index for identifier lookup         | Multi-project support                    |
 | Structural outlines (functions, structs, imports)      | mmap-backed trigram index                |
 | Reverse dependency graph                               |                                          |
@@ -151,7 +142,6 @@ zig-out/bin/codedb /path/to/project hot
 | `codedb_changes` | Changed files since a sequence number |
 | `codedb_status` | Index status (file count, current sequence, scan phase) |
 | `codedb_snapshot` | Full pre-rendered JSON snapshot of the codebase |
-| `codedb_remote` | Query indexed public repos via api.wiki.codes — no local clone needed |
 | `codedb_projects` | List all locally indexed projects on this machine |
 | `codedb_index` | Index a local folder and write `codedb.snapshot` |
 | `codedb_find` | Fuzzy **file-name** search (typo-tolerant subsequence match against indexed paths — not a content/symbol search) |
@@ -165,42 +155,6 @@ literal search expands to remaining eligible files when candidates do not fill
 `max_results`, `max_per_file`, ignore rules, compact filtering, and the
 sensitive-file policy. Basename globs such as `*.ts` are promoted to `**/*.ts`
 in MCP search/glob/query filters so nested files are included by default.
-
-### `codedb_remote` — Cloud Intelligence
-
-Query any indexed public GitHub repo without cloning it. `codedb_remote` always uses `api.wiki.codes`; the old `codegraff` backend name is no longer a supported route. Omit `backend`, or keep `backend="wiki"` only for older prompts.
-
-```
-# Check what the remote slug supports
-codedb_remote repo="vercel/next.js" action="actions"
-
-# Get a compact directory summary instead of dumping a huge file list
-codedb_remote repo="vercel/next.js" action="tree" expand=false
-
-# Page a file tree by prefix and limit
-codedb_remote repo="vercel/next.js" action="tree" prefix="packages/" limit=100
-
-# Search for code in a dependency
-codedb_remote repo="justrach/merjs" action="search" query="handleRequest"
-
-# Read a small file slice
-codedb_remote repo="openai/codex" action="read" path="codex-rs/core/src/codex.rs" lines="1-80"
-
-# Exact symbol lookup
-codedb_remote repo="justrach/codedb" action="symbol" query="buildSnapshot"
-
-# Check dependency CVE evidence; scope can be runtime or all
-codedb_remote repo="axios/axios" action="cves" scope="runtime"
-
-# Raw wiki slugs are accepted for repos that are indexed that way
-codedb_remote repo="chromium" action="policy"
-```
-
-**Remote actions:** `actions`, `tree`, `outline`, `search`, `read`, `symbol`, `policy`, `deps`, `score`, `cves`, `commits`, `branches`, `dep-history`
-
-For Codex and Claude Code hook examples around `codedb_remote`, see [`docs/hooks-labs.md`](docs/hooks-labs.md).
-
-**Note:** This tool calls `https://api.wiki.codes`. No API key required. The repo must already be indexed by the public service.
 
 ### CLI Commands
 
@@ -443,7 +397,8 @@ zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos
 
 ### Releasing
 
-There is no release-binary publishing flow. Consumers build from source.
+There is no release-binary publishing flow. Consumers build from source, using
+the vendored Zig package dependencies in this repository.
 
 ---
 

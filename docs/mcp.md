@@ -177,7 +177,6 @@ comments. Unknown keys are ignored.
 # .codedbrc
 max_cached   = 16384   # in-memory ContentCache size (files); default 16384
 max_versions = 100     # versions kept per file in the change log; default 100
-rerank_trace = false   # write per-search rerank-trace.jsonl (debug only)
 ```
 
 Pass an alternative path with `--config-file <path>` to the CLI for

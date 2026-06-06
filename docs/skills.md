@@ -106,7 +106,6 @@ that project. Full keys + defaults:
 # .codedbrc
 max_cached   = 16384   # in-memory ContentCache size (files); v0.2.5815+
 max_versions = 100     # versions kept per file in the change log
-rerank_trace = false   # write per-search rerank-trace.jsonl (debug)
 ```
 
 INI-style `key = value`, one per line, `#` for comments, unknown keys
