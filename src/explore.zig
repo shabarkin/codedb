@@ -4469,7 +4469,7 @@ pub const Explorer = struct {
             }
         } else if (startsWith(line, "class ")) {
             if (extractIdent(line[6..])) |name| {
-                try appendOutlineSymbol(a, outline, name, .struct_def, line_num, line);
+                try appendOutlineSymbol(a, outline, name, .class_def, line_num, line);
             }
         } else if (startsWith(line, "import ") or startsWith(line, "from ")) {
             try appendOutlineSymbol(a, outline, line, .import, line_num, null);
@@ -6317,7 +6317,10 @@ fn extractIdent(s: []const u8) ?[]const u8 {
     var end: usize = 0;
     for (s) |ch| {
         if (end >= max_ident_len) break;
-        if (std.ascii.isAlphanumeric(ch) or ch == '_') {
+        // Accept ASCII identifier chars plus any non-ASCII UTF-8 byte (>= 0x80) so
+        // identifiers in non-Latin scripts (Korean, Japanese, accented Latin, ...)
+        // are captured rather than truncated to empty. See issue #518.
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80) {
             end += 1;
         } else break;
     }
@@ -6808,7 +6811,10 @@ fn extractRubyMethodName(s: []const u8) ?[]const u8 {
     var end: usize = 0;
     for (s) |ch| {
         if (end >= max_len) break;
-        if (std.ascii.isAlphanumeric(ch) or ch == '_') {
+        // Accept ASCII identifier chars plus any non-ASCII UTF-8 byte (>= 0x80) so
+        // identifiers in non-Latin scripts (Korean, Japanese, accented Latin, ...)
+        // are captured rather than truncated to empty. See issue #518.
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80) {
             end += 1;
         } else break;
     }
@@ -7335,6 +7341,30 @@ fn getFilename(path: []const u8) []const u8 {
     return path;
 }
 
+// Length of the longest common subsequence of two strings, case-insensitive.
+// Used as a fuzzy-match floor: how many of the query's characters actually align,
+// in order, somewhere in the path. See issue #518.
+fn lcsLenIgnoreCase(query: []const u8, path: []const u8) usize {
+    const MAXB = 512;
+    var row: [MAXB + 1]usize = undefined;
+    const pn = @min(path.len, MAXB);
+    for (0..pn + 1) |j| row[j] = 0;
+    for (query) |qc| {
+        const lq = toLowerByte(qc);
+        var prev_diag: usize = 0;
+        for (0..pn) |j| {
+            const tmp = row[j + 1];
+            if (lq == toLowerByte(path[j])) {
+                row[j + 1] = prev_diag + 1;
+            } else if (row[j] > row[j + 1]) {
+                row[j + 1] = row[j];
+            }
+            prev_diag = tmp;
+        }
+    }
+    return row[pn];
+}
+
 pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
     if (query.len == 0 or path.len == 0) return null;
     if (query.len > 128 or path.len > 512) return null;
@@ -7436,6 +7466,14 @@ pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
     // Minimum score threshold based on query length
     const min_threshold = @as(f32, @floatFromInt(query.len)) * MATCH_SCORE * 0.3;
     if (best_score < min_threshold) return null;
+
+    // Issue #518: a local alignment can clear the score floor on a handful of
+    // incidental matches even when most of the query never appears in the path
+    // (e.g. a 16-char query hitting 5 stray filename chars). Require the query and
+    // path to share a real in-order subsequence — at least 60% of the query's
+    // characters. Computed only for candidates past the score floor, so it adds
+    // no cost to the overwhelming majority of non-matching files.
+    if (lcsLenIgnoreCase(query, path) * 5 < query.len * 3) return null;
 
     // Special entry point bonus (like fff: main.go, index.ts, lib.rs rank higher)
     const fname = getFilename(path);

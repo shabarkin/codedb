@@ -173,6 +173,20 @@ test "issue-163: fuzzy no match returns null" {
     try testing.expect(score == null);
 }
 
+test "issue-518: fuzzy find has a subsequence floor — garbage queries return null" {
+    // Long queries whose characters only incidentally overlap a path must not
+    // score as confident hits. Before the LCS-ratio floor, the local alignment
+    // let a few stray filename matches clear the threshold, so codedb_find
+    // returned ranked results for queries that match no filename.
+    try testing.expect(fuzzyScore("zzznosuchfilexyz", "notrail.py") == null);
+    try testing.expect(fuzzyScore("Widget", "empty.py") == null);
+    // Typo-tolerant matches that share most of the query in order still score.
+    try testing.expect(fuzzyScore("authmid", "src/auth_middleware.py") != null);
+    try testing.expect(fuzzyScore("mian", "src/main.zig") != null);
+    try testing.expect(fuzzyScore("auth_midlware", "src/auth_middleware.py") != null);
+}
+
+
 test "issue-163: fuzzyFindFiles via Explorer" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
