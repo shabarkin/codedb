@@ -1420,6 +1420,19 @@ fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     }
 }
 
+fn appendInvalidRegexPatternError(alloc: std.mem.Allocator, out: *std.ArrayList(u8), pattern: []const u8) void {
+    if (explore_mod.invalidEscapeIndex(pattern)) |escape_idx| {
+        const w = cio.listWriter(out, alloc);
+        if (escape_idx + 1 < pattern.len) {
+            w.print("error: invalid regex pattern (unsupported escape '\\{c}')", .{pattern[escape_idx + 1]}) catch {};
+        } else {
+            w.print("error: invalid regex pattern (trailing escape '\\')", .{}) catch {};
+        }
+    } else {
+        out.appendSlice(alloc, "error: invalid regex pattern") catch {};
+    }
+}
+
 fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const query = getStr(args, "query") orelse {
         out.appendSlice(alloc, "error: missing 'query' argument") catch {};
@@ -1470,7 +1483,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     if (scope and is_regex) {
         const results = explorer.searchContentRegexWithScopeCapped(query, alloc, max_results, regex_engine_max_per_file) catch |err| {
             switch (err) {
-                error.InvalidPattern => out.appendSlice(alloc, "error: invalid regex pattern") catch {},
+                error.InvalidPattern => appendInvalidRegexPatternError(alloc, out, query),
                 else => out.appendSlice(alloc, "error: scoped regex search failed") catch {},
             }
             return;
@@ -1598,7 +1611,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     } else if (is_regex) {
         const results = explorer.searchContentRegexCapped(query, alloc, max_results, regex_engine_max_per_file) catch |err| {
             switch (err) {
-                error.InvalidPattern => out.appendSlice(alloc, "error: invalid regex pattern") catch {},
+                error.InvalidPattern => appendInvalidRegexPatternError(alloc, out, query),
                 else => out.appendSlice(alloc, "error: regex search failed") catch {},
             }
             return;
@@ -2505,11 +2518,8 @@ fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     };
     defer alloc.free(content);
 
-    // Bug 5: detect binary content (NUL byte in first 8KB) and stub the
-    // response — dumping raw bytes corrupts JSON consumers and leaks tokens
-    // for files that are never useful to a model.
-    const probe_len = @min(content.len, 8 * 1024);
-    if (std.mem.indexOfScalar(u8, content[0..probe_len], 0) != null) {
+    // Keep read behavior aligned with the indexer's binary sniff.
+    if (explore_mod.looksBinary(content)) {
         const w0 = cio.listWriter(out, alloc);
         const hash_b = std.hash.Wyhash.hash(0, content);
         w0.print("binary file: {d} bytes  hash:{x}\n", .{ content.len, hash_b }) catch {};
@@ -3783,6 +3793,14 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                     had_failure = true;
                     failure_step = step_i;
                     failure_reason = "empty regex pattern";
+                    failure_step_args = step;
+                    break;
+                }
+                if (explore_mod.invalidEscapeIndex(pat) != null) {
+                    w.print("error: invalid regex pattern\n", .{}) catch {};
+                    had_failure = true;
+                    failure_step = step_i;
+                    failure_reason = "invalid regex pattern";
                     failure_step_args = step;
                     break;
                 }

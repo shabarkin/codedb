@@ -515,10 +515,7 @@ fn parseInitialScanEntry(io: std.Io, root: []const u8, entry: InitialScanEntry, 
     const stat = try path_security.statSafeFile(io, dir, real_root, entry.path);
     if (stat.size > 512 * 1024) return null;
     const content = try path_security.readFileAlloc(io, dir, real_root, entry.path, arena_alloc, .limited(512 * 1024));
-    const check_len = @min(content.len, 512);
-    for (content[0..check_len]) |c| {
-        if (c == 0) return null;
-    }
+    if (explore_mod.looksBinary(content)) return null;
     // Threshold for including a file in the trigram index. Bumped from 64KB to
     // 1MB after the search-shootout bench (issue: large code files like
     // ReactFiberCompleteWork.js at 77KB were invisible to substring search,
@@ -617,10 +614,7 @@ fn readFileEntry(io: std.Io, root: []const u8, entry: InitialScanEntry, arena_al
     const stat = path_security.statSafeFile(io, dir, real_root, entry.path) catch return null;
     if (stat.size > 512 * 1024) return null;
     const c = path_security.readFileAlloc(io, dir, real_root, entry.path, arena_alloc, .limited(512 * 1024)) catch return null;
-    const check_len = @min(c.len, 512);
-    for (c[0..check_len]) |ch| {
-        if (ch == 0) return null;
-    }
+    if (explore_mod.looksBinary(c)) return null;
     return .{ .path = entry.path, .content = c };
 }
 
@@ -945,10 +939,7 @@ fn indexFileOutline(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: []co
     if (stat.size > 512 * 1024) return;
     const content = try path_security.readFileAlloc(io, dir, real_root, path, allocator, .limited(512 * 1024));
     defer allocator.free(content);
-    const check_len = @min(content.len, 512);
-    for (content[0..check_len]) |c| {
-        if (c == 0) return;
-    }
+    if (explore_mod.looksBinary(content)) return;
     try explorer.indexFileOutlineOnly(path, content);
 }
 
@@ -1227,11 +1218,7 @@ fn indexFileContent(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: []co
     var content_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer content_arena.deinit();
     const content = try path_security.readFileAlloc(io, dir, real_root, path, content_arena.allocator(), .limited(512 * 1024));
-    // Skip binary content (check first 512 bytes for null bytes)
-    const check_len = @min(content.len, 512);
-    for (content[0..check_len]) |c| {
-        if (c == 0) return;
-    }
+    if (explore_mod.looksBinary(content)) return;
     // Skip trigram indexing for files > 64KB to prevent OOM on large repos
     const effective_skip_trigram = skip_trigram or (content.len > 1024 * 1024);
     if (effective_skip_trigram) {
