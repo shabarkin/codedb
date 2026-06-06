@@ -503,7 +503,7 @@ pub fn matchGlob(pattern: []const u8, path: []const u8) bool {
     var lit_end: usize = 0;
     while (lit_end < pattern.len) : (lit_end += 1) {
         const c = pattern[lit_end];
-        if (c == '*' or c == '?' or c == '{') break;
+        if (c == '*' or c == '?' or c == '{' or c == '[') break;
     }
     if (lit_end > 0) {
         if (path.len < lit_end) return false;
@@ -522,7 +522,7 @@ fn globIsPureSuffix(pattern: []const u8) ?[]const u8 {
     if (pattern.len < 4) return null;
     if (pattern[0] != '*' or pattern[1] != '*' or pattern[2] != '/' or pattern[3] != '*') return null;
     const tail = pattern[4..];
-    for (tail) |c| if (c == '*' or c == '?' or c == '{' or c == '}') return null;
+    for (tail) |c| if (c == '*' or c == '?' or c == '{' or c == '}' or c == '[' or c == ']') return null;
     return tail;
 }
 
@@ -537,6 +537,60 @@ fn findBraceAlternatives(pattern: []const u8, open: usize) ?usize {
             else => {},
         }
     }
+    return null;
+}
+
+pub fn globPatternHasNestedBraces(pattern: []const u8) bool {
+    var depth: usize = 0;
+    for (pattern) |c| {
+        if (c == '{') {
+            depth += 1;
+            if (depth >= 2) return true;
+        } else if (c == '}') {
+            if (depth > 0) depth -= 1;
+        }
+    }
+    return false;
+}
+
+fn matchCharClass(pattern: []const u8, gi: usize, ch: u8) ?struct { matched: bool, next_gi: usize } {
+    if (gi >= pattern.len or pattern[gi] != '[') return null;
+    var i = gi + 1;
+    var negated = false;
+    if (i < pattern.len and (pattern[i] == '!' or pattern[i] == '^')) {
+        negated = true;
+        i += 1;
+    }
+
+    var saw_member = false;
+    var matched = false;
+    if (i < pattern.len and pattern[i] == ']') {
+        saw_member = true;
+        if (ch == ']') matched = true;
+        i += 1;
+    }
+
+    while (i < pattern.len) {
+        if (pattern[i] == ']' and saw_member) {
+            const raw_match = if (negated) !matched else matched;
+            const class_match = ch != '/' and raw_match;
+            return .{ .matched = class_match, .next_gi = i + 1 };
+        }
+
+        const start = pattern[i];
+        saw_member = true;
+        if (i + 2 < pattern.len and pattern[i + 1] == '-' and pattern[i + 2] != ']') {
+            const finish = pattern[i + 2];
+            const lo = @min(start, finish);
+            const hi = @max(start, finish);
+            if (ch >= lo and ch <= hi) matched = true;
+            i += 3;
+        } else {
+            if (ch == start) matched = true;
+            i += 1;
+        }
+    }
+
     return null;
 }
 
@@ -573,6 +627,17 @@ fn matchGlobFragmentThen(fragment: []const u8, gi_start: usize, path: []const u8
             if (ti >= path.len or path[ti] == '/') return false;
             gi += 1;
             ti += 1;
+        } else if (c == '[') {
+            if (ti >= path.len) return false;
+            if (matchCharClass(fragment, gi, path[ti])) |class| {
+                if (!class.matched) return false;
+                gi = class.next_gi;
+                ti += 1;
+            } else {
+                if (path[ti] != c) return false;
+                gi += 1;
+                ti += 1;
+            }
         } else {
             if (ti >= path.len or path[ti] != c) return false;
             gi += 1;
@@ -613,6 +678,17 @@ fn matchGlobRec(pattern: []const u8, gi_start: usize, path: []const u8, ti_start
             if (ti >= path.len or path[ti] == '/') return false;
             gi += 1;
             ti += 1;
+        } else if (c == '[') {
+            if (ti >= path.len) return false;
+            if (matchCharClass(pattern, gi, path[ti])) |class| {
+                if (!class.matched) return false;
+                gi = class.next_gi;
+                ti += 1;
+            } else {
+                if (path[ti] != c) return false;
+                gi += 1;
+                ti += 1;
+            }
         } else if (c == '{') {
             if (findBraceAlternatives(pattern, gi)) |close| {
                 var alt_start = gi + 1;
