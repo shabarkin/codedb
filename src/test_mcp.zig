@@ -1755,3 +1755,133 @@ test "issue-507: indexFileOutlineOnly files remain searchable via tier 3" {
     try testing.expect(hits.len > 0);
     try testing.expectEqualStrings(path, hits[0].path);
 }
+
+test "issue-516: codedb_search response discloses when max_results was clamped" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(testing.allocator);
+    var line_buf: [64]u8 = undefined;
+    for (0..10500) |i| {
+        const line = try std.fmt.bufPrint(&line_buf, "needle row {d}\n", .{i});
+        try content.appendSlice(testing.allocator, line);
+    }
+    try explorer.indexFile("src/big.zig", content.items);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"query":"needle","max_results":100000}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "10000 results for") == null or
+        std.mem.indexOf(u8, out.items, "clamp") != null or
+        std.mem.indexOf(u8, out.items, "more match") != null);
+}
+
+test "issue-XX: codedb_glob list cut at max_results carries a truncation marker" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn a() void {}\n");
+    try explorer.indexFile("src/b.zig", "pub fn b() void {}\n");
+    try explorer.indexFile("src/c.zig", "pub fn c() void {}\n");
+    try explorer.indexFile("src/d.zig", "pub fn d() void {}\n");
+    try explorer.indexFile("src/e.zig", "pub fn e() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"pattern":"src/*.zig","max_results":3}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_glob, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "more") != null);
+}
+
+test "issue-G1-7.2: codedb_glob character-class pattern must not silently return bare 'no matches'" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("apple.zig", "pub fn a() void {}\n");
+    try explorer.indexFile("zebra.zig", "pub fn z() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"pattern":"[az]*.zig"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_glob, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // '[az]*.zig' matches both indexed files under zsh/fd/rg semantics.
+    // codedb must either reject the unsupported class with a diagnostic or
+    // match it — a bare "no matches" is indistinguishable from the files
+    // not existing.
+    try testing.expect(std.mem.indexOf(u8, out.items, "no matches") == null);
+}
+
+test "issue-G2-7.6: codedb_glob nested brace pattern must not silently return bare 'no matches'" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn a() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"pattern":"**/*.{z{ig,on}}"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_glob, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // '**/*.{z{ig,on}}' means '**/*.{zig,zon}' under fd and rg globset and
+    // matches src/a.zig. codedb must either expand the nested brace or
+    // reject it with a diagnostic — not silently answer "no matches".
+    try testing.expect(std.mem.indexOf(u8, out.items, "no matches") == null);
+}
