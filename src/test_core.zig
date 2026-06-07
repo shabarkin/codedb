@@ -10,7 +10,6 @@ const edit_mod = @import("edit.zig");
 const explore = @import("explore.zig");
 const Explorer = explore.Explorer;
 
-
 test "store: record and retrieve snapshots" {
     var store = Store.init(testing.allocator);
     defer store.deinit();
@@ -22,7 +21,6 @@ test "store: record and retrieve snapshots" {
     try testing.expect(seq2 == 2);
     try testing.expect(store.currentSeq() == 2);
 }
-
 
 test "store: getLatest returns most recent version" {
     var store = Store.init(testing.allocator);
@@ -37,14 +35,12 @@ test "store: getLatest returns most recent version" {
     try testing.expect(latest.hash == 0x222);
 }
 
-
 test "store: getLatest returns null for unknown file" {
     var store = Store.init(testing.allocator);
     defer store.deinit();
 
     try testing.expect(store.getLatest("nope.zig") == null);
 }
-
 
 test "store: changesSince counts correctly" {
     var store = Store.init(testing.allocator);
@@ -58,7 +54,6 @@ test "store: changesSince counts correctly" {
     try testing.expect(store.changesSince(1) == 2);
     try testing.expect(store.changesSince(3) == 0);
 }
-
 
 test "store: changesSinceDetailed" {
     var store = Store.init(testing.allocator);
@@ -74,7 +69,6 @@ test "store: changesSinceDetailed" {
     try testing.expect(changes.len == 2); // a.zig and b.zig both changed
 }
 
-
 test "store: recordDelete creates tombstone" {
     var store = Store.init(testing.allocator);
     defer store.deinit();
@@ -86,7 +80,6 @@ test "store: recordDelete creates tombstone" {
     try testing.expect(latest.op == .tombstone);
     try testing.expect(latest.size == 0);
 }
-
 
 test "store: getAtCursor" {
     var store = Store.init(testing.allocator);
@@ -105,7 +98,6 @@ test "store: getAtCursor" {
     const at3 = store.getAtCursor("f.zig", 99).?;
     try testing.expect(at3.size == 30);
 }
-
 
 test "store: recordEdit persists diff data to data log" {
     var tmp_dir = testing.tmpDir(.{});
@@ -139,7 +131,6 @@ test "store: recordEdit persists diff data to data log" {
     try testing.expectEqualStrings(diff, buf[0..diff.len]);
 }
 
-
 test "agent: register and heartbeat" {
     var agents = AgentRegistry.init(testing.allocator);
     defer agents.deinit();
@@ -151,7 +142,6 @@ test "agent: register and heartbeat" {
     // No crash = success
 }
 
-
 test "agent: register multiple agents" {
     var agents = AgentRegistry.init(testing.allocator);
     defer agents.deinit();
@@ -161,7 +151,6 @@ test "agent: register multiple agents" {
     try testing.expect(a == 1);
     try testing.expect(b == 2);
 }
-
 
 test "agent: lock and unlock" {
     var agents = AgentRegistry.init(testing.allocator);
@@ -174,7 +163,6 @@ test "agent: lock and unlock" {
 
     agents.releaseLock(id, "file.zig");
 }
-
 
 test "agent: lock contention between agents" {
     var agents = AgentRegistry.init(testing.allocator);
@@ -199,7 +187,6 @@ test "agent: lock contention between agents" {
     try testing.expect(got_b2 == true);
 }
 
-
 test "agent: same-agent relock does not duplicate lock key" {
     var agents = AgentRegistry.init(testing.allocator);
     defer agents.deinit();
@@ -216,7 +203,6 @@ test "agent: same-agent relock does not duplicate lock key" {
     try testing.expect(agent.locked_paths.count() == 0);
 }
 
-
 test "agent: reapStale frees lock keys and clears map" {
     var agents = AgentRegistry.init(testing.allocator);
     defer agents.deinit();
@@ -232,7 +218,6 @@ test "agent: reapStale frees lock keys and clears map" {
     try testing.expect(agent.state == .crashed);
     try testing.expect(agent.locked_paths.count() == 0);
 }
-
 
 test "issue-411: tryLock grants new locks to a crashed agent" {
     var agents = AgentRegistry.init(testing.allocator);
@@ -254,6 +239,30 @@ test "issue-411: tryLock grants new locks to a crashed agent" {
     try testing.expect(got == false);
 }
 
+test "issue-528: each MCP session registers a distinct edit-lock owner (not shared agent 1)" {
+    // Bug 2 from the #528 audit: codedb_edit hardcoded agent_id=1, so concurrent
+    // edits from separate connections all shared the startup __filesystem__ agent
+    // and re-entrantly "won" the same-file lock. The MCP server now registers a
+    // distinct agent per session and threads it into handleEdit. This guards that
+    // registration yields distinct, non-1 owners that mutually exclude on a path.
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+
+    const fs = try agents.register("__filesystem__"); // startup agent (id 1)
+    const session_a = try agents.register("mcp-session");
+    const session_b = try agents.register("mcp-session");
+
+    try testing.expect(session_a != fs);
+    try testing.expect(session_b != fs);
+    try testing.expect(session_a != session_b);
+
+    // Distinct session owners serialize same-file edits (vs the old shared-id
+    // re-entrant grant that let two connections clobber each other).
+    try testing.expect(try agents.tryLock(session_a, "x.zig", 60_000));
+    try testing.expect(!(try agents.tryLock(session_b, "x.zig", 60_000)));
+    agents.releaseLock(session_a, "x.zig");
+    try testing.expect(try agents.tryLock(session_b, "x.zig", 60_000));
+}
 
 test "issue-401: insert with after=null is a no-op but consumes seq and writes file" {
     var tmp = testing.tmpDir(.{});
@@ -290,7 +299,6 @@ test "issue-401: insert with after=null is a no-op but consumes seq and writes f
         try testing.expectEqual(@as(u64, 0), store.currentSeq());
     }
 }
-
 
 test "issue-404: applyEdit corrupts CRLF line endings into mixed LF/CRLF" {
     var tmp = testing.tmpDir(.{});
@@ -338,7 +346,6 @@ test "issue-404: applyEdit corrupts CRLF line endings into mixed LF/CRLF" {
     }
 }
 
-
 test "issue-409: replacing whole file with empty content leaves a stray newline" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -378,7 +385,6 @@ test "issue-409: replacing whole file with empty content leaves a stray newline"
     try testing.expectEqual(@as(usize, 0), after.len);
     try testing.expectEqual(@as(u64, 0), result.new_size);
 }
-
 
 // ── Post-edit syntax health (trial/graph-based-codedb) ────────────────────
 
@@ -554,7 +560,6 @@ test "edit-health: a name re-imported from another module is not flagged" {
     try testing.expect(msg == null);
 }
 
-
 // ── Anchor-based str_replace (P2, trial/graph-based-codedb) ───────────────
 
 test "edit-str_replace: anchored replace updates the unique occurrence exactly" {
@@ -671,7 +676,6 @@ test "edit-str_replace: health check still runs on an anchored edit that breaks 
     try testing.expect(std.mem.indexOf(u8, result.health.?, "never closed") != null);
 }
 
-
 test "issue-101: Store.max_versions is configurable (caps per-file history)" {
     // Default cap is 100. After setting max_versions = 3, writing 5 versions
     // of the same file must leave exactly 3 in-memory.
@@ -692,7 +696,6 @@ test "issue-101: Store.max_versions is configurable (caps per-file history)" {
     try testing.expectEqual(@as(u64, 0x555), entry.versions.items[2].hash);
 }
 
-
 test "issue-102: Explorer.init capacity flows to ContentCache" {
     // Verifies that the capacity arg to Explorer.init actually sets the
     // ContentCache capacity — the bug that issue-102 was filed for.
@@ -701,7 +704,6 @@ test "issue-102: Explorer.init capacity flows to ContentCache" {
 
     try testing.expectEqual(@as(u32, 8), explorer.contents.capacity);
 }
-
 
 test "issue-101+102: .codedbrc max_cached threads through to ContentCache capacity" {
     // End-to-end: parse a .codedbrc body, construct Explorer with the parsed
@@ -726,4 +728,3 @@ test "issue-101+102: .codedbrc max_cached threads through to ContentCache capaci
     try testing.expectEqual(@as(usize, 7), store.max_versions);
     try testing.expectEqual(@as(u32, 32), explorer.contents.capacity);
 }
-

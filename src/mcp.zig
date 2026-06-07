@@ -493,7 +493,7 @@ pub const BenchContext = struct {
         explorer: *Explorer,
         agents: *AgentRegistry,
     ) void {
-        dispatch(io, alloc, tool, args, out, store, explorer, agents, &self.cache, null);
+        dispatch(io, alloc, tool, args, out, store, explorer, agents, &self.cache, null, 1);
     }
 
     pub fn runHandleCall(
@@ -507,7 +507,7 @@ pub const BenchContext = struct {
         explorer: *Explorer,
         agents: *AgentRegistry,
     ) void {
-        handleCall(io, alloc, root, stdout, id, store, explorer, agents, &self.cache, null);
+        handleCall(io, alloc, root, stdout, id, store, explorer, agents, &self.cache, null, 1);
     }
 
     pub fn runToolCall(
@@ -525,7 +525,7 @@ pub const BenchContext = struct {
         defer out.deinit(alloc);
 
         const t0 = cio.nanoTimestamp();
-        dispatch(io, alloc, tool, args, &out, store, explorer, agents, &self.cache, null);
+        dispatch(io, alloc, tool, args, &out, store, explorer, agents, &self.cache, null, 1);
         const elapsed = cio.nanoTimestamp() - t0;
 
         const is_error = std.mem.startsWith(u8, out.items, "error:");
@@ -804,6 +804,10 @@ const Session = struct {
     pending_roots_id: ?i64 = null,
     roots: std.ArrayList(Root) = .empty,
     deferred_scan: ?*DeferredScan = null,
+    /// Per-session advisory-lock owner for codedb_edit (#528 audit). Set to a
+    /// distinct registered agent id at session start; defaults to 1 so any path
+    /// that constructs a Session without registering still uses __filesystem__.
+    edit_agent_id: u64 = 1,
 
     fn freeRoots(self: *Session) void {
         for (self.roots.items) |r| {
@@ -870,6 +874,11 @@ pub fn run(
         .stdout = stdout,
         .deferred_scan = deferred_scan,
     };
+    // #528 audit: give this MCP session a distinct advisory-lock owner so that
+    // concurrent edits from separate connections (if a multi-connection MCP
+    // transport is added) serialize correctly instead of all sharing the
+    // startup __filesystem__ agent. Falls back to 1 (__filesystem__).
+    session.edit_agent_id = agents.register("mcp-session") catch 1;
     defer session.deinit();
 
     var read_buf: [4096]u8 = undefined;
@@ -933,7 +942,7 @@ pub fn run(
         } else if (mcpj.eql(method, "tools/list")) {
             if (!is_notification) writeResult(alloc, stdout, id, tools_list_response);
         } else if (mcpj.eql(method, "tools/call")) {
-            handleCall(io, alloc, root, stdout, id, store, explorer, agents, &cache, session.deferred_scan);
+            handleCall(io, alloc, root, stdout, id, store, explorer, agents, &cache, session.deferred_scan, session.edit_agent_id);
         } else if (mcpj.eql(method, "ping")) {
             if (!is_notification) writeResult(alloc, stdout, id, "{}");
         } else {
@@ -1094,6 +1103,7 @@ fn handleCall(
     agents: *AgentRegistry,
     cache: *ProjectCache,
     deferred_scan: ?*DeferredScan,
+    edit_agent_id: u64,
 ) void {
     const is_notification = id == null;
 
@@ -1132,7 +1142,7 @@ fn handleCall(
     defer out.deinit(alloc);
 
     const t0 = cio.nanoTimestamp();
-    dispatch(io, alloc, tool, args, &out, store, explorer, agents, cache, deferred_scan);
+    dispatch(io, alloc, tool, args, &out, store, explorer, agents, cache, deferred_scan, edit_agent_id);
     const elapsed = cio.nanoTimestamp() - t0;
 
     const is_error = std.mem.startsWith(u8, out.items, "error:");
@@ -1254,6 +1264,7 @@ fn dispatch(
     agents: *AgentRegistry,
     cache: *ProjectCache,
     deferred_scan: ?*DeferredScan,
+    edit_agent_id: u64,
 ) void {
     const project_path = getStr(args, "project");
     const ctx = if (project_path) |path|
@@ -1308,11 +1319,11 @@ fn dispatch(
         .codedb_hot => handleHot(alloc, args, out, ctx.store, ctx.explorer),
         .codedb_deps => handleDeps(alloc, args, out, ctx.explorer),
         .codedb_read => handleRead(io, alloc, args, out, ctx.explorer),
-        .codedb_edit => handleEdit(io, alloc, args, out, default_store, default_explorer, agents),
+        .codedb_edit => handleEdit(io, alloc, args, out, default_store, default_explorer, agents, edit_agent_id),
         .codedb_changes => handleChanges(alloc, args, out, default_store),
         .codedb_status => handleStatus(alloc, out, ctx.store, ctx.explorer),
         .codedb_snapshot => handleSnapshot(alloc, out, ctx.explorer, ctx.store, ctx.snapshot_cache),
-        .codedb_bundle => handleBundle(io, alloc, args, out, ctx.store, ctx.explorer, agents, cache, deferred_scan),
+        .codedb_bundle => handleBundle(io, alloc, args, out, ctx.store, ctx.explorer, agents, cache, deferred_scan, edit_agent_id),
         .codedb_projects => handleProjects(io, alloc, out),
         .codedb_index => handleIndex(io, alloc, args, out, cache, default_store, default_explorer, deferred_scan),
         .codedb_find => handleFind(alloc, args, out, ctx.explorer),
@@ -2590,7 +2601,7 @@ fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     }
 }
 
-fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer, agents: *AgentRegistry) void {
+fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer, agents: *AgentRegistry, edit_agent_id: u64) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path'") catch {};
         return;
@@ -2620,13 +2631,14 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     const range_end = getInt(args, "range_end");
     const after = getInt(args, "after");
 
-    // Use agent 1 (the __filesystem__ agent registered at startup).
-    // TODO: agent_id is hardcoded to 1 — two MCP clients share the same agent_id and
-    // could both acquire locks on different files without conflict, but cannot detect
-    // concurrent edits to the same file from separate connections.
+    // Per-session advisory-lock owner. The server threads a distinct agent id
+    // per MCP connection (Session.edit_agent_id), so concurrent edits to the
+    // same file from separate connections are detected instead of all sharing
+    // the startup __filesystem__ agent (#528 audit). Defaults to 1 (the
+    // __filesystem__ agent) for the single-connection stdio path.
     var req = edit_mod.EditRequest{
         .path = path,
-        .agent_id = 1,
+        .agent_id = edit_agent_id,
         .op = op,
         .content = content,
         .old_string = getStr(args, "old_string"),
@@ -2931,6 +2943,7 @@ fn handleBundle(
     agents: *AgentRegistry,
     cache: *ProjectCache,
     deferred_scan: ?*DeferredScan,
+    edit_agent_id: u64,
 ) void {
     const ops_val = args.get("ops") orelse {
         out.appendSlice(alloc, "error: missing 'ops' argument") catch {};
@@ -3048,7 +3061,7 @@ fn handleBundle(
         };
         sub_out.ensureTotalCapacity(alloc, sub_reserve) catch {};
 
-        dispatch(io, alloc, tool, sub_args, &sub_out, default_store, default_explorer, agents, cache, deferred_scan);
+        dispatch(io, alloc, tool, sub_args, &sub_out, default_store, default_explorer, agents, cache, deferred_scan, edit_agent_id);
 
         // Check size BEFORE appending to prevent blowout
         if (out.items.len + sub_out.items.len > 200 * 1024) {

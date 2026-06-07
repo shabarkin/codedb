@@ -983,7 +983,7 @@ fn parseJsonU64(json: []const u8, key: []const u8) ?u64 {
 
 /// Returns true if a file path looks like it may contain secrets.
 /// These files are excluded from snapshots to prevent accidental exposure.
-fn isSensitivePath(path: []const u8) bool {
+pub fn isSensitivePath(path: []const u8) bool {
     return path_security.isSensitivePath(path);
 }
 

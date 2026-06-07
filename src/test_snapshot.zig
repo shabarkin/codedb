@@ -846,3 +846,39 @@ test "issue-p0-2: corrupt META offset beyond EOF returns false without panicking
     const loaded = snapshot_mod.loadSnapshotValidated(io, snap_path, dir_path, &exp2, &store2, testing.allocator);
     try testing.expect(!loaded);
 }
+
+test "issue-528: isSensitivePath parity between snapshot.zig and watcher.zig" {
+    // Snapshot persistence and live indexing must agree on the centralized
+    // secret/credential filter. Drift here would mean a secret could leak into
+    // one path but not the other.
+    const cases = [_][]const u8{
+        // secrets — both copies must block
+        ".env",                         ".env.local",         ".env.production",
+        ".env.development",             ".env.staging",       ".env.test",
+        ".dev.vars",                    ".npmrc",             ".pypirc",
+        ".netrc",                       "credentials.json",   "service-account.json",
+        "secrets.json",                 "secrets.yaml",       "secrets.yml",
+        "id_rsa",                       "id_ed25519",         "server.key",
+        "cert.pem",                     "keystore.jks",       "identity.pfx",
+        "bundle.p12",                   "config/.env.local",  "a/b/secrets.yaml",
+        "deep/nested/.ssh/known_hosts", ".gnupg/secring.gpg", "x/.aws/credentials",
+        // non-secrets — both copies must allow (esp. the .env-prefix edge cases)
+        ".envoy.json",                  ".environment",       ".envrc",
+        ".envconfig.yaml",              "main.zig",           "src/server.zig",
+        "README.md",                    "package.json",       "id_rsa.pub",
+        "envvars.ts",                   "Makefile",           "Dockerfile",
+    };
+    for (cases) |p| {
+        try testing.expectEqual(watcher.isSensitivePath(p), snapshot_mod.isSensitivePath(p));
+    }
+    // Anchor the contract so parity can't be satisfied by both copies being
+    // wrong in the same direction.
+    try testing.expect(snapshot_mod.isSensitivePath(".env"));
+    try testing.expect(snapshot_mod.isSensitivePath("credentials.json"));
+    try testing.expect(snapshot_mod.isSensitivePath("deep/.ssh/id_rsa"));
+    try testing.expect(snapshot_mod.isSensitivePath("keystore.jks")); // fast-path ext
+    try testing.expect(!snapshot_mod.isSensitivePath(".envoy.json")); // issue-409
+    try testing.expect(!snapshot_mod.isSensitivePath(".environment"));
+    try testing.expect(!snapshot_mod.isSensitivePath("main.zig"));
+    try testing.expect(!snapshot_mod.isSensitivePath("package.json"));
+}
