@@ -3202,6 +3202,134 @@ pub const Explorer = struct {
         return n > 0;
     }
 
+    pub const CalleeRef = struct {
+        name: []const u8, // callee identifier (borrows the resolved body content)
+        path: []const u8, // file the callee is defined in (borrows a stable outlines key)
+        line: u32,
+        kind: SymbolKind,
+    };
+
+    /// Resolve the call sites inside the function defined at `path` spanning
+    /// [line_start, line_end] to their definitions — the dependency side of the
+    /// call-graph neighborhood, using the same extraction as centrality. Deduped
+    /// by callee name, capped at `max`, function/method targets only, and the
+    /// defining function itself is skipped. Best-effort. Everything is allocated
+    /// in / borrowed from `allocator` (intended to be a per-request arena); the
+    /// returned slice and each `.name` live as long as that allocator.
+    pub fn resolveCallees(
+        self: *Explorer,
+        path: []const u8,
+        line_start: u32,
+        line_end: u32,
+        allocator: std.mem.Allocator,
+        max: usize,
+    ) ![]CalleeRef {
+        if (max == 0 or line_end < line_start) return &.{};
+        const content = (self.getContent(path, allocator) catch return &.{}) orelse return &.{};
+        const body = sliceLineRange(content, line_start, line_end);
+        if (body.len == 0) return &.{};
+        const callees = codegraph.extractCallees(allocator, body) catch return &.{};
+
+        var refs: std.ArrayList(CalleeRef) = .empty;
+        for (callees) |name| {
+            if (refs.items.len >= max) break;
+            // Skip ubiquitous std/container/builtin method names. They are almost
+            // always calls on some receiver (ArrayList.append, HashMap.get, ...),
+            // not the rare user-defined free function of the same name, so name-
+            // based resolution would assert a false edge even when there's a
+            // single user definition.
+            if (isUbiquitousName(name)) continue;
+            const defs = self.findAllSymbols(name, allocator) catch continue;
+            // Only surface UNAMBIGUOUS edges: a callee is shown only if exactly
+            // one non-test function/method defines that name. Resolution here is
+            // name-based (no type info), so common method names (init, lock, get,
+            // next, ...) resolve to many candidates — guessing one would assert a
+            // false edge. Skipping them keeps this high-precision: distinctive
+            // names (extractCallees, readContentForSearch, ...) resolve cleanly;
+            // ambiguous ones are simply omitted. (Centrality tolerates ambiguity
+            // via 1/N weighting + aggregation; a per-edge display cannot.)
+            var cand: ?SymbolResult = null;
+            var n_cand: usize = 0;
+            for (defs) |d| {
+                if (d.symbol.kind != .function and d.symbol.kind != .method) continue;
+                if (isLikelyTestPath(d.path)) continue;
+                // Skip the defining function itself (self-edge / recursion).
+                if (d.symbol.line_start == line_start and std.mem.eql(u8, d.path, path)) continue;
+                n_cand += 1;
+                if (n_cand > 1) break; // ambiguous — stop, will be skipped
+                cand = d;
+            }
+            if (n_cand == 1) {
+                const d = cand.?;
+                try refs.append(allocator, .{
+                    .name = name,
+                    .path = d.path,
+                    .line = d.symbol.line_start,
+                    .kind = d.symbol.kind,
+                });
+            }
+        }
+        return refs.toOwnedSlice(allocator);
+    }
+
+    /// Heuristic: does this path look like a test/spec/fixture file? Mirrors the
+    /// filter used by the codedb_context callers section.
+    fn isLikelyTestPath(path: []const u8) bool {
+        return std.mem.startsWith(u8, path, "tests/") or
+            std.mem.startsWith(u8, path, "test/") or
+            std.mem.indexOf(u8, path, "/test") != null or
+            std.mem.indexOf(u8, path, "_test.") != null or
+            std.mem.indexOf(u8, path, ".test.") != null or
+            std.mem.indexOf(u8, path, ".spec.") != null or
+            std.mem.indexOf(u8, path, "/__tests__/") != null or
+            std.mem.indexOf(u8, path, "/spec/") != null or
+            std.mem.indexOf(u8, path, "/fixtures/") != null;
+    }
+
+    /// Names so commonly used as stdlib/container/builtin methods across
+    /// languages that a `name(` call site almost never refers to a user-defined
+    /// free function of that name. Used to suppress false callee edges from
+    /// name-only resolution. Conservative: only the highest-collision names.
+    fn isUbiquitousName(name: []const u8) bool {
+        const common = [_][]const u8{
+            "init",   "deinit",   "append",   "get",          "set",
+            "put",    "getOrPut", "remove",   "contains",     "has",
+            "count",  "len",      "items",    "alloc",        "free",
+            "create", "destroy",  "lock",     "unlock",       "tryLock",
+            "next",   "iterator", "clone",    "dupe",         "slice",
+            "reset",  "clear",    "format",   "hash",         "eql",
+            "write",  "writeAll", "print",    "read",         "close",
+            "open",   "value",    "key",      "toOwnedSlice", "pop",
+            "push",   "find",     "add",      "new",          "build",
+            "run",    "deinit",   "toString", "valueOf",      "of",
+        };
+        for (common) |c| {
+            if (std.mem.eql(u8, name, c)) return true;
+        }
+        return false;
+    }
+
+    /// Return the slice of `content` covering source lines [line_start, line_end]
+    /// (1-based, inclusive), excluding the trailing newline. Empty if out of range.
+    fn sliceLineRange(content: []const u8, line_start: u32, line_end: u32) []const u8 {
+        if (line_start == 0 or line_end < line_start) return content[0..0];
+        var line: u32 = 1;
+        var i: usize = 0;
+        while (i < content.len and line < line_start) : (i += 1) {
+            if (content[i] == '\n') line += 1;
+        }
+        if (i >= content.len) return content[0..0];
+        const start = i;
+        var cur: u32 = line_start;
+        while (i < content.len) : (i += 1) {
+            if (content[i] == '\n') {
+                if (cur >= line_end) break;
+                cur += 1;
+            }
+        }
+        return content[start..i];
+    }
+
     pub fn renderSymbols(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !bool {
         self.mu.lockShared();
         defer self.mu.unlockShared();

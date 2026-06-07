@@ -2115,7 +2115,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     };
     var by_file = std.StringHashMap(PerFile).init(A);
 
-    const SymRef = struct { kw: []const u8, kind: []const u8, path: []const u8, line: u32 };
+    const SymRef = struct { kw: []const u8, kind: []const u8, path: []const u8, line: u32, line_end: u32 };
     var sym_refs: std.ArrayList(SymRef) = .empty;
     var seen_syms = std.StringHashMap(void).init(A);
 
@@ -2132,6 +2132,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     .kind = @tagName(d.symbol.kind),
                     .path = d.path,
                     .line = d.symbol.line_start,
+                    .line_end = d.symbol.line_end,
                 }) catch break;
             }
         } else |_| {}
@@ -2298,6 +2299,31 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     }
                     shown_for_sym += 1;
                     total_shown += 1;
+                }
+            }
+        }
+
+        // Callees section (graph-resolved): walk each ≤3 key symbol's call sites
+        // through the resolved call graph and surface where each callee is
+        // defined. This is the dependency side of the neighborhood — pairs with
+        // the Callers section above so the agent sees both who calls a symbol and
+        // what it calls, without a follow-up codedb_outline/read on the callees.
+        if (inline_bodies) {
+            var any_callees = false;
+            var done_sym = std.StringHashMap(void).init(A);
+            for (sym_refs.items) |sr| {
+                const sym_key = std.fmt.allocPrint(A, "{s}:{d}", .{ sr.path, sr.line }) catch continue;
+                if (done_sym.contains(sym_key)) continue;
+                done_sym.put(sym_key, {}) catch {};
+                const callees = explorer.resolveCallees(sr.path, sr.line, sr.line_end, A, 6) catch continue;
+                if (callees.len == 0) continue;
+                if (!any_callees) {
+                    w.print("\n## Calls (graph-resolved callees of these symbols)\n", .{}) catch {};
+                    any_callees = true;
+                }
+                w.print("- {s} ({s}) calls:\n", .{ sr.kw, sr.kind }) catch {};
+                for (callees) |c| {
+                    w.print("    \xe2\x86\x92 {s} ({s})  {s}:{d}\n", .{ c.name, @tagName(c.kind), c.path, c.line }) catch {};
                 }
             }
         }
