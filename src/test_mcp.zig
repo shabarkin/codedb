@@ -1916,3 +1916,43 @@ test "issue-G2-7.6: codedb_glob nested brace pattern must not silently return ba
     // reject it with a diagnostic — not silently answer "no matches".
     try testing.expect(std.mem.indexOf(u8, out.items, "no matches") == null);
 }
+
+test "cli-mcp-parity: runCliTool bridges navigation commands to MCP handlers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var explorer = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer.indexFile("src/store.zig", "pub const Store = struct {};\n");
+    try explorer.indexFile("src/main.zig", "const Store = @import(\"store.zig\").Store;\npub fn main() void {}\n");
+
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        const code = mcp_mod.runCliTool(io, aa, &explorer, ".", "glob", &.{ "codedb", ".", "glob", "src/*.zig" }, 3, &out);
+        try testing.expectEqual(@as(?u8, 0), code);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
+    }
+
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        const code = mcp_mod.runCliTool(io, aa, &explorer, ".", "symbol", &.{ "codedb", ".", "symbol", "Store" }, 3, &out);
+        try testing.expectEqual(@as(?u8, 0), code);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
+    }
+
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        try testing.expectEqual(@as(?u8, null), mcp_mod.runCliTool(io, aa, &explorer, ".", "bogus", &.{ "codedb", ".", "bogus" }, 3, &out));
+    }
+
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        try testing.expectEqual(@as(?u8, 1), mcp_mod.runCliTool(io, aa, &explorer, ".", "glob", &.{ "codedb", ".", "glob" }, 3, &out));
+        try testing.expect(std.mem.indexOf(u8, out.items, "usage") != null);
+    }
+}
