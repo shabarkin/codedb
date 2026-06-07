@@ -608,16 +608,36 @@ fn cliIsQueryCmd(cmd: []const u8) bool {
 /// (CLI calls are infrequent and runQuery already tolerates concurrent reads
 /// from the watcher). On a fatal bind failure it logs and returns — the daemon
 /// keeps working and clients simply fall back to the cold path.
-fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, abs_root: []const u8) void {
+/// Daemon side. Bind a per-project Unix socket and serve framed query requests
+/// against the warm `explorer`/`store`. Runs on its own detached thread so it
+/// never blocks the daemon's primary loop. Connections are handled sequentially
+/// (CLI calls are infrequent and runQuery already tolerates concurrent reads
+/// from the watcher).
+///
+/// `last_activity_ms` is bumped to the current ms timestamp at the start of
+/// every accepted connection so a time-based idle watchdog (cli-daemon) can
+/// tell when the socket has gone quiet. `shutdown` is set to true on a fatal
+/// bind/listen failure: this lets an auto-spawned cli-daemon that lost the bind
+/// race to an already-running daemon exit promptly instead of lingering. The
+/// long-lived serve/mcp daemons pass a `shutdown` flag they never watch, so for
+/// them a bind failure simply disables the proxy (clients fall back to cold).
+fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, abs_root: []const u8, last_activity_ms: *std.atomic.Value(i64), shutdown: *std.atomic.Value(bool)) void {
     var path_buf: [128]u8 = undefined;
     const sock_path = cliSocketPath(&path_buf, abs_root) orelse {
         std.log.warn("cli-proxy: could not build socket path", .{});
+        shutdown.store(true, .release);
         return;
     };
     var path_z_buf: [128]u8 = undefined;
-    const sock_path_z = std.fmt.bufPrintZ(&path_z_buf, "{s}", .{sock_path}) catch return;
+    const sock_path_z = std.fmt.bufPrintZ(&path_z_buf, "{s}", .{sock_path}) catch {
+        shutdown.store(true, .release);
+        return;
+    };
 
-    const sa = cliFillSockaddr(sock_path) orelse return;
+    const sa = cliFillSockaddr(sock_path) orelse {
+        shutdown.store(true, .release);
+        return;
+    };
 
     // Try to bind; if the path is stale (a dead daemon left it behind) unlink
     // and retry once. listenfd is owned for the lifetime of the daemon.
@@ -627,6 +647,7 @@ fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer
         const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
         if (fd < 0) {
             std.log.warn("cli-proxy: socket() failed", .{});
+            shutdown.store(true, .release);
             return;
         }
         var sa_mut = sa;
@@ -641,10 +662,16 @@ fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer
             _ = std.c.unlink(sock_path_z.ptr);
             continue;
         }
+        // A live daemon already owns this socket (lost the bind race). Signal
+        // shutdown so a duplicate auto-spawned cli-daemon exits promptly.
         std.log.warn("cli-proxy: bind {s} failed — proxy disabled", .{sock_path});
+        shutdown.store(true, .release);
         return;
     }
-    if (listenfd < 0) return;
+    if (listenfd < 0) {
+        shutdown.store(true, .release);
+        return;
+    }
     defer {
         _ = std.c.close(listenfd);
         _ = std.c.unlink(sock_path_z.ptr);
@@ -657,6 +684,7 @@ fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer
 
     if (std.c.listen(listenfd, 16) != 0) {
         std.log.warn("cli-proxy: listen failed — proxy disabled", .{});
+        shutdown.store(true, .release);
         return;
     }
     std.log.info("cli-proxy: listening on {s}", .{sock_path});
@@ -668,6 +696,8 @@ fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer
             // Listener went bad; stop the loop (daemon still serves its main API).
             return;
         }
+        // Record activity for the cli-daemon idle watchdog before serving.
+        last_activity_ms.store(cio.milliTimestamp(), .release);
         cliServeConn(io, allocator, explorer, store, abs_root, conn);
         _ = std.c.close(conn);
     }
@@ -963,6 +993,20 @@ fn mainImpl() !void {
         if (cliTryProxy(io, allocator, abs_root, args, use_color)) |code| {
             out.flush();
             std.process.exit(code);
+        }
+        // No daemon answered. Auto-spawn a detached cli-daemon so the NEXT call
+        // is warm; this call still falls through to the cold path below. The
+        // daemon is the SAME binary (resolved via the self-exe path) run as
+        // `codedb <abs_root> cli-daemon`, with stdio redirected to /dev/null and
+        // no waitpid (fire-and-forget). Gated by CODEDB_NO_CLI_DAEMON and skipped
+        // for an empty root. cli-daemon is not a query command, so the spawned
+        // process won't recurse into this path.
+        if (cio.posixGetenv("CODEDB_NO_CLI_DAEMON") == null and abs_root.len > 0) {
+            if (std.process.executablePathAlloc(io, allocator)) |self_exe| {
+                defer allocator.free(self_exe);
+                const daemon_argv = [_][]const u8{ self_exe, abs_root, "cli-daemon" };
+                cio.spawnDetached(allocator, &daemon_argv);
+            } else |_| {}
         }
     }
 
@@ -1350,6 +1394,77 @@ fn mainImpl() !void {
             sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed),
             s.reset,
         });
+    } else if (std.mem.eql(u8, cmd, "cli-daemon")) {
+        // Hidden command: a lightweight warm daemon spawned by a cold CLI query
+        // so the NEXT query is fast. It is `serve` minus the TCP server, agent
+        // registry, and reaper — just the warm explorer/store (loaded by the
+        // section above), an incremental watcher to keep the index fresh, the
+        // per-project CLI socket listener, and a time-based idle watchdog that
+        // exits the process once the socket has been quiet for a while. We do
+        // NOT auto-spawn `serve` here because two `serve` daemons would fight
+        // over the fixed TCP port; the CLI socket is per-project and conflict-free.
+
+        // Detach from the controlling terminal so we outlive the spawning CLI
+        // and never touch its stdio. (spawnDetached already pointed 0/1/2 at
+        // /dev/null; this also starts a fresh session.)
+        cio.detachFromTerminal();
+
+        const idle_ms: i64 = blk: {
+            const raw = cio.posixGetenv("CODEDB_CLI_DAEMON_IDLE_MS") orelse break :blk 5 * 60 * 1000;
+            break :blk std.fmt.parseInt(i64, raw, 10) catch (5 * 60 * 1000);
+        };
+
+        var shutdown = std.atomic.Value(bool).init(false);
+        defer shutdown.store(true, .release);
+        // The load section above already loaded/scanned the index, so the
+        // watcher starts in the "scan done" state and only does incremental
+        // upkeep from here.
+        var scan_already_done = std.atomic.Value(bool).init(true);
+
+        // Grace period: treat startup as activity so a freshly-spawned daemon
+        // gets the full idle window before the watchdog can fire.
+        var last_activity_ms = std.atomic.Value(i64).init(cio.milliTimestamp());
+
+        const queue = try allocator.create(watcher.EventQueue);
+        defer allocator.destroy(queue);
+        queue.* = watcher.EventQueue{};
+        const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ io, &store, &explorer, queue, root, &shutdown, &scan_already_done });
+        watch_thread.detach();
+
+        std.log.info("cli-daemon: {d} files indexed, idle_timeout={d}ms", .{ store.currentSeq(), idle_ms });
+
+        // CLI socket listener. Pass the REAL shutdown flag: if another daemon
+        // already owns the socket (we lost the bind race), cliDaemonListen sets
+        // shutdown and the watchdog below returns at once, so the redundant
+        // daemon exits instead of lingering idle.
+        if (std.Thread.spawn(.{}, cliDaemonListen, .{ io, allocator, &explorer, &store, abs_root, &last_activity_ms, &shutdown })) |cli_t| {
+            cli_t.detach();
+        } else |err| {
+            std.log.warn("cli-proxy: could not start listener: {s}", .{@errorName(err)});
+            return;
+        }
+
+        // Block here until idle (or a bind-race shutdown). On return the process
+        // exits immediately — std.process.exit reclaims everything and avoids
+        // racing the detached listener thread against freed explorer/store.
+        const idle_exit = cliIdleWatchdog(&shutdown, &last_activity_ms, idle_ms);
+        shutdown.store(true, .release);
+        // If WE owned the socket (exited on idle, not a bind-race loss), unlink
+        // it on the way out. The listener thread's own `defer unlink` never runs
+        // because std.process.exit kills it mid-accept; do it here so we don't
+        // leave a stale node behind. On a bind-race loss the socket belongs to
+        // the winning daemon, so idle_exit is false and we leave it alone.
+        if (idle_exit) {
+            var sock_buf: [128]u8 = undefined;
+            if (cliSocketPath(&sock_buf, abs_root)) |sock_path| {
+                var sock_z_buf: [128]u8 = undefined;
+                if (std.fmt.bufPrintZ(&sock_z_buf, "{s}", .{sock_path})) |sock_z| {
+                    _ = std.c.unlink(sock_z.ptr);
+                } else |_| {}
+            }
+        }
+        out.flush();
+        std.process.exit(0);
     } else if (std.mem.eql(u8, cmd, "serve")) {
         const port = defaultServePort(cio.posixGetenv("CODEDB_PORT"));
         const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
@@ -1395,7 +1510,13 @@ fn mainImpl() !void {
         // Thin-CLI proxy listener: lets `codedb <root> <query>` invocations
         // reuse this warm explorer/store over a per-project Unix socket instead
         // of paying a cold snapshot reload. Detached so it never blocks serve().
-        if (std.Thread.spawn(.{}, cliDaemonListen, .{ io, allocator, &explorer, &store, abs_root })) |cli_t| {
+        // serve has no idle timeout: it passes throwaway activity/shutdown
+        // atomics that nobody watches (a bind failure just disables the proxy).
+        // These outlive the detached thread because server.serve() below blocks
+        // on this same stack frame for the whole process lifetime.
+        var cli_activity = std.atomic.Value(i64).init(cio.milliTimestamp());
+        var cli_listener_dead = std.atomic.Value(bool).init(false);
+        if (std.Thread.spawn(.{}, cliDaemonListen, .{ io, allocator, &explorer, &store, abs_root, &cli_activity, &cli_listener_dead })) |cli_t| {
             cli_t.detach();
         } else |err| {
             std.log.warn("cli-proxy: could not start listener: {s}", .{@errorName(err)});
@@ -1473,8 +1594,13 @@ fn mainImpl() !void {
         // Thin-CLI proxy listener (same as the serve branch): serve read-only
         // query commands from this warm explorer/store over a per-project Unix
         // socket so plain `codedb <root> <query>` calls skip a cold reload.
-        // Detached so it never blocks mcp_server.run().
-        if (std.Thread.spawn(.{}, cliDaemonListen, .{ io, allocator, &explorer, &store, abs_root })) |cli_t| {
+        // Detached so it never blocks mcp_server.run(). Like serve, mcp has no
+        // idle timeout — throwaway activity/shutdown atomics that nobody watches.
+        // They outlive the detached thread because mcp_server.run() below blocks
+        // on this same stack frame for the whole process lifetime.
+        var cli_activity = std.atomic.Value(i64).init(cio.milliTimestamp());
+        var cli_listener_dead = std.atomic.Value(bool).init(false);
+        if (std.Thread.spawn(.{}, cliDaemonListen, .{ io, allocator, &explorer, &store, abs_root, &cli_activity, &cli_listener_dead })) |cli_t| {
             cli_t.detach();
         } else |err| {
             std.log.warn("cli-proxy: could not start listener: {s}", .{@errorName(err)});
@@ -1600,7 +1726,7 @@ pub fn isValidMcpFlag(arg: []const u8) bool {
 }
 
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "snapshot", "serve", "mcp", "update", "nuke" };
+    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
     for (commands) |c| {
         if (std.mem.eql(u8, arg, c)) return true;
     }
@@ -2197,4 +2323,34 @@ fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
 
         cio.sleepMs(mcp.dead_client_poll_ms);
     }
+}
+
+/// Time-based idle watchdog for the `cli-daemon` background process. Unlike
+/// `idleWatchdog` (which watches stdin for POLLHUP on an MCP stdio transport),
+/// this exits the daemon after `idle_ms` elapse with no CLI socket activity.
+/// "Activity" is the last_activity_ms timestamp bumped by cliDaemonListen at
+/// the start of each accepted connection. It also returns promptly if
+/// `shutdown` is set externally — e.g. cliDaemonListen sets it when this daemon
+/// lost the bind race to an already-running daemon, so the redundant daemon
+/// tears down immediately instead of idling for the full timeout.
+///
+/// Returns true when it exited because the idle window elapsed (this daemon
+/// owned the socket and the caller should clean it up), or false when it
+/// returned because `shutdown` was already set by someone else (a bind-race
+/// loss — the socket belongs to the winning daemon, so the caller must NOT
+/// unlink it).
+fn cliIdleWatchdog(shutdown: *std.atomic.Value(bool), last_activity_ms: *std.atomic.Value(i64), idle_ms: i64) bool {
+    while (!shutdown.load(.acquire)) {
+        // Poll in 250ms slices so a bind-race shutdown (set by cliDaemonListen)
+        // is honored quickly rather than after a full idle window.
+        cio.sleepMs(250);
+        if (shutdown.load(.acquire)) return false;
+        const idle = cio.milliTimestamp() - last_activity_ms.load(.acquire);
+        if (idle >= idle_ms) {
+            std.log.info("cli-daemon: idle {d}ms >= {d}ms — exiting", .{ idle, idle_ms });
+            shutdown.store(true, .release);
+            return true;
+        }
+    }
+    return false;
 }

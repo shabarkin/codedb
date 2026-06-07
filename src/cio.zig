@@ -44,6 +44,12 @@ const Os = if (is_freestanding) struct {
         _ = fd;
         return 0;
     }
+
+    fn open(path: [*:0]const u8, oflag: c_int) c_int {
+        _ = path;
+        _ = oflag;
+        return -1;
+    }
 } else struct {
     extern "c" fn write(fd: c_int, ptr: [*]const u8, len: usize) isize;
     extern "c" fn read(fd: c_int, ptr: [*]u8, len: usize) isize;
@@ -51,6 +57,7 @@ const Os = if (is_freestanding) struct {
     extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
     extern "c" fn pipe(fds: *[2]c_int) c_int;
     extern "c" fn close(fd: c_int) c_int;
+    extern "c" fn open(path: [*:0]const u8, oflag: c_int) c_int;
 };
 
 const Clock = if (is_freestanding) struct {
@@ -91,6 +98,7 @@ const Spawn = if (is_freestanding) struct {} else struct {
     extern "c" fn posix_spawn_file_actions_adddup2(fa: *PosixSpawnFileActions, fd: c_int, newfd: c_int) c_int;
     extern "c" fn posix_spawn_file_actions_addclose(fa: *PosixSpawnFileActions, fd: c_int) c_int;
     extern "c" fn posix_spawn_file_actions_addchdir_np(fa: *PosixSpawnFileActions, path: [*:0]const u8) c_int;
+    extern "c" fn posix_spawn_file_actions_addopen(fa: *PosixSpawnFileActions, fd: c_int, path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int;
     extern "c" fn waitpid(pid: pid_t, status: *c_int, options: c_int) pid_t;
 };
 
@@ -102,6 +110,25 @@ pub fn ignoreSigpipe() void {
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.PIPE, &act, null);
+}
+
+/// Detach a daemonized child from its controlling terminal: start a new
+/// session (so it survives the spawning shell / parent CLI) and point
+/// stdin/stdout/stderr at /dev/null (so it never holds the terminal open or
+/// writes stray bytes to it). Best-effort — every step ignores errors, since a
+/// failure here only means the daemon keeps an inherited fd, not that it
+/// malfunctions. Called once at cli-daemon startup.
+pub fn detachFromTerminal() void {
+    _ = std.c.setsid();
+    // O_RDWR == 2 on both Darwin and Linux.
+    if (is_freestanding) return;
+    const fd = Os.open("/dev/null", 2);
+    if (fd >= 0) {
+        _ = std.c.dup2(fd, 0);
+        _ = std.c.dup2(fd, 1);
+        _ = std.c.dup2(fd, 2);
+        if (fd > 2) _ = Os.close(fd);
+    }
 }
 
 const CLOCK_REALTIME: c_int = 0;
@@ -539,4 +566,58 @@ pub fn runCapture(opts: RunOptions) !CaptureResult {
         .stderr = try err_ctx.out.toOwnedSlice(alloc),
         .term = term,
     };
+}
+
+/// Fire-and-forget spawn: posix_spawnp `argv` with stdin/stdout/stderr
+/// redirected to /dev/null, and do NOT wait on the child. Used to launch the
+/// warm cli-daemon from a cold CLI invocation. The child is expected to
+/// setsid() itself; once this CLI process exits the child is reparented to
+/// init, so we never reap it (no zombie outlives this short-lived CLI). All
+/// failures are swallowed — auto-spawn is best-effort and the cold path still
+/// produces correct output regardless.
+pub fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    if (is_freestanding) return;
+    if (argv.len == 0) return;
+
+    const c_argv = allocator.alloc(?[*:0]const u8, argv.len + 1) catch return;
+    defer allocator.free(c_argv);
+    const arg_bufs = allocator.alloc([]u8, argv.len) catch return;
+    var built: usize = 0;
+    defer {
+        for (arg_bufs[0..built]) |b| allocator.free(b);
+        allocator.free(arg_bufs);
+    }
+    for (argv, 0..) |a, i| {
+        const buf = allocator.alloc(u8, a.len + 1) catch return;
+        @memcpy(buf[0..a.len], a);
+        buf[a.len] = 0;
+        arg_bufs[i] = buf;
+        built = i + 1;
+        c_argv[i] = @ptrCast(buf.ptr);
+    }
+    c_argv[argv.len] = null;
+    const c_argv_z: [*:null]const ?[*:0]const u8 = @ptrCast(c_argv.ptr);
+
+    var fa_storage: PosixSpawnFAStorage = undefined;
+    const fa: *PosixSpawnFileActions = @ptrCast(&fa_storage);
+    if (Spawn.posix_spawn_file_actions_init(fa) != 0) return;
+    defer _ = Spawn.posix_spawn_file_actions_destroy(fa);
+
+    // Redirect 0/1/2 to /dev/null so the daemon holds no inherited terminal fds.
+    // O_RDWR == 2 on both Darwin and Linux. Errors are non-fatal — the daemon
+    // re-redirects to /dev/null itself after setsid() at startup.
+    const devnull: [*:0]const u8 = "/dev/null";
+    _ = Spawn.posix_spawn_file_actions_addopen(fa, 0, devnull, 2, 0);
+    _ = Spawn.posix_spawn_file_actions_addopen(fa, 1, devnull, 2, 0);
+    _ = Spawn.posix_spawn_file_actions_addopen(fa, 2, devnull, 2, 0);
+
+    const envp: [*:null]const ?[*:0]const u8 = if (builtin.os.tag == .macos)
+        @ptrCast(DarwinArgs._NSGetEnviron().*)
+    else
+        @ptrCast(std.c.environ);
+
+    var pid: pid_t = 0;
+    // Fire and forget: no waitpid. The child reparents to init once this CLI
+    // exits, so it never becomes a lingering zombie of ours.
+    _ = Spawn.posix_spawnp(&pid, c_argv[0].?, fa, null, c_argv_z, envp);
 }
