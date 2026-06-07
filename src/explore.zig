@@ -3147,6 +3147,49 @@ pub const Explorer = struct {
         return result_list.toOwnedSlice(allocator);
     }
 
+    // Resolve an exact symbol name to its definition sites for codedb_find's
+    // symbol fast-path. Uses findAllSymbols — the COMPLETE lookup including the
+    // outline safety scan, because symbol_index alone is incomplete for some
+    // languages (e.g. it indexes ~no TypeScript functions). That costs about what
+    // codedb_symbol does (~2ms) but resolves real symbols reliably and far below
+    // the fuzzy file scan. Definition kinds rank above import/comment usages, and
+    // when no real definition exists the usages are shown as a fallback. Returns
+    // false WITHOUT writing anything when there's no such symbol, so the caller
+    // falls back to fuzzy file search.
+    pub fn renderSymbolDefsFast(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), max_results: usize) bool {
+        const results = self.findAllSymbols(name, allocator) catch return false;
+        defer {
+            for (results) |r| {
+                allocator.free(r.path);
+                allocator.free(r.symbol.name);
+                if (r.symbol.detail) |d| allocator.free(d);
+            }
+            allocator.free(results);
+        }
+        if (results.len == 0) return false;
+        var has_def = false;
+        for (results) |r| {
+            if (r.symbol.kind != .import and r.symbol.kind != .comment_block) {
+                has_def = true;
+                break;
+            }
+        }
+        out.appendSlice(allocator, "exact symbol matches (codedb_symbol shows bodies):\n") catch return false;
+        var n: usize = 0;
+        for (results) |r| {
+            if (n >= max_results) break;
+            const is_def = r.symbol.kind != .import and r.symbol.kind != .comment_block;
+            if (has_def and !is_def) continue;
+            var nb: [16]u8 = undefined;
+            out.appendSlice(allocator, std.fmt.bufPrint(&nb, "{d}. ", .{n + 1}) catch continue) catch {};
+            out.appendSlice(allocator, r.path) catch {};
+            var lb: [64]u8 = undefined;
+            out.appendSlice(allocator, std.fmt.bufPrint(&lb, ":{d} ({s})\n", .{ r.symbol.line_start, @tagName(r.symbol.kind) }) catch continue) catch {};
+            n += 1;
+        }
+        return n > 0;
+    }
+
     pub fn renderSymbols(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !bool {
         self.mu.lockShared();
         defer self.mu.unlockShared();

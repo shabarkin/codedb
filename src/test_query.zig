@@ -253,6 +253,39 @@ test "fuzzy SIMD batch scorer matches scalar fuzzyScore exactly" {
 }
 
 
+test "find: symbol fast-path classifier and lookup" {
+    try testing.expect(mcp_mod.looksLikeCompoundIdentifier("getTokenProvider"));
+    try testing.expect(mcp_mod.looksLikeCompoundIdentifier("TokenProvider"));
+    try testing.expect(mcp_mod.looksLikeCompoundIdentifier("handle_request"));
+    try testing.expect(mcp_mod.looksLikeCompoundIdentifier("abortChatRunById"));
+    try testing.expect(!mcp_mod.looksLikeCompoundIdentifier("auth"));
+    try testing.expect(!mcp_mod.looksLikeCompoundIdentifier("config"));
+    try testing.expect(!mcp_mod.looksLikeCompoundIdentifier("README"));
+    try testing.expect(!mcp_mod.looksLikeCompoundIdentifier("provider.ts"));
+    try testing.expect(!mcp_mod.looksLikeCompoundIdentifier("src/main"));
+    try testing.expect(!mcp_mod.looksLikeCompoundIdentifier("auth provider"));
+    try testing.expect(!mcp_mod.looksLikeCompoundIdentifier("abc"));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer.indexFile("src/auth.zig", "pub fn getTokenProvider() void {}\n");
+    try explorer.indexFile("src/use.zig", "const getTokenProvider = @import(\"auth.zig\").getTokenProvider;\n");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try testing.expect(explorer.renderSymbolDefsFast("getTokenProvider", alloc, &out, 10));
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/auth.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "(function)") != null);
+
+    var miss: std.ArrayList(u8) = .empty;
+    defer miss.deinit(alloc);
+    try testing.expect(!explorer.renderSymbolDefsFast("nonexistentSymbolXyz", alloc, &miss, 10));
+    try testing.expectEqual(@as(usize, 0), miss.items.len);
+}
+
+
 test "issue-163: fuzzyFindFiles via Explorer" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();

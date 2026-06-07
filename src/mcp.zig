@@ -3270,6 +3270,32 @@ fn handleIndex(
     }
 }
 
+// True when `q` is a single compound identifier — camelCase/PascalCase (an
+// interior uppercase alongside a lowercase) or snake_case (an underscore) — and
+// contains only identifier characters (no space, path separator, glob, dot, or
+// colon). These queries are almost always symbol names, not filenames, and are
+// exactly the ones that miss the exact-filename fast path and fall into the slow
+// fuzzy scan. ALL-CAPS (e.g. README) is excluded so filename-ish tokens stay on
+// the fuzzy path.
+pub fn looksLikeCompoundIdentifier(q: []const u8) bool {
+    if (q.len < 4) return false;
+    var inner_upper = false;
+    var has_lower = false;
+    var has_underscore = false;
+    for (q, 0..) |c, i| {
+        switch (c) {
+            'A'...'Z' => if (i > 0) {
+                inner_upper = true;
+            },
+            'a'...'z' => has_lower = true,
+            '_' => has_underscore = true,
+            '0'...'9' => {},
+            else => return false, // space, '/', '.', '*', '?', ':', etc.
+        }
+    }
+    return (inner_upper and has_lower) or has_underscore;
+}
+
 fn handleFind(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     // Historical usage showed 71% of codedb_find calls were failing with
     // "missing 'query'" — agents were passing `name`/`path`/`pattern`/`q`
@@ -3295,6 +3321,16 @@ fn handleFind(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
         if (exact_count > 0) return;
     }
 
+    // Symbol fast-path: a compound identifier (camelCase / snake_case) typed into
+    // find is almost always a symbol the caller wants the definition of, not a
+    // filename — such queries don't match filenames, so they'd otherwise pay the
+    // full fuzzy scan (the slow case). If the symbol index has it, return the def
+    // sites (O(1)) and skip the scan; a non-matching identifier falls through to
+    // the fuzzy file search below, so legitimate filename searches are unaffected.
+    if (looksLikeCompoundIdentifier(query)) {
+        out.ensureUnusedCapacity(alloc, 128) catch {};
+        if (explorer.renderSymbolDefsFast(query, alloc, out, max_results)) return;
+    }
     var matches = explorer.fuzzyFindFiles(query, alloc, max_results) catch {
         out.appendSlice(alloc, "error: search failed") catch {};
         return;
