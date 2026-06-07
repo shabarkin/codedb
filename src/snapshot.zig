@@ -45,6 +45,7 @@ pub const SectionId = enum(u32) {
     freq_table = 5,
     meta = 6,
     outline_state = 7,
+    call_centrality = 8,
 };
 
 const SectionEntry = struct {
@@ -325,6 +326,35 @@ pub fn writeSnapshot(
         try sections.append(allocator, .{ .id = @intFromEnum(SectionId.freq_table), .offset = offset, .length = end - offset });
     }
 
+    // ── Section: CALL_CENTRALITY ──
+    // Per-file weighted call-graph in-degree (path -> f32), so a loaded snapshot
+    // can skip the lazy first-query rebuild in ensureCallCentrality. Written only
+    // if already built (non-null); an absent/empty section makes the loader fall
+    // back to the lazy build — backward compatible with older snapshots. Read
+    // under the shared lock held above; never builds here.
+    {
+        const offset = file_writer.logicalPos();
+        const count: u32 = if (explorer.call_centrality) |cm| @intCast(cm.count()) else 0;
+        var count_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &count_buf, count, .little);
+        try fw.writeAll(&count_buf);
+        if (explorer.call_centrality) |cm| {
+            var it = cm.iterator();
+            while (it.next()) |e| {
+                const key = e.key_ptr.*;
+                var plen_buf: [2]u8 = undefined;
+                std.mem.writeInt(u16, &plen_buf, @intCast(@min(key.len, std.math.maxInt(u16))), .little);
+                try fw.writeAll(&plen_buf);
+                try fw.writeAll(key[0..@min(key.len, std.math.maxInt(u16))]);
+                const bits: u32 = @bitCast(e.value_ptr.*);
+                var f_buf: [4]u8 = undefined;
+                std.mem.writeInt(u32, &f_buf, bits, .little);
+                try fw.writeAll(&f_buf);
+            }
+        }
+        const end = file_writer.logicalPos();
+        try sections.append(allocator, .{ .id = @intFromEnum(SectionId.call_centrality), .offset = offset, .length = end - offset });
+    }
     // ── Write header + section table at file start ──
     try file_writer.seekTo(0);
 
@@ -953,7 +983,63 @@ fn loadSnapshotFast(
         }
     }
 
+    // Restore persisted call-graph centrality, if present, so the first ranked
+    // search skips the lazy rebuild (ensureCallCentrality's null-check returns
+    // early once this is set). Best-effort: any failure just leaves it unbuilt.
+    if (sections.get(@intFromEnum(SectionId.call_centrality))) |cc_entry| {
+        restoreCallCentrality(io, snapshot_path, cc_entry, explorer, allocator) catch {};
+    }
+
     return true;
+}
+
+/// Reconstruct Explorer.call_centrality from a persisted CALL_CENTRALITY section.
+/// Keys are taken from the (now-populated) outlines map so they share the same
+/// stable, borrowed lifetime as ensureCallCentrality's keys — Explorer.deinit
+/// frees them via outlines, never via call_centrality. Files no longer in the
+/// outlines (changed/removed since the snapshot) are simply skipped.
+fn restoreCallCentrality(
+    io: std.Io,
+    snapshot_path: []const u8,
+    entry: SectionEntry,
+    explorer: *Explorer,
+    allocator: std.mem.Allocator,
+) !void {
+    if (entry.length < 4 or entry.length > 256 * 1024 * 1024) return;
+    const bytes = try allocator.alloc(u8, entry.length);
+    defer allocator.free(bytes);
+    const f = try std.Io.Dir.cwd().openFile(io, snapshot_path, .{});
+    defer f.close(io);
+    if ((try f.readPositionalAll(io, bytes, entry.offset)) != entry.length) return;
+
+    var cursor: usize = 0;
+    if (cursor + 4 > bytes.len) return;
+    const count = std.mem.readInt(u32, bytes[cursor..][0..4], .little);
+    cursor += 4;
+    if (count == 0) return;
+
+    var cmap = std.StringHashMap(f32).init(explorer.allocator);
+    errdefer cmap.deinit();
+    cmap.ensureTotalCapacity(count) catch {};
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        if (cursor + 2 > bytes.len) break;
+        const plen = std.mem.readInt(u16, bytes[cursor..][0..2], .little);
+        cursor += 2;
+        if (plen == 0 or cursor + plen + 4 > bytes.len) break;
+        const path = bytes[cursor .. cursor + plen];
+        cursor += plen;
+        const bits = std.mem.readInt(u32, bytes[cursor..][0..4], .little);
+        cursor += 4;
+        const centrality: f32 = @bitCast(bits);
+        // Borrow the stable outlines key (don't allocate a new one).
+        if (explorer.outlines.getEntry(path)) |e| {
+            cmap.put(e.key_ptr.*, centrality) catch {};
+        }
+    }
+
+    explorer.call_centrality = cmap;
 }
 
 fn parseJsonU32(json: []const u8, key: []const u8) ?u32 {

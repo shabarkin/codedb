@@ -1277,6 +1277,12 @@ fn mainImpl() !void {
             }
 
             if (!std.mem.eql(u8, cmd, "snapshot")) {
+                // Pre-build call-graph centrality so it's persisted in the snapshot
+                // and a later load restores it instead of paying the lazy
+                // first-query rebuild. Same env gate as the search path.
+                if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null) {
+                    explorer.buildCallCentrality(allocator);
+                }
                 snapshot_mod.writeProjectCacheSnapshot(io, &explorer, abs_root, allocator) catch |err| {
                     std.log.warn("could not persist project-cache snapshot: {}", .{err});
                 };

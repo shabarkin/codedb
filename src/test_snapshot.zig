@@ -200,6 +200,57 @@ test "issue-46: empty-repo snapshot rejected on load" {
     try testing.expect(exp2.outlines.count() == 0);
 }
 
+// Call-graph centrality (the ranking boost) is persisted in a snapshot section
+// and restored on load, so the first ranked search skips the lazy rebuild. This
+// pins: (1) the value round-trips exactly, and (2) restore happens at load time
+// with no search having run, keyed off the restored outlines.
+test "snapshot: call-graph centrality persists and restores (no lazy rebuild)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // util.zig defines helper(); main.zig calls it twice -> util.zig has in-degree.
+    // Paths don't exist on disk, so the load takes the restore path.
+    try exp.indexFile("cc_pkg/util.zig",
+        \\pub fn helper() void {}
+        \\
+    );
+    try exp.indexFile("cc_pkg/main.zig",
+        \\const util = @import("util.zig");
+        \\pub fn run() void {
+        \\    helper();
+        \\    helper();
+        \\}
+        \\
+    );
+
+    exp.buildCallCentrality(testing.allocator);
+    try testing.expect(exp.call_centrality != null);
+    const want = exp.call_centrality.?.get("cc_pkg/util.zig") orelse 0.0;
+    try testing.expect(want > 0.0);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/cc.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, testing.allocator);
+    try testing.expect(loaded);
+
+    // Restored at load time — no ranked search ran to build it.
+    try testing.expect(exp2.call_centrality != null);
+    const got = exp2.call_centrality.?.get("cc_pkg/util.zig") orelse 0.0;
+    try testing.expectEqual(want, got);
+}
+
 test "issue-220: snapshot fast load restores outlines and lazily rebuilds word index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

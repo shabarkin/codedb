@@ -3950,6 +3950,17 @@ pub const Explorer = struct {
         return 1.0 + alpha * @log(1.0 + c);
     }
 
+    /// Public, lock-acquiring entry point for single-threaded callers (the
+    /// index/scan path) to pre-build call_centrality before persisting a snapshot,
+    /// so a later load can restore it instead of paying the lazy first-query build.
+    /// ensureCallCentrality assumes the caller already holds a shared lock (it is
+    /// normally reached from searchContentRanked); this wrapper takes that lock.
+    pub fn buildCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        self.ensureCallCentrality(allocator);
+    }
+
     /// Build `call_centrality` once (idempotent, mutex-guarded). Must be called
     /// while holding at least a shared lock on `mu` (it reads outlines/contents
     /// via readContentForSearch, which assumes the lock is held). The resolved
