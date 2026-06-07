@@ -1956,3 +1956,92 @@ test "cli-mcp-parity: runCliTool bridges navigation commands to MCP handlers" {
         try testing.expect(std.mem.indexOf(u8, out.items, "usage") != null);
     }
 }
+
+// ── #528: CLI parsing / validation / exit-code regressions ──────────────────
+
+test "issue-528: parseLineRange accepts valid ranges and EOF sentinel" {
+    const r = try main_mod.parseLineRange("1-3");
+    try testing.expectEqual(@as(u32, 1), r.start);
+    try testing.expectEqual(@as(u32, 3), r.end);
+
+    const eof = try main_mod.parseLineRange("10-$");
+    try testing.expectEqual(@as(u32, 10), eof.start);
+    try testing.expectEqual(std.math.maxInt(u32), eof.end);
+
+    const eof2 = try main_mod.parseLineRange("5-end");
+    try testing.expectEqual(std.math.maxInt(u32), eof2.end);
+}
+
+test "issue-528: parseLineRange rejects malformed/zero/reversed ranges" {
+    // #3 malformed: no dash, non-numeric start/end
+    try testing.expectError(error.MissingDash, main_mod.parseLineRange("nope"));
+    try testing.expectError(error.BadStart, main_mod.parseLineRange("abc-10"));
+    try testing.expectError(error.BadEnd, main_mod.parseLineRange("10-abc"));
+    // #7 zero-based (used to silently clamp / default)
+    try testing.expectError(error.ZeroLine, main_mod.parseLineRange("0-3"));
+    try testing.expectError(error.ZeroLine, main_mod.parseLineRange("1-0"));
+    // #4 reversed (used to exit 0 with empty output)
+    try testing.expectError(error.Reversed, main_mod.parseLineRange("20-1"));
+}
+
+test "issue-528: parseSearchArgs flags any order, max-results, unknown/empty rejected" {
+    // #9: `--max-results 1 allocator` used to search for the literal "--max-results"
+    const a = try main_mod.parseSearchArgs(&[_][]const u8{ "search", "--max-results", "1", "allocator" }, 1);
+    try testing.expectEqualStrings("allocator", a.query);
+    try testing.expectEqual(@as(usize, 1), a.max_results);
+
+    // flag after the query now applies instead of being ignored
+    const b = try main_mod.parseSearchArgs(&[_][]const u8{ "search", "allocator", "--paths-only" }, 1);
+    try testing.expectEqualStrings("allocator", b.query);
+    try testing.expect(b.paths_only);
+
+    // unknown flag rejected (not silently treated as query text)
+    try testing.expectError(error.UnknownFlag, main_mod.parseSearchArgs(&[_][]const u8{ "search", "--bogus", "x" }, 1));
+    // empty / missing query are usage errors
+    try testing.expectError(error.EmptyQuery, main_mod.parseSearchArgs(&[_][]const u8{ "search", "" }, 1));
+    try testing.expectError(error.MissingQuery, main_mod.parseSearchArgs(&[_][]const u8{"search"}, 1));
+    // `--` ends flag parsing so a literal `--foo` can still be searched
+    const c = try main_mod.parseSearchArgs(&[_][]const u8{ "search", "--", "--foo" }, 1);
+    try testing.expectEqualStrings("--foo", c.query);
+    try testing.expect(!c.use_regex);
+}
+
+test "issue-528: parseDepsArgs flags before/after path, rejects unknown + bad depth" {
+    // #2: flag before the path no longer misreads the flag as the path
+    const a = try mcp_mod.parseDepsArgs(&[_][]const u8{ "deps", "--depends-on", "src/main.zig" }, 1);
+    try testing.expectEqualStrings("src/main.zig", a.path);
+    try testing.expect(a.depends_on);
+    try testing.expectEqual(@as(?i64, null), a.max_depth);
+
+    // flag after path + valid max-depth
+    const b = try mcp_mod.parseDepsArgs(&[_][]const u8{ "deps", "src/main.zig", "--transitive", "--max-depth", "3" }, 1);
+    try testing.expectEqualStrings("src/main.zig", b.path);
+    try testing.expect(b.transitive);
+    try testing.expectEqual(@as(?i64, 3), b.max_depth);
+
+    // #11: unknown flag + bad/missing max-depth rejected (used to be silently coerced to 1)
+    try testing.expectError(error.UnknownFlag, mcp_mod.parseDepsArgs(&[_][]const u8{ "deps", "src/main.zig", "--badflag" }, 1));
+    try testing.expectError(error.BadMaxDepth, mcp_mod.parseDepsArgs(&[_][]const u8{ "deps", "src/main.zig", "--max-depth", "notnum" }, 1));
+    try testing.expectError(error.BadMaxDepth, mcp_mod.parseDepsArgs(&[_][]const u8{ "deps", "src/main.zig", "--max-depth", "0" }, 1));
+    try testing.expectError(error.MissingPath, mcp_mod.parseDepsArgs(&[_][]const u8{"deps"}, 1));
+}
+
+test "issue-528: finishCli maps error-prefixed handler output to exit 1" {
+    const alloc = testing.allocator;
+    // #6: handler emitted an error → bridge now returns exit 1
+    var err_out: std.ArrayList(u8) = .empty;
+    defer err_out.deinit(alloc);
+    try err_out.appendSlice(alloc, "error: task must be 3-1024 chars");
+    try testing.expectEqual(@as(u8, 1), mcp_mod.finishCli(&err_out, 0));
+
+    // zero-result wording (find's "no matches") keeps exit 0 (#5 decision)
+    var ok_out: std.ArrayList(u8) = .empty;
+    defer ok_out.deinit(alloc);
+    try ok_out.appendSlice(alloc, "no matches");
+    try testing.expectEqual(@as(u8, 0), mcp_mod.finishCli(&ok_out, 0));
+
+    // empty output → exit 0
+    var empty_out: std.ArrayList(u8) = .empty;
+    defer empty_out.deinit(alloc);
+    try testing.expectEqual(@as(u8, 0), mcp_mod.finishCli(&empty_out, 0));
+}

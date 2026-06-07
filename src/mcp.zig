@@ -3474,6 +3474,7 @@ pub fn runCliTool(
     out: *std.ArrayList(u8),
 ) ?u8 {
     const pos: ?[]const u8 = if (args.len > cmd_args_start) args[cmd_args_start] else null;
+    const out_start = out.items.len;
 
     var m: std.json.ObjectMap = .empty;
     defer m.deinit(alloc);
@@ -3485,7 +3486,7 @@ pub fn runCliTool(
             if (std.mem.eql(u8, a, "--body")) m.put(alloc, "body", .{ .bool = true }) catch {};
         }
         handleSymbol(alloc, &m, out, explorer);
-        return 0;
+        return finishCli(out, out_start);
     } else if (std.mem.eql(u8, cmd, "callers")) {
         const name = pos orelse return cliUsage(alloc, out, "callers <name>");
         m.put(alloc, "name", .{ .string = name }) catch return 1;
@@ -3494,38 +3495,29 @@ pub fn runCliTool(
         // the heap word index. Keeps the footprint at the MCP level.
         loadProjectTrigramFromDiskIfPresent(io, explorer, root, alloc);
         handleCallers(alloc, &m, out, explorer);
-        return 0;
+        return finishCli(out, out_start);
     } else if (std.mem.eql(u8, cmd, "deps")) {
-        const path = pos orelse return cliUsage(alloc, out, "deps <path> [--depends-on] [--transitive] [--max-depth N]");
-        m.put(alloc, "path", .{ .string = path }) catch return 1;
-        var i = cmd_args_start + 1;
-        while (i < args.len) : (i += 1) {
-            const a = args[i];
-            if (std.mem.eql(u8, a, "--depends-on")) {
-                m.put(alloc, "direction", .{ .string = "depends_on" }) catch {};
-            } else if (std.mem.eql(u8, a, "--transitive")) {
-                m.put(alloc, "transitive", .{ .bool = true }) catch {};
-            } else if (std.mem.eql(u8, a, "--max-depth") and i + 1 < args.len) {
-                m.put(alloc, "max_depth", .{ .integer = std.fmt.parseInt(i64, args[i + 1], 10) catch 1 }) catch {};
-                i += 1;
-            }
-        }
+        const da = parseDepsArgs(args, cmd_args_start) catch |e| return cliDepsUsage(alloc, out, e);
+        m.put(alloc, "path", .{ .string = da.path }) catch return 1;
+        if (da.depends_on) m.put(alloc, "direction", .{ .string = "depends_on" }) catch {};
+        if (da.transitive) m.put(alloc, "transitive", .{ .bool = true }) catch {};
+        if (da.max_depth) |md| m.put(alloc, "max_depth", .{ .integer = md }) catch {};
         handleDeps(alloc, &m, out, explorer);
-        return 0;
+        return finishCli(out, out_start);
     } else if (std.mem.eql(u8, cmd, "glob")) {
         const pattern = pos orelse return cliUsage(alloc, out, "glob <pattern>");
         m.put(alloc, "pattern", .{ .string = pattern }) catch return 1;
         handleGlob(alloc, &m, out, explorer);
-        return 0;
+        return finishCli(out, out_start);
     } else if (std.mem.eql(u8, cmd, "ls")) {
         if (pos) |p| m.put(alloc, "path", .{ .string = p }) catch return 1;
         handleLs(alloc, &m, out, explorer);
-        return 0;
+        return finishCli(out, out_start);
     } else if (std.mem.eql(u8, cmd, "file")) {
         const query = pos orelse return cliUsage(alloc, out, "file <fuzzy-name>");
         m.put(alloc, "query", .{ .string = query }) catch return 1;
         handleFind(alloc, &m, out, explorer);
-        return 0;
+        return finishCli(out, out_start);
     } else if (std.mem.eql(u8, cmd, "context")) {
         var task: std.ArrayList(u8) = .empty;
         defer task.deinit(alloc);
@@ -3538,7 +3530,7 @@ pub fn runCliTool(
         m.put(alloc, "task", .{ .string = task.items }) catch return 1;
         loadProjectWordIndexFromDiskIfPresent(io, explorer, root, alloc);
         handleContext(io, alloc, &m, out, explorer, root);
-        return 0;
+        return finishCli(out, out_start);
     }
     return null;
 }
@@ -3550,6 +3542,72 @@ fn cliUsage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), usage: []const u8
     return 1;
 }
 
+/// Exit code for a bridged handler: 1 if it appended an `error:`-prefixed
+/// message (the same failure marker MCP uses to set `isError` — see the
+/// `startsWith(out.items, "error:")` checks elsewhere in this file), else 0.
+/// Fixes #528 item 6, where bridged handlers printed `error: …` to stdout but
+/// `runCliTool` always reported success, so scripts couldn't detect failures.
+/// Zero-result paths (e.g. find's "no matches") use non-`error:` wording and
+/// therefore keep exit 0.
+pub fn finishCli(out: *std.ArrayList(u8), start: usize) u8 {
+    return if (std.mem.startsWith(u8, out.items[start..], "error:")) 1 else 0;
+}
+/// Parsed `deps` invocation. `max_depth` stays null unless `--max-depth N` was
+/// given so the handler keeps its own default for transitive walks.
+pub const DepsArgs = struct {
+    path: []const u8,
+    depends_on: bool = false,
+    transitive: bool = false,
+    max_depth: ?i64 = null,
+};
+
+pub const DepsArgError = error{ MissingPath, UnknownFlag, MissingMaxDepth, BadMaxDepth, ExtraArg };
+
+/// Parse `deps` args. Flags (`--depends-on`, `--transitive`, `--max-depth N`)
+/// may appear before or after the path, in any order; the first non-flag token
+/// is the path (so `deps --depends-on src/main.zig` no longer misreads the flag
+/// as the path). Unknown flags are rejected instead of silently ignored, and
+/// `--max-depth` must be a positive integer instead of coercing junk to 1.
+/// See issue #528 (items 2, 11).
+pub fn parseDepsArgs(args: []const []const u8, start: usize) DepsArgError!DepsArgs {
+    var result: DepsArgs = .{ .path = "" };
+    var path: ?[]const u8 = null;
+    var i = start;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--depends-on")) {
+            result.depends_on = true;
+        } else if (std.mem.eql(u8, a, "--transitive")) {
+            result.transitive = true;
+        } else if (std.mem.eql(u8, a, "--max-depth")) {
+            if (i + 1 >= args.len) return error.MissingMaxDepth;
+            i += 1;
+            const n = std.fmt.parseInt(i64, args[i], 10) catch return error.BadMaxDepth;
+            if (n < 1) return error.BadMaxDepth;
+            result.max_depth = n;
+        } else if (a.len > 1 and a[0] == '-' and a[1] == '-') {
+            return error.UnknownFlag;
+        } else if (path == null) {
+            path = a;
+        } else {
+            return error.ExtraArg;
+        }
+    }
+    result.path = path orelse return error.MissingPath;
+    return result;
+}
+
+fn cliDepsUsage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), e: DepsArgError) u8 {
+    const msg = switch (e) {
+        error.MissingPath => "error: usage: codedb [root] deps <path> [--depends-on] [--transitive] [--max-depth N]",
+        error.UnknownFlag => "error: unknown flag for deps (valid: --depends-on, --transitive, --max-depth N)",
+        error.MissingMaxDepth, error.BadMaxDepth => "error: --max-depth requires a positive integer",
+        error.ExtraArg => "error: unexpected extra argument for deps",
+    };
+    out.appendSlice(alloc, msg) catch {};
+    out.appendSlice(alloc, "\n") catch {};
+    return 1;
+}
 
 fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer, store: *Store) void {
     _ = store;
