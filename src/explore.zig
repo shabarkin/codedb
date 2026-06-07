@@ -4099,29 +4099,46 @@ pub const Explorer = struct {
         var matches: std.ArrayList(FuzzyMatch) = .empty;
         errdefer matches.deinit(allocator);
 
-        var iter = self.outlines.keyIterator();
-        while (iter.next()) |key_ptr| {
-            const path = key_ptr.*;
-
-            // Extension filter
-            if (ext_filter) |ext| {
-                if (!std.mem.endsWith(u8, path, ext)) continue;
+        if (parts.items.len == 1 and parts.items[0].len <= FUZZY_MAX_QUERY) {
+            // Single-part (the common case): score files in SIMD batches of
+            // FZ_LANES via fuzzyScoreBatch, which yields the same per-file
+            // best_score/matched_chars as the scalar fuzzyDP; fuzzyFinalize is the
+            // shared tail, so results are identical — just scored 8 files at once.
+            const q = parts.items[0];
+            var cands: std.ArrayList([]const u8) = .empty;
+            defer cands.deinit(allocator);
+            var iter = self.outlines.keyIterator();
+            while (iter.next()) |key_ptr| {
+                const path = key_ptr.*;
+                if (ext_filter) |ext| {
+                    if (!std.mem.endsWith(u8, path, ext)) continue;
+                }
+                if (path.len == 0 or path.len > FUZZY_MAX_PATH) continue;
+                if (fuzzyPresenceReject(q, path)) continue;
+                try cands.append(allocator, path);
             }
-
-            // Multi-part scoring: all parts must match, scores sum
-            var total_score: f32 = 0;
-            var all_matched = true;
-            for (parts.items) |part| {
-                if (fuzzyScore(part, path)) |s| {
-                    total_score += s;
-                } else {
-                    all_matched = false;
-                    break;
+            var off: usize = 0;
+            while (off < cands.items.len) : (off += FZ_LANES) {
+                const slab = cands.items[off..@min(off + FZ_LANES, cands.items.len)];
+                var best: [FZ_LANES]f32 = undefined;
+                var matched: [FZ_LANES]u32 = undefined;
+                fuzzyScoreBatch(q, slab, &best, &matched);
+                for (slab, 0..) |path, l| {
+                    if (fuzzyFinalize(q, path, best[l], matched[l])) |s| {
+                        try matches.append(allocator, .{ .path = path, .score = s });
+                    }
                 }
             }
-
-            if (all_matched and total_score > 0) {
-                try matches.append(allocator, .{ .path = path, .score = total_score });
+        } else {
+            var iter = self.outlines.keyIterator();
+            while (iter.next()) |key_ptr| {
+                const path = key_ptr.*;
+                if (ext_filter) |ext| {
+                    if (!std.mem.endsWith(u8, path, ext)) continue;
+                }
+                if (scoreAllParts(parts.items, path)) |s| {
+                    try matches.append(allocator, .{ .path = path, .score = s });
+                }
             }
         }
 
@@ -7365,21 +7382,35 @@ fn lcsLenIgnoreCase(query: []const u8, path: []const u8) usize {
     return row[pn];
 }
 
-pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
-    if (query.len == 0 or path.len == 0) return null;
-    if (query.len > 128 or path.len > 512) return null;
+// Score `path` against every space-separated query part (all must match, scores
+// sum) — the exhaustive per-file scoring shared by both fuzzyFindFiles passes.
+fn scoreAllParts(parts: []const []const u8, path: []const u8) ?f32 {
+    var total: f32 = 0;
+    for (parts) |part| {
+        if (fuzzyScore(part, path)) |s| {
+            total += s;
+        } else return null;
+    }
+    if (total > 0) return total;
+    return null;
+}
+// Fuzzy file-scoring constants, shared by the scalar (fuzzyScore/fuzzyDP) and the
+// SIMD-across-files (fuzzyScoreBatch) scorers so both stay bit-identical.
+const FUZZY_MAX_QUERY = 128;
+const FUZZY_MAX_PATH = 512;
+const FZ_MATCH: f32 = 16.0;
+const FZ_MISMATCH: f32 = -8.0;
+const FZ_GAP_OPEN: f32 = -3.0;
+const FZ_GAP_EXTEND: f32 = -1.0;
+const FZ_DELIM: f32 = 8.0;
+const FZ_FILENAME: f32 = 6.0;
+const FZ_CONSEC: f32 = 4.0;
+const FZ_CASE: f32 = 2.0;
+const FZ_PREFIX: f32 = 6.0;
 
-    const MATCH_SCORE: f32 = 16.0;
-    const MISMATCH_PENALTY: f32 = -8.0;
-    const GAP_OPEN: f32 = -3.0;
-    const GAP_EXTEND: f32 = -1.0;
-    const DELIMITER_BONUS: f32 = 8.0;
-    const FILENAME_BONUS: f32 = 6.0;
-    const CONSECUTIVE_BONUS: f32 = 4.0;
-    const CASE_BONUS: f32 = 2.0;
-    const PREFIX_BONUS: f32 = 6.0;
+const FuzzyDPResult = struct { best_score: f32, matched_chars: usize };
 
-    // Find filename start
+fn fuzzyFilenameStart(path: []const u8) usize {
     var fname_start: usize = 0;
     for (0..path.len) |i| {
         if (path[path.len - 1 - i] == '/') {
@@ -7387,108 +7418,253 @@ pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
             break;
         }
     }
+    return fname_start;
+}
 
-    // Smith-Waterman-style DP with affine gaps
-    // H[i][j] = best alignment score ending with query[0..i] aligned to path[0..j]
-    // We use two rows to save memory: prev and curr
-    const MAX_PATH = 512;
-    var prev_h: [MAX_PATH + 1]f32 = undefined;
-    var curr_h: [MAX_PATH + 1]f32 = undefined;
-    var prev_gap: [MAX_PATH + 1]f32 = undefined; // gap in query (deletion from path)
-    var curr_gap: [MAX_PATH + 1]f32 = undefined;
+// Presence pre-filter shared by the scalar + batch scorers. The score floor below
+// (issue #518) makes a >=60% in-order LCS a hard requirement; unordered character
+// presence is an upper bound on that LCS, so a path missing >40% of the query's
+// chars can be rejected in O(path) without the DP — and would fail the LCS check
+// anyway, so no result changes.
+pub fn fuzzyPresenceReject(query: []const u8, path: []const u8) bool {
+    var present = [_]bool{false} ** 256;
+    for (path) |c| present[toLowerByte(c)] = true;
+    var hits: usize = 0;
+    for (query) |c| {
+        if (present[toLowerByte(c)]) hits += 1;
+    }
+    return hits * 5 < query.len * 3;
+}
 
-    // Init
+// Smith-Waterman-style DP with affine gaps for one (query, path). Returns the raw
+// best_score + matched_chars; the floor/LCS/bonus tail lives in fuzzyFinalize so
+// the scalar and SIMD paths share identical post-processing. Two rows swapped by
+// pointer; per-cell inputs that don't vary with j (lowercased query char, path
+// lowercase + word-boundary flags) are hoisted/precomputed.
+fn fuzzyDP(query: []const u8, path: []const u8) FuzzyDPResult {
+    const fname_start = fuzzyFilenameStart(path);
+
+    var ql_buf: [FUZZY_MAX_QUERY]u8 = undefined;
+    var pl_buf: [FUZZY_MAX_PATH]u8 = undefined;
+    var wb_buf: [FUZZY_MAX_PATH]bool = undefined;
+    const ql = ql_buf[0..query.len];
+    const pl = pl_buf[0..path.len];
+    const wb = wb_buf[0..path.len];
+    for (query, 0..) |c, k| ql[k] = toLowerByte(c);
+    for (path, 0..) |c, k| {
+        pl[k] = toLowerByte(c);
+        wb[k] = isWordBoundary(path, k);
+    }
+
+    var h_a: [FUZZY_MAX_PATH + 1]f32 = undefined;
+    var h_b: [FUZZY_MAX_PATH + 1]f32 = undefined;
+    var g_a: [FUZZY_MAX_PATH + 1]f32 = undefined;
+    var g_b: [FUZZY_MAX_PATH + 1]f32 = undefined;
+    var prev_h: []f32 = h_a[0 .. path.len + 1];
+    var curr_h: []f32 = h_b[0 .. path.len + 1];
+    var prev_gap: []f32 = g_a[0 .. path.len + 1];
+    var curr_gap: []f32 = g_b[0 .. path.len + 1];
     for (0..path.len + 1) |j| {
         prev_h[j] = 0;
-        prev_gap[j] = GAP_OPEN;
+        prev_gap[j] = FZ_GAP_OPEN;
     }
 
     var best_score: f32 = 0;
     var matched_chars: usize = 0;
+    const last_i = query.len - 1;
 
     for (0..query.len) |i| {
+        const qc = ql[i];
+        const qchar = query[i];
         curr_h[0] = 0;
-        curr_gap[0] = GAP_OPEN;
-        var query_gap: f32 = GAP_OPEN; // gap in path (deletion from query)
+        curr_gap[0] = FZ_GAP_OPEN;
+        var query_gap: f32 = FZ_GAP_OPEN;
+        var row_positive = false;
 
         for (0..path.len) |j| {
-            const qc = toLowerByte(query[i]);
-            const pc = toLowerByte(path[j]);
-
-            // Match/mismatch score
-            var match_score: f32 = if (qc == pc) MATCH_SCORE else MISMATCH_PENALTY;
-
-            // Bonuses for matches
-            if (qc == pc) {
-                // Exact case bonus
-                if (query[i] == path[j]) match_score += CASE_BONUS;
-                // Word boundary bonus
-                if (isWordBoundary(path, j)) match_score += DELIMITER_BONUS;
-                // Filename bonus
-                if (j >= fname_start) match_score += FILENAME_BONUS;
-                // Prefix bonus (match at start of path or filename)
-                if (j == 0 or j == fname_start) match_score += PREFIX_BONUS;
-                // Consecutive match bonus
+            const is_match = qc == pl[j];
+            var match_score: f32 = if (is_match) FZ_MATCH else FZ_MISMATCH;
+            if (is_match) {
+                if (qchar == path[j]) match_score += FZ_CASE;
+                if (wb[j]) match_score += FZ_DELIM;
+                if (j >= fname_start) match_score += FZ_FILENAME;
+                if (j == 0 or j == fname_start) match_score += FZ_PREFIX;
                 if (i > 0 and j > 0 and prev_h[j] > prev_h[j + 1] * 0.5) {
-                    match_score += CONSECUTIVE_BONUS;
+                    match_score += FZ_CONSEC;
                 }
             }
-
             const diag = prev_h[j] + match_score;
-
-            // Affine gap penalties
-            curr_gap[j + 1] = @max(prev_h[j + 1] + GAP_OPEN, prev_gap[j + 1] + GAP_EXTEND);
-            query_gap = @max(curr_h[j] + GAP_OPEN, query_gap + GAP_EXTEND);
-
-            // Smith-Waterman: take max of all options, floor at 0
-            curr_h[j + 1] = @max(0, @max(diag, @max(curr_gap[j + 1], query_gap)));
-
-            if (i == query.len - 1 and curr_h[j + 1] > best_score) {
-                best_score = curr_h[j + 1];
-            }
+            curr_gap[j + 1] = @max(prev_h[j + 1] + FZ_GAP_OPEN, prev_gap[j + 1] + FZ_GAP_EXTEND);
+            query_gap = @max(curr_h[j] + FZ_GAP_OPEN, query_gap + FZ_GAP_EXTEND);
+            const v: f32 = @max(0, @max(diag, @max(curr_gap[j + 1], query_gap)));
+            curr_h[j + 1] = v;
+            if (v > 0) row_positive = true;
+            if (i == last_i and v > best_score) best_score = v;
         }
 
-        // Count matched chars (check if any cell in this row is positive)
-        for (1..path.len + 1) |j| {
-            if (curr_h[j] > 0) {
-                matched_chars = i + 1;
-                break;
-            }
-        }
-
-        @memcpy(prev_h[0 .. path.len + 1], curr_h[0 .. path.len + 1]);
-        @memcpy(prev_gap[0 .. path.len + 1], curr_gap[0 .. path.len + 1]);
+        if (row_positive) matched_chars = i + 1;
+        std.mem.swap([]f32, &prev_h, &curr_h);
+        std.mem.swap([]f32, &prev_gap, &curr_gap);
     }
 
+    return .{ .best_score = best_score, .matched_chars = matched_chars };
+}
+
+// Floor + issue-#518 LCS gate + special bonuses + length normalization, shared by
+// the scalar and SIMD scorers. Returns null if the path doesn't qualify.
+pub fn fuzzyFinalize(query: []const u8, path: []const u8, best_in: f32, matched_chars: usize) ?f32 {
+    var best_score = best_in;
     // Require at least 60% of query chars to contribute to score
     if (best_score <= 0 or matched_chars < (query.len + 1) / 2) return null;
-
     // Minimum score threshold based on query length
-    const min_threshold = @as(f32, @floatFromInt(query.len)) * MATCH_SCORE * 0.3;
+    const min_threshold = @as(f32, @floatFromInt(query.len)) * FZ_MATCH * 0.3;
     if (best_score < min_threshold) return null;
-
-    // Issue #518: a local alignment can clear the score floor on a handful of
-    // incidental matches even when most of the query never appears in the path
-    // (e.g. a 16-char query hitting 5 stray filename chars). Require the query and
-    // path to share a real in-order subsequence — at least 60% of the query's
-    // characters. Computed only for candidates past the score floor, so it adds
-    // no cost to the overwhelming majority of non-matching files.
+    // Issue #518: require a real >=60% in-order subsequence, not stray local hits.
     if (lcsLenIgnoreCase(query, path) * 5 < query.len * 3) return null;
-
     // Special entry point bonus (like fff: main.go, index.ts, lib.rs rank higher)
     const fname = getFilename(path);
     if (isSpecialEntryPoint(fname)) best_score += best_score * 0.05;
+    // Issue #363b: an exact basename match must rank above fuzzy matches.
+    if (std.ascii.eqlIgnoreCase(query, fname)) best_score *= 4.0;
+    // Normalize by path length (shorter paths rank higher)
+    return best_score / @sqrt(@as(f32, @floatFromInt(path.len)));
+}
 
-    // Issue #363b: an exact basename match must rank above fuzzy matches in
-    // the same tree. Without this, a query of `cli.rs` against a workspace
-    // containing several `lib.rs` files returned the `lib.rs` files first
-    // because the special-entry-point bonus + length normalization outweighed
-    // the imperfect fuzzy alignment of `cli.rs` against `lib.rs`.
-    if (std.ascii.eqlIgnoreCase(query, fname)) {
-        best_score *= 4.0;
+pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
+    if (query.len == 0 or path.len == 0) return null;
+    if (query.len > FUZZY_MAX_QUERY or path.len > FUZZY_MAX_PATH) return null;
+    if (fuzzyPresenceReject(query, path)) return null;
+    const dp = fuzzyDP(query, path);
+    return fuzzyFinalize(query, path, dp.best_score, dp.matched_chars);
+}
+
+// Number of files scored per SIMD batch (each lane = a different path, same
+// query). 8 f32 lanes map to 2 NEON / 1 AVX2 register and give the inner DP loop
+// enough independent work to hide the per-column dependency latency.
+const FZ_LANES = 8;
+
+// SIMD-across-files Smith-Waterman: scores up to FZ_LANES paths against `query` in
+// lockstep, one path per vector lane. Produces bit-identical best_score +
+// matched_chars to fuzzyDP for every lane (same f32 arithmetic per lane, just
+// vectorized), so the caller's fuzzyFinalize yields identical results. paths.len
+// must be in 1..=FZ_LANES; every path 1..=FUZZY_MAX_PATH; query 1..=FUZZY_MAX_QUERY.
+// Lanes >= paths.len are inert. Shorter paths are masked per column so their
+// padding columns never affect best_score/matched_chars.
+pub fn fuzzyScoreBatch(query: []const u8, paths: []const []const u8, out_best: *[FZ_LANES]f32, out_matched: *[FZ_LANES]u32) void {
+    const V = @Vector(FZ_LANES, f32);
+    const U8V = @Vector(FZ_LANES, u8);
+    const U32V = @Vector(FZ_LANES, u32);
+    const BoolV = @Vector(FZ_LANES, bool);
+
+    const count = paths.len;
+    var lens: [FZ_LANES]usize = .{0} ** FZ_LANES;
+    var len_arr: [FZ_LANES]u32 = .{0} ** FZ_LANES;
+    var fname_arr: [FZ_LANES]u32 = .{0} ** FZ_LANES;
+    var max_len: usize = 0;
+    for (0..count) |l| {
+        lens[l] = paths[l].len;
+        len_arr[l] = @intCast(paths[l].len);
+        fname_arr[l] = @intCast(fuzzyFilenameStart(paths[l]));
+        if (paths[l].len > max_len) max_len = paths[l].len;
+    }
+    const len_v: U32V = len_arr;
+    const fname_v: U32V = fname_arr;
+
+    // Column-major transpose of the batch's paths (lowercased + original + word-
+    // boundary flag per lane). Padding lanes/columns hold 0 / false (never match).
+    var pl_t: [FUZZY_MAX_PATH]U8V = undefined;
+    var po_t: [FUZZY_MAX_PATH]U8V = undefined;
+    var wb_t: [FUZZY_MAX_PATH]BoolV = undefined;
+    for (0..max_len) |j| {
+        var lo: [FZ_LANES]u8 = .{0} ** FZ_LANES;
+        var orig: [FZ_LANES]u8 = .{0} ** FZ_LANES;
+        var wbf: [FZ_LANES]bool = .{false} ** FZ_LANES;
+        for (0..count) |l| {
+            if (j < lens[l]) {
+                const c = paths[l][j];
+                lo[l] = toLowerByte(c);
+                orig[l] = c;
+                wbf[l] = isWordBoundary(paths[l], j);
+            }
+        }
+        pl_t[j] = lo;
+        po_t[j] = orig;
+        wb_t[j] = wbf;
     }
 
-    // Normalize by path length (shorter paths rank higher)
-    const len_factor = @sqrt(@as(f32, @floatFromInt(path.len)));
-    return best_score / len_factor;
+    const zero: V = @splat(0);
+    const gap_open_v: V = @splat(FZ_GAP_OPEN);
+    const gap_ext_v: V = @splat(FZ_GAP_EXTEND);
+    const match_v: V = @splat(FZ_MATCH);
+    const mismatch_v: V = @splat(FZ_MISMATCH);
+    const case_v: V = @splat(FZ_CASE);
+    const delim_v: V = @splat(FZ_DELIM);
+    const filename_v: V = @splat(FZ_FILENAME);
+    const prefix_v: V = @splat(FZ_PREFIX);
+    const consec_v: V = @splat(FZ_CONSEC);
+    const half_v: V = @splat(0.5);
+
+    var h_a: [FUZZY_MAX_PATH + 1]V = undefined;
+    var h_b: [FUZZY_MAX_PATH + 1]V = undefined;
+    var g_a: [FUZZY_MAX_PATH + 1]V = undefined;
+    var g_b: [FUZZY_MAX_PATH + 1]V = undefined;
+    var prev_h: []V = h_a[0 .. max_len + 1];
+    var curr_h: []V = h_b[0 .. max_len + 1];
+    var prev_gap: []V = g_a[0 .. max_len + 1];
+    var curr_gap: []V = g_b[0 .. max_len + 1];
+    for (0..max_len + 1) |j| {
+        prev_h[j] = zero;
+        prev_gap[j] = gap_open_v;
+    }
+
+    var best_v: V = zero;
+    var matched_v: U32V = @splat(0);
+    const last_i = query.len - 1;
+
+    for (0..query.len) |i| {
+        const qc_v: U8V = @splat(toLowerByte(query[i]));
+        const qo_v: U8V = @splat(query[i]);
+        curr_h[0] = zero;
+        curr_gap[0] = gap_open_v;
+        var query_gap: V = gap_open_v;
+        var row_pos_v: V = zero;
+        const is_last = i == last_i;
+        const consec_row = i > 0;
+        const iplus1_v: U32V = @splat(@as(u32, @intCast(i + 1)));
+
+        for (0..max_len) |j| {
+            const jv: U32V = @splat(@as(u32, @intCast(j)));
+            const match_mask: BoolV = pl_t[j] == qc_v;
+
+            // Bonuses (gated to match lanes by the final select below).
+            var bonus: V = @select(f32, po_t[j] == qo_v, case_v, zero);
+            bonus += @select(f32, wb_t[j], delim_v, zero);
+            bonus += @select(f32, jv >= fname_v, filename_v, zero);
+            const at_prefix: BoolV = if (j == 0) @splat(true) else (jv == fname_v);
+            bonus += @select(f32, at_prefix, prefix_v, zero);
+            if (consec_row and j > 0) {
+                const cons: BoolV = prev_h[j] > prev_h[j + 1] * half_v;
+                bonus += @select(f32, cons, consec_v, zero);
+            }
+            const ms: V = @select(f32, match_mask, match_v + bonus, mismatch_v);
+
+            const diag = prev_h[j] + ms;
+            curr_gap[j + 1] = @max(prev_h[j + 1] + gap_open_v, prev_gap[j + 1] + gap_ext_v);
+            query_gap = @max(curr_h[j] + gap_open_v, query_gap + gap_ext_v);
+            const v: V = @max(zero, @max(diag, @max(curr_gap[j + 1], query_gap)));
+            curr_h[j + 1] = v;
+
+            const valid: BoolV = jv < len_v; // lane has a real char at column j
+            row_pos_v = @max(row_pos_v, @select(f32, valid, v, zero));
+            if (is_last) best_v = @select(f32, valid, @max(best_v, v), best_v);
+        }
+
+        const row_has: BoolV = row_pos_v > zero;
+        matched_v = @select(u32, row_has, iplus1_v, matched_v);
+        std.mem.swap([]V, &prev_h, &curr_h);
+        std.mem.swap([]V, &prev_gap, &curr_gap);
+    }
+
+    out_best.* = best_v;
+    out_matched.* = matched_v;
 }

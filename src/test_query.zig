@@ -187,6 +187,72 @@ test "issue-518: fuzzy find has a subsequence floor — garbage queries return n
 }
 
 
+test "fuzzy SIMD batch scorer matches scalar fuzzyScore exactly" {
+    // fuzzyFindFiles routes single-part queries through the SIMD-across-files
+    // scorer (fuzzyScoreBatch); it must produce results identical to scalar fuzzyScore.
+    const FZL = 8;
+    const paths = [_][]const u8{
+        "src/main.zig",
+        "extensions/codex/provider.ts",
+        "README.md",
+        "src/agents/getTokenProvider.test.ts",
+        "lib/auth/token.go",
+        "a",
+        "src/index.ts",
+        "very/deep/nested/path/to/some/TokenProvider.tsx",
+        "Provider.tsx",
+        "tokenprovider.js",
+        "ui/src/components/handle-request.tsx",
+        "x",
+        "config/settings.yaml",
+        "GETtokenPROVIDER",
+        "no_zzz_qqq.bin",
+        "pi/embedded/subscribe-session.ts",
+    };
+    const queries = [_][]const u8{
+        "getTokenProvider", "TokenProvider", "handleRequest", "token",
+        "provider.ts",      "x",             "main",          "session",
+        "PROVIDER",         "abcxyz",        "index",         "subscribe",
+    };
+
+    for (queries) |q| {
+        for (paths) |p| {
+            const expected = explore.fuzzyScore(q, p);
+            var got: ?f32 = null;
+            if (p.len != 0 and p.len <= 512 and q.len <= 128 and !explore.fuzzyPresenceReject(q, p)) {
+                var best: [FZL]f32 = undefined;
+                var matched: [FZL]u32 = undefined;
+                const one = [_][]const u8{p};
+                explore.fuzzyScoreBatch(q, &one, &best, &matched);
+                got = explore.fuzzyFinalize(q, p, best[0], matched[0]);
+            }
+            if (expected) |e| {
+                try testing.expect(got != null);
+                try testing.expectEqual(e, got.?);
+            } else {
+                try testing.expect(got == null);
+            }
+        }
+    }
+
+    const q = "provider";
+    const batch = paths[0..FZL];
+    var best: [FZL]f32 = undefined;
+    var matched: [FZL]u32 = undefined;
+    explore.fuzzyScoreBatch(q, batch, &best, &matched);
+    for (batch, 0..) |p, l| {
+        const expected = explore.fuzzyScore(q, p);
+        const got: ?f32 = if (explore.fuzzyPresenceReject(q, p)) null else explore.fuzzyFinalize(q, p, best[l], matched[l]);
+        if (expected) |e| {
+            try testing.expect(got != null);
+            try testing.expectEqual(e, got.?);
+        } else {
+            try testing.expect(got == null);
+        }
+    }
+}
+
+
 test "issue-163: fuzzyFindFiles via Explorer" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
