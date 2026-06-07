@@ -1558,7 +1558,6 @@ test "issue-518: Python class is labeled class_def, not struct_def" {
     try expectOutlineSymbol(&outline, "Widget", .class_def);
 }
 
-
 test "issue-108: HCL resource block parsed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2298,4 +2297,51 @@ test "issue-392: Swift parser" {
     try testing.expect(found_enum);
     try testing.expect(found_top_fn);
     try testing.expect(found_method);
+}
+
+test "issue-532: ReScript parser" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/User.res",
+        \\open Belt
+        \\
+        \\module User = {
+        \\    type t = {
+        \\        name: string,
+        \\        age: int,
+        \\    }
+        \\
+        \\    let make = (name, age) => {name, age}
+        \\
+        \\    let greet = user => "Hi " ++ user.name
+        \\}
+        \\
+        \\type status = Active | Inactive
+        \\
+        \\let defaultName = "anon"
+        \\
+        \\let rec fib = n => if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+        \\
+        \\external getEnv: string => string = "%identity"
+    );
+
+    var outline = (try explorer.getOutline("src/User.res", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    // .res must detect as rescript; without it the file is .unknown and no parser runs.
+    try testing.expectEqualStrings("rescript", @tagName(outline.language));
+
+    // Module → struct_def, type → type_alias, arrow-let → function, value-let → constant,
+    // external → function. `open` is recorded as an import.
+    try expectOutlineSymbol(&outline, "User", .struct_def);
+    try expectOutlineSymbol(&outline, "t", .type_alias);
+    try expectOutlineSymbol(&outline, "status", .type_alias);
+    try expectOutlineSymbol(&outline, "make", .function);
+    try expectOutlineSymbol(&outline, "greet", .function);
+    try expectOutlineSymbol(&outline, "fib", .function);
+    try expectOutlineSymbol(&outline, "getEnv", .function);
+    try expectOutlineSymbol(&outline, "defaultName", .constant);
+    try expectOutlineImport(&outline, "Belt");
 }

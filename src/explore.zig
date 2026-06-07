@@ -177,6 +177,7 @@ pub const Language = enum(u8) {
     llvm_ir,
     mlir,
     tablegen,
+    rescript,
 };
 
 pub fn detectLanguage(path: []const u8) Language {
@@ -215,6 +216,7 @@ pub fn detectLanguage(path: []const u8) Language {
     if (std.mem.endsWith(u8, path, ".ll")) return .llvm_ir;
     if (std.mem.endsWith(u8, path, ".mlir")) return .mlir;
     if (std.mem.endsWith(u8, path, ".td")) return .tablegen;
+    if (std.mem.endsWith(u8, path, ".res") or std.mem.endsWith(u8, path, ".resi")) return .rescript;
     return .unknown;
 }
 
@@ -2485,7 +2487,7 @@ pub const Explorer = struct {
                 outline.language == .vue or outline.language == .astro or
                 outline.language == .css or outline.language == .scss or
                 outline.language == .protobuf or outline.language == .mlir or
-                outline.language == .tablegen)
+                outline.language == .tablegen or outline.language == .rescript)
             {
                 if (in_block_comment) {
                     if (std.mem.indexOf(u8, trimmed, "*/")) |close_pos| {
@@ -2575,6 +2577,8 @@ pub const Explorer = struct {
                 try parser.parseMlirLine(trimmed, line_num, &outline);
             } else if (outline.language == .tablegen) {
                 try parser.parseTableGenLine(trimmed, line_num, &outline);
+            } else if (outline.language == .rescript) {
+                try parser.parseRescriptLine(trimmed, line_num, &outline);
             }
 
             prev_line_trimmed = trimmed;
@@ -5384,6 +5388,68 @@ pub const Explorer = struct {
         }
     }
 
+    /// ReScript (.res/.resi). `let`/`and` bindings become functions when the RHS has an
+    /// arrow (`=>`) and constants otherwise; `type` → type_alias; `module` → struct_def
+    /// (`module type` → interface_def); `external` → function; `open`/`include` → import.
+    /// Leading @decorators are stripped first. Line-based like the sibling parsers, so
+    /// nested module members are flattened into the top-level outline.
+    fn parseRescriptLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
+        const a = self.allocator;
+        const code = stripLeadingResDecorators(line);
+        if (code.len == 0 or startsWith(code, "//")) return;
+
+        if (startsWith(code, "open ")) {
+            const name = resModulePath(std.mem.trimStart(u8, code[5..], " \t"));
+            if (name.len > 0) {
+                try appendImportPath(a, outline, name);
+                try appendOutlineSymbol(a, outline, name, .import, line_num, null);
+            }
+            return;
+        }
+        if (startsWith(code, "include ")) {
+            const name = resModulePath(std.mem.trimStart(u8, code[8..], " \t"));
+            if (name.len > 0) {
+                try appendImportPath(a, outline, name);
+                try appendOutlineSymbol(a, outline, name, .import, line_num, null);
+            }
+            return;
+        }
+        if (startsWith(code, "module ")) {
+            var rest = std.mem.trimStart(u8, code[7..], " \t");
+            var kind: SymbolKind = .struct_def;
+            if (startsWith(rest, "type ")) {
+                kind = .interface_def;
+                rest = std.mem.trimStart(u8, rest[5..], " \t");
+            }
+            const name = resIdent(rest);
+            if (name.len > 0) try appendOutlineSymbol(a, outline, name, kind, line_num, line);
+            return;
+        }
+        if (startsWith(code, "type ")) {
+            var rest = std.mem.trimStart(u8, code[5..], " \t");
+            if (startsWith(rest, "rec ")) rest = std.mem.trimStart(u8, rest[4..], " \t");
+            const name = resIdent(rest);
+            if (name.len > 0) try appendOutlineSymbol(a, outline, name, .type_alias, line_num, line);
+            return;
+        }
+        if (startsWith(code, "external ")) {
+            const name = resIdent(std.mem.trimStart(u8, code[9..], " \t"));
+            if (name.len > 0) try appendOutlineSymbol(a, outline, name, .function, line_num, line);
+            return;
+        }
+        var rest: []const u8 = undefined;
+        if (startsWith(code, "let ")) {
+            rest = std.mem.trimStart(u8, code[4..], " \t");
+            if (startsWith(rest, "rec ")) rest = std.mem.trimStart(u8, rest[4..], " \t");
+        } else if (startsWith(code, "and ")) {
+            rest = std.mem.trimStart(u8, code[4..], " \t");
+        } else return;
+        const name = resIdent(rest);
+        if (name.len == 0) return; // destructuring binding (let (a, b) = …) — skip
+        const kind: SymbolKind = if (std.mem.indexOf(u8, code, "=>") != null) .function else .constant;
+        try appendOutlineSymbol(a, outline, name, kind, line_num, line);
+    }
+
     fn depPathExists(self: *Explorer, dep_path: []const u8) bool {
         return self.outlines.contains(dep_path);
     }
@@ -5851,6 +5917,7 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
         .sql => std.mem.startsWith(u8, trimmed, "--") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
         .fortran => std.mem.startsWith(u8, trimmed, "!"),
         .llvm_ir => std.mem.startsWith(u8, trimmed, ";"),
+        .rescript => std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
         else => false,
     };
 }
@@ -6349,6 +6416,54 @@ fn appendOutlineSymbol(
         .line_end = line_num,
         .detail = detail_copy,
     });
+}
+
+inline fn resIsIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+}
+inline fn resIsIdentChar(c: u8) bool {
+    return resIsIdentStart(c) or (c >= '0' and c <= '9') or c == '\'';
+}
+/// Leading ReScript identifier (letter/_/digit/prime), or "" if none.
+fn resIdent(s: []const u8) []const u8 {
+    if (s.len == 0 or !resIsIdentStart(s[0])) return "";
+    var i: usize = 1;
+    while (i < s.len and resIsIdentChar(s[i])) i += 1;
+    return s[0..i];
+}
+/// Leading dotted module path (Foo.Bar.Baz), trailing dots trimmed, or "".
+fn resModulePath(s: []const u8) []const u8 {
+    if (s.len == 0 or !resIsIdentStart(s[0])) return "";
+    var i: usize = 1;
+    while (i < s.len and (resIsIdentChar(s[i]) or s[i] == '.')) i += 1;
+    var end = i;
+    while (end > 0 and s[end - 1] == '.') end -= 1;
+    return s[0..end];
+}
+/// Strip leading `@decorator` / `@decorator(args)` tokens (and trailing space) so a
+/// decorated `external`/`let` on the same line still parses. Returns the remainder.
+fn stripLeadingResDecorators(line: []const u8) []const u8 {
+    var s = std.mem.trimStart(u8, line, " \t");
+    while (s.len > 0 and s[0] == '@') {
+        var i: usize = 1;
+        while (i < s.len and (resIsIdentChar(s[i]) or s[i] == '.')) i += 1;
+        if (i < s.len and s[i] == '(') {
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '(') {
+                    depth += 1;
+                } else if (s[i] == ')') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        s = std.mem.trimStart(u8, s[i..], " \t");
+    }
+    return s;
 }
 
 fn appendImportSymbol(

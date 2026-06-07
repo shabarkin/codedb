@@ -1125,6 +1125,11 @@ test "issue-215: detectLanguage handles .r and .R" {
     try testing.expectEqual(Language.r, explore.detectLanguage("analysis.R"));
 }
 
+test "issue-532: detectLanguage handles .res and .resi" {
+    try testing.expectEqualStrings("rescript", @tagName(explore.detectLanguage("src/User.res")));
+    try testing.expectEqualStrings("rescript", @tagName(explore.detectLanguage("src/User.resi")));
+}
+
 test "dep-graph: reverse index gives O(1) imported_by lookup" {
     var graph = DependencyGraph.init(testing.allocator);
     defer graph.deinit();
