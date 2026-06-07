@@ -3231,6 +3231,15 @@ pub const Explorer = struct {
         const callees = codegraph.extractCallees(allocator, body) catch return &.{};
 
         var refs: std.ArrayList(CalleeRef) = .empty;
+        // Resolve each callee straight off the symbol index: we only need to know
+        // whether exactly one non-test function/method defines the name, which is
+        // O(defs-of-that-name). findAllSymbols would instead run an O(all-symbols)
+        // safety scan over every outline and allocate a full result list per name —
+        // ~18 such scans per codedb_context made it ~20% slower on a multi-thousand-
+        // file repo (the #524 bench regression). The index is rebuilt on every
+        // commit, so for this high-precision/best-effort feature it is authoritative.
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
         for (callees) |name| {
             if (refs.items.len >= max) break;
             // Skip ubiquitous std/container/builtin method names. They are almost
@@ -3239,33 +3248,30 @@ pub const Explorer = struct {
             // based resolution would assert a false edge even when there's a
             // single user definition.
             if (isUbiquitousName(name)) continue;
-            const defs = self.findAllSymbols(name, allocator) catch continue;
-            // Only surface UNAMBIGUOUS edges: a callee is shown only if exactly
-            // one non-test function/method defines that name. Resolution here is
-            // name-based (no type info), so common method names (init, lock, get,
-            // next, ...) resolve to many candidates — guessing one would assert a
-            // false edge. Skipping them keeps this high-precision: distinctive
-            // names (extractCallees, readContentForSearch, ...) resolve cleanly;
-            // ambiguous ones are simply omitted. (Centrality tolerates ambiguity
-            // via 1/N weighting + aggregation; a per-edge display cannot.)
-            var cand: ?SymbolResult = null;
+            const locs = self.symbol_index.get(name) orelse continue;
+            // Only surface UNAMBIGUOUS edges: a callee is shown only if exactly one
+            // non-test function/method defines that name. Resolution is name-based
+            // (no type info), so common method names (init, lock, get, next, ...)
+            // resolve to many candidates — guessing one would assert a false edge.
+            // Skipping them keeps this high-precision; ambiguous names are omitted.
+            var cand: ?SymbolLocation = null;
             var n_cand: usize = 0;
-            for (defs) |d| {
-                if (d.symbol.kind != .function and d.symbol.kind != .method) continue;
-                if (isLikelyTestPath(d.path)) continue;
+            for (locs.items) |loc| {
+                if (loc.kind != .function and loc.kind != .method) continue;
+                if (isLikelyTestPath(loc.path)) continue;
                 // Skip the defining function itself (self-edge / recursion).
-                if (d.symbol.line_start == line_start and std.mem.eql(u8, d.path, path)) continue;
+                if (loc.line_start == line_start and std.mem.eql(u8, loc.path, path)) continue;
                 n_cand += 1;
                 if (n_cand > 1) break; // ambiguous — stop, will be skipped
-                cand = d;
+                cand = loc;
             }
             if (n_cand == 1) {
-                const d = cand.?;
+                const loc = cand.?;
                 try refs.append(allocator, .{
                     .name = name,
-                    .path = d.path,
-                    .line = d.symbol.line_start,
-                    .kind = d.symbol.kind,
+                    .path = try allocator.dupe(u8, loc.path),
+                    .line = loc.line_start,
+                    .kind = loc.kind,
                 });
             }
         }
