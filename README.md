@@ -36,7 +36,7 @@
 
 | What works today                                       | What's in progress                       |
 |--------------------------------------------------------|------------------------------------------|
-| 22 MCP tools for full codebase intelligence            | Deeper parser coverage and edge-case handling |
+| 20 MCP tools available by default for full codebase intelligence | Deeper parser coverage and edge-case handling |
 | Trigram v2: integer doc IDs, batch-accumulate, merge intersect | Incremental segment-based indexing |
 | Warm, pre-indexed MCP queries can be hundreds of times faster than one-shot ripgrep | WASM target experiments                  |
 | O(1) inverted word index for identifier lookup         | Multi-project support                    |
@@ -124,7 +124,7 @@ zig-out/bin/codedb /path/to/project hot
 
 ## 🔧 MCP Tools
 
-22 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio):
+20 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio):
 
 | Tool | Description |
 |------|-------------|
