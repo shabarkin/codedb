@@ -230,7 +230,8 @@ pub fn writeSnapshot(
             var import_count_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &import_count_buf, @intCast(outline.imports.items.len), .little);
             try writer.writeAll(&import_count_buf);
-            for (outline.imports.items) |imp| {
+            for (outline.imports.items) |imp_full| {
+                const imp = imp_full[0..@min(imp_full.len, max_snapshot_string_len)];
                 try writeSnapshotString(writer, imp);
             }
 
@@ -238,7 +239,9 @@ pub fn writeSnapshot(
             std.mem.writeInt(u32, &symbol_count_buf, @intCast(outline.symbols.items.len), .little);
             try writer.writeAll(&symbol_count_buf);
             for (outline.symbols.items) |sym| {
-                try writeSnapshotString(writer, sym.name);
+                // Names from minified/generated files can exceed u16 (65535) —
+                // truncate the stored name instead of panicking on @intCast (P0).
+                try writeSnapshotString(writer, sym.name[0..@min(sym.name.len, max_snapshot_string_len)]);
 
                 try writer.writeByte(@intFromEnum(sym.kind));
 
@@ -250,7 +253,8 @@ pub fn writeSnapshot(
                 std.mem.writeInt(u32, &line_end_buf, sym.line_end, .little);
                 try writer.writeAll(&line_end_buf);
 
-                if (sym.detail) |detail| {
+                if (sym.detail) |detail_full| {
+                    const detail = detail_full[0..@min(detail_full.len, std.math.maxInt(u16))];
                     try writer.writeByte(1);
                     // Symbol detail comes from parser-emitted source context, so
                     // clamp it instead of panicking if a signature line is huge.
