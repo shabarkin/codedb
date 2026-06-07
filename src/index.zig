@@ -26,6 +26,14 @@ pub const WordIndex = struct {
     doc_lengths: std.AutoHashMap(u32, u32),
     /// Sum of all values in doc_lengths.
     total_tokens: u64 = 0,
+    /// Zero-copy read mode: when non-null, the postings live in this mmap'd
+    /// word.index file and `index` is empty — search/searchPrefix binary-search
+    /// the sorted on-disk words instead. The first write promotes to a heap
+    /// index (promoteIfBorrowed). Cuts warm-daemon RSS from ~4x the file to a
+    /// small word directory + touched pages.
+    mmap_data: ?[]align(std.heap.page_size_min) const u8 = null,
+    /// Byte offset of each sorted word record in mmap_data, for binary search.
+    word_dir: []u32 = &.{},
 
     pub fn hitPath(self: *const WordIndex, hit: WordHit) []const u8 {
         if (hit.doc_id < self.id_to_path.items.len) return self.id_to_path.items[hit.doc_id];
@@ -53,6 +61,22 @@ pub const WordIndex = struct {
     }
 
     pub fn deinit(self: *WordIndex) void {
+        if (self.mmap_data) |m| {
+            // Zero-copy mode: index/path_to_id/file_words are empty; id_to_path
+            // owns the duped paths; word_dir + doc_lengths are heap; the postings
+            // live in the mmap. Free the heap bits and unmap.
+            self.index.deinit();
+            self.path_to_id.deinit();
+            self.file_words.deinit();
+            for (self.id_to_path.items) |path| {
+                if (path.len > 0) self.allocator.free(path);
+            }
+            self.id_to_path.deinit(self.allocator);
+            self.doc_lengths.deinit();
+            self.allocator.free(self.word_dir);
+            std.posix.munmap(m);
+            return;
+        }
         // Free hit lists and duped word keys
         var iter = self.index.iterator();
         while (iter.next()) |entry| {
@@ -157,6 +181,8 @@ pub const WordIndex = struct {
 
     pub fn indexFile(self: *WordIndex, path: []const u8, content: []const u8) !void {
         if (!self.enabled) return;
+        // A write to a zero-copy (mmap) index must first materialize a heap index.
+        try self.promoteIfBorrowed();
         // Clean up old entries first
         self.removeFile(path);
 
@@ -300,14 +326,85 @@ pub const WordIndex = struct {
 
     /// Look up all hits for a word. O(1) lookup + O(hits) iteration.
     /// Query is normalized to lowercase (all index keys are stored lowercase).
-    pub fn search(self: *WordIndex, word: []const u8) []const WordHit {
+    pub fn search(self: *WordIndex, word: []const u8) []align(1) const WordHit {
         var buf: [512]u8 = undefined;
         const lower = if (word.len <= buf.len) blk: {
             for (word, 0..) |c, i| buf[i] = normalizeChar(c);
             break :blk buf[0..word.len];
         } else word;
+        if (self.mmap_data != null) return self.mmapSearch(lower);
         if (self.index.get(lower)) |hits| return hits.items;
         return &.{};
+    }
+
+    /// Binary-search the sorted on-disk words; return the postings as a
+    /// zero-copy slice into the mmap. Unaligned (records sit at arbitrary byte
+    /// offsets), hence align(1) — fields are read with unaligned loads.
+    fn mmapSearch(self: *WordIndex, lower: []const u8) []align(1) const WordHit {
+        const data = self.mmap_data.?;
+        var lo: usize = 0;
+        var hi: usize = self.word_dir.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const off = self.word_dir[mid];
+            const wlen = std.mem.readInt(u16, data[off..][0..2], .little);
+            const wbytes = data[off + 2 ..][0..wlen];
+            switch (std.mem.order(u8, wbytes, lower)) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => {
+                    const hc_off = off + 2 + wlen;
+                    const hit_count = std.mem.readInt(u32, data[hc_off..][0..4], .little);
+                    const posts = data[hc_off + 4 ..][0 .. @as(usize, hit_count) * @sizeOf(WordHit)];
+                    return std.mem.bytesAsSlice(WordHit, posts);
+                },
+            }
+        }
+        return &.{};
+    }
+
+    /// First write to a zero-copy (mmap) index rebuilds a heap index from the
+    /// mmap so the mutation has somewhere to land, then unmaps. Reads stay
+    /// zero-copy; only an actual edit pays this one-time cost.
+    fn promoteIfBorrowed(self: *WordIndex) !void {
+        const data = self.mmap_data orelse return;
+        var new_index = std.StringHashMap(std.ArrayList(WordHit)).init(self.allocator);
+        errdefer {
+            var it = new_index.iterator();
+            while (it.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                e.value_ptr.deinit(self.allocator);
+            }
+            new_index.deinit();
+        }
+        try new_index.ensureTotalCapacity(@intCast(self.word_dir.len));
+        for (self.word_dir) |off| {
+            const wlen = std.mem.readInt(u16, data[off..][0..2], .little);
+            const word = try self.allocator.dupe(u8, data[off + 2 ..][0..wlen]);
+            errdefer self.allocator.free(word);
+            const hc_off = off + 2 + wlen;
+            const hit_count = std.mem.readInt(u32, data[hc_off..][0..4], .little);
+            const posts = std.mem.bytesAsSlice(WordHit, data[hc_off + 4 ..][0 .. @as(usize, hit_count) * @sizeOf(WordHit)]);
+            var list: std.ArrayList(WordHit) = .empty;
+            errdefer list.deinit(self.allocator);
+            try list.appendUnalignedSlice(self.allocator, posts);
+            try new_index.put(word, list);
+        }
+        var new_p2i = std.StringHashMap(u32).init(self.allocator);
+        errdefer new_p2i.deinit();
+        try new_p2i.ensureTotalCapacity(@intCast(self.id_to_path.items.len));
+        for (self.id_to_path.items, 0..) |p, i| {
+            if (p.len > 0) try new_p2i.put(p, @intCast(i));
+        }
+        // Commit: drop the (empty) mmap-mode maps + unmap, install heap maps.
+        self.index.deinit();
+        self.path_to_id.deinit();
+        self.allocator.free(self.word_dir);
+        std.posix.munmap(data);
+        self.index = new_index;
+        self.path_to_id = new_p2i;
+        self.word_dir = &.{};
+        self.mmap_data = null;
     }
 
     /// Look up hits, returning results allocated by the caller.
@@ -360,6 +457,38 @@ pub const WordIndex = struct {
         defer seen.deinit();
         try seen.ensureTotalCapacity(@intCast(max_results));
 
+        if (self.mmap_data) |data| {
+            // Sorted on-disk words: binary-search the prefix lower bound, then
+            // walk forward while the word still starts with `prefix`.
+            var lo: usize = 0;
+            var hi: usize = self.word_dir.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const off = self.word_dir[mid];
+                const wlen = std.mem.readInt(u16, data[off..][0..2], .little);
+                if (std.mem.order(u8, data[off + 2 ..][0..wlen], prefix) == .lt) lo = mid + 1 else hi = mid;
+            }
+            var wi = lo;
+            outer_mmap: while (wi < self.word_dir.len) : (wi += 1) {
+                const off = self.word_dir[wi];
+                const wlen = std.mem.readInt(u16, data[off..][0..2], .little);
+                const wbytes = data[off + 2 ..][0..wlen];
+                if (!std.mem.startsWith(u8, wbytes, prefix)) break; // past the prefix range
+                if (wlen <= prefix.len) continue; // strictly longer; exact is Tier 0
+                const hc_off = off + 2 + wlen;
+                const hit_count = std.mem.readInt(u32, data[hc_off..][0..4], .little);
+                const posts = std.mem.bytesAsSlice(WordHit, data[hc_off + 4 ..][0 .. @as(usize, hit_count) * @sizeOf(WordHit)]);
+                for (posts) |hit| {
+                    const dk = DedupKey{ .doc_id = hit.doc_id, .line_num = hit.line_num };
+                    const gop = try seen.getOrPut(dk);
+                    if (!gop.found_existing) {
+                        result.appendAssumeCapacity(hit);
+                        if (result.items.len >= max_results) break :outer_mmap;
+                    }
+                }
+            }
+            return result.toOwnedSlice(allocator);
+        }
         var key_iter = self.index.keyIterator();
         outer: while (key_iter.next()) |k| {
             if (k.len <= prefix.len) continue; // strictly longer: exact match is Tier 0
@@ -558,7 +687,7 @@ pub const WordIndex = struct {
 
         var file_paths = try allocator.alloc([]u8, file_count);
         defer allocator.free(file_paths);
-        var used_paths = try allocator.alloc(bool, file_count);
+        const used_paths = try allocator.alloc(bool, file_count);
         defer allocator.free(used_paths);
         @memset(used_paths, false);
         var parsed_files: u32 = 0;
@@ -586,14 +715,11 @@ pub const WordIndex = struct {
         var result = WordIndex.init(allocator);
         errdefer result.deinit();
 
-        // Temporary HashMap for accumulating file_words during load
-        // (compacted to slices below)
-        var tmp_file_words = std.StringHashMap(std.StringHashMap(void)).init(allocator);
-        defer {
-            var tfw_iter = tmp_file_words.iterator();
-            while (tfw_iter.next()) |entry| entry.value_ptr.deinit();
-            tmp_file_words.deinit();
-        }
+        // Pre-size the maps to the exact counts so they don't overshoot via
+        // incremental doubling while loading (saves tens of MB on big indexes).
+        try result.index.ensureTotalCapacity(word_count);
+        try result.path_to_id.ensureTotalCapacity(file_count);
+        try result.doc_lengths.ensureTotalCapacity(file_count);
 
         for (0..word_count) |_| {
             if (pos + 2 > data.len) return null;
@@ -612,7 +738,6 @@ pub const WordIndex = struct {
             errdefer hits.deinit(allocator);
             try hits.ensureTotalCapacity(allocator, hit_count);
 
-            var last_file_id: ?u32 = null;
             for (0..hit_count) |_| {
                 if (pos + 8 > data.len) return null;
                 const file_id = std.mem.readInt(u32, data[pos..][0..4], .little);
@@ -620,23 +745,7 @@ pub const WordIndex = struct {
                 if (file_id >= file_count) return null;
                 const line_num = std.mem.readInt(u32, data[pos..][0..4], .little);
                 pos += 4;
-
-                hits.appendAssumeCapacity(.{
-                    .doc_id = file_id,
-                    .line_num = line_num,
-                });
-
-                if (last_file_id == null or last_file_id.? != file_id) {
-                    const fw_gop = try tmp_file_words.getOrPut(file_paths[file_id]);
-                    if (!fw_gop.found_existing) {
-                        fw_gop.key_ptr.* = file_paths[file_id];
-                        fw_gop.value_ptr.* = std.StringHashMap(void).init(allocator);
-                        used_paths[file_id] = true;
-                    }
-                    const wgop = try fw_gop.value_ptr.getOrPut(word);
-                    if (!wgop.found_existing) wgop.key_ptr.* = word;
-                    last_file_id = file_id;
-                }
+                hits.appendAssumeCapacity(.{ .doc_id = file_id, .line_num = line_num });
             }
 
             const gop = try result.index.getOrPut(word);
@@ -673,21 +782,93 @@ pub const WordIndex = struct {
         }
         result.total_tokens = total_tokens_loaded;
 
-        // Compact tmp_file_words HashMaps into slices for result.file_words
-        var tfw_iter = tmp_file_words.iterator();
-        while (tfw_iter.next()) |entry| {
-            const compact = try allocator.alloc([]const u8, entry.value_ptr.count());
-            var ki2: usize = 0;
-            var wk_iter2 = entry.value_ptr.keyIterator();
-            while (wk_iter2.next()) |k| : (ki2 += 1) {
-                compact[ki2] = k.*;
-            }
-            try result.file_words.put(entry.key_ptr.*, compact);
-        }
+        // Loaded indexes skip file_words: only incremental removeFile needs it,
+        // and queries / BM25 never do. Same hundreds-of-MB save the bulk scan
+        // already takes (see main.zig). id_to_path owns the path strings now, so
+        // keep them out of the cleanup defer (used_paths=true) and free them via
+        // the skip_file_words deinit path.
+        @memset(used_paths, true);
+        result.skip_file_words = true;
 
         return result;
     }
 
+    /// Zero-copy load: mmap the word.index file and build only a small word
+    /// directory + doc-length table; postings stay in the mmap. Returns a
+    /// WordIndex in zero-copy mode (first write promotes to heap). Null on any
+    /// malformation — caller can fall back to readFromDisk.
+    pub fn mmapFromDisk(io: std.Io, dir_path: []const u8, allocator: std.mem.Allocator) ?WordIndex {
+        return mmapFromDiskInner(io, dir_path, allocator) catch null;
+    }
+
+    fn mmapFromDiskInner(io: std.Io, dir_path: []const u8, allocator: std.mem.Allocator) !?WordIndex {
+        const index_path = try std.fmt.allocPrint(allocator, "{s}/word.index", .{dir_path});
+        defer allocator.free(index_path);
+
+        const file = std.Io.Dir.cwd().openFile(io, index_path, .{}) catch return null;
+        defer file.close(io);
+        const size = file.length(io) catch return null;
+        if (size < 51) return null;
+        const data = std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0) catch return null;
+        errdefer std.posix.munmap(data);
+
+        if (!std.mem.eql(u8, data[0..4], &DISK_MAGIC)) return null;
+        if (std.mem.readInt(u16, data[4..6], .little) != DISK_FORMAT_VERSION) return null;
+        const file_count = std.mem.readInt(u32, data[6..10], .little);
+
+        var result = WordIndex.init(allocator);
+        result.skip_file_words = true;
+        // mmap_data stays null until the hand-off below, so this errdefer takes
+        // the heap deinit path (frees the duped paths); word_dir + mmap have
+        // their own errdefers.
+        errdefer result.deinit();
+
+        try result.id_to_path.ensureTotalCapacity(allocator, file_count);
+        var pos: usize = 51;
+        for (0..file_count) |_| {
+            if (pos + 2 > data.len) return null;
+            const plen = std.mem.readInt(u16, data[pos..][0..2], .little);
+            pos += 2;
+            if (plen == 0 or pos + plen > data.len) return null;
+            const path = try allocator.dupe(u8, data[pos .. pos + plen]);
+            result.id_to_path.appendAssumeCapacity(path);
+            pos += plen;
+        }
+
+        if (pos + 4 > data.len) return null;
+        const word_count = std.mem.readInt(u32, data[pos..][0..4], .little);
+        pos += 4;
+        const word_dir = try allocator.alloc(u32, word_count);
+        errdefer allocator.free(word_dir);
+        for (0..word_count) |i| {
+            if (pos + 2 > data.len) return null;
+            word_dir[i] = @intCast(pos);
+            const wlen = std.mem.readInt(u16, data[pos..][0..2], .little);
+            pos += 2 + wlen;
+            if (pos + 4 > data.len) return null;
+            const hit_count = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4 + @as(usize, hit_count) * @sizeOf(WordHit);
+            if (pos > data.len) return null;
+        }
+
+        if (pos + 4 > data.len) return null;
+        const dl_count = std.mem.readInt(u32, data[pos..][0..4], .little);
+        pos += 4;
+        if (dl_count != file_count or pos + @as(usize, dl_count) * 4 + 8 > data.len) return null;
+        for (0..dl_count) |i| {
+            const len = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4;
+            if (len > 0) try result.doc_lengths.put(@intCast(i), len);
+        }
+        result.total_tokens = std.mem.readInt(u64, data[pos..][0..8], .little);
+        pos += 8;
+        if (pos != data.len) return null;
+
+        // Hand off: switch to zero-copy mode. result.deinit now takes the mmap path.
+        result.mmap_data = data;
+        result.word_dir = word_dir;
+        return result;
+    }
     pub fn readDiskHeader(io: std.Io, dir_path: []const u8, allocator: std.mem.Allocator) !?DiskHeader {
         const index_path = try std.fmt.allocPrint(allocator, "{s}/word.index", .{dir_path});
         defer allocator.free(index_path);

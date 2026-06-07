@@ -267,7 +267,7 @@ fn loadProjectWordIndexFromDiskIfPresent(io: std.Io, explorer: *Explorer, projec
         return;
     }
 
-    if (idx.WordIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
+    if (idx.WordIndex.mmapFromDisk(io, data_dir, allocator) orelse idx.WordIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.replaceWordIndex(loaded);
     } else {
         explorer.disableWordIndexDiskLoad();

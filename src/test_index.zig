@@ -2943,6 +2943,61 @@ test "bm25-persistence: writeToDisk/readFromDisk preserves total_tokens and doc_
 }
 
 
+test "mmap word index: zero-copy load matches heap load and promotes on write" {
+    const alloc = testing.allocator;
+    var wi = WordIndex.init(alloc);
+    defer wi.deinit();
+    wi.skip_file_words = true;
+    try wi.indexFile("src/a.zig", "pub fn alphaToken() void { betaToken(); }\n");
+    try wi.indexFile("src/b.zig", "pub fn betaToken() void { alphaToken(); alphaToken(); }\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pb[0..try tmp.dir.realPathFile(io, ".", &pb)];
+    try wi.writeToDisk(io, dir, null);
+
+    var heap = WordIndex.readFromDisk(io, dir, alloc).?;
+    defer heap.deinit();
+    var mm = WordIndex.mmapFromDisk(io, dir, alloc).?;
+    defer mm.deinit();
+    try testing.expect(mm.mmap_data != null);
+
+    try testing.expectEqual(heap.search("alphaToken").len, mm.search("alphaToken").len);
+    try testing.expect(mm.search("alphaToken").len >= 1);
+
+    {
+        const h = try mm.searchDeduped("betaToken", alloc);
+        defer alloc.free(h);
+        const r = try heap.searchDeduped("betaToken", alloc);
+        defer alloc.free(r);
+        try testing.expectEqual(r.len, h.len);
+        try testing.expect(h.len >= 1);
+        try testing.expectEqualStrings(heap.hitPath(r[0]), mm.hitPath(h[0]));
+    }
+
+    {
+        const h = try mm.searchPrefix("alpha", alloc, 10);
+        defer alloc.free(h);
+        const r = try heap.searchPrefix("alpha", alloc, 10);
+        defer alloc.free(r);
+        try testing.expectEqual(r.len, h.len);
+    }
+
+    try testing.expectEqual(heap.rankedDocCount(), mm.rankedDocCount());
+    try testing.expectEqual(heap.total_tokens, mm.total_tokens);
+    try testing.expectEqual(heap.docLength(0), mm.docLength(0));
+    try testing.expectEqual(heap.docLength(1), mm.docLength(1));
+
+    try mm.indexFile("src/c.zig", "pub fn gammaToken() void {}\n");
+    try testing.expect(mm.mmap_data == null);
+    const gamma = try mm.searchDeduped("gammaToken", alloc);
+    defer alloc.free(gamma);
+    try testing.expectEqual(@as(usize, 1), gamma.len);
+    try testing.expect(mm.search("alphaToken").len >= 1);
+}
+
+
 test "issue-451: scope search surfaces skip-trigram canonical file" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
