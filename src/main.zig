@@ -509,6 +509,15 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
             });
         }
     } else {
+        // Not a natively-rendered command — bridge to the MCP navigation
+        // handlers (symbol/callers/deps/glob/ls/file/context) so the CLI can
+        // reach the same warm tools the MCP surface exposes.
+        var nav: std.ArrayList(u8) = .empty;
+        defer nav.deinit(allocator);
+        if (mcp_server.runCliTool(io, allocator, explorer, root, cmd, args, cmd_args_start, &nav)) |code| {
+            out.p("{s}", .{nav.items});
+            return code;
+        }
         return 1;
     }
     return 0;
@@ -595,7 +604,7 @@ fn cliWriteFull(fd: c_int, data: []const u8) bool {
 /// will proxy. Everything else (serve, mcp, snapshot, index, ...) is handled
 /// only by the cold path.
 fn cliIsQueryCmd(cmd: []const u8) bool {
-    const cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot" };
+    const cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "symbol", "callers", "deps", "glob", "ls", "file", "context" };
     for (cmds) |c| {
         if (std.mem.eql(u8, cmd, c)) return true;
     }
@@ -1222,9 +1231,11 @@ fn mainImpl() !void {
 
     if (std.mem.eql(u8, cmd, "tree") or std.mem.eql(u8, cmd, "outline") or std.mem.eql(u8, cmd, "find") or
         std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "read") or
-        std.mem.eql(u8, cmd, "hot"))
+        std.mem.eql(u8, cmd, "hot") or std.mem.eql(u8, cmd, "symbol") or std.mem.eql(u8, cmd, "callers") or
+        std.mem.eql(u8, cmd, "deps") or std.mem.eql(u8, cmd, "glob") or std.mem.eql(u8, cmd, "ls") or
+        std.mem.eql(u8, cmd, "file") or std.mem.eql(u8, cmd, "context"))
     {
-        const code = runQuery(io, allocator, &explorer, &store, root, cmd, args, cmd_args_start, &out, s);
+        const code = runQuery(io, allocator, &explorer, &store, abs_root, cmd, args, cmd_args_start, &out, s);
         out.flush();
         std.process.exit(code);
     } else if (std.mem.eql(u8, cmd, "bench-engine")) {
@@ -1726,7 +1737,7 @@ pub fn isValidMcpFlag(arg: []const u8) bool {
 }
 
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
+    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "symbol", "callers", "deps", "glob", "ls", "file", "context", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
     for (commands) |c| {
         if (std.mem.eql(u8, arg, c)) return true;
     }
@@ -2084,12 +2095,26 @@ fn printUsage(out: *Out, s: sty.Style) void {
     });
     out.p(
         \\    {s}hot{s}                       recently modified files
+        \\    {s}symbol{s}  <name>            where a symbol is defined (all matches; --body for source)
+        \\    {s}callers{s}  <name>           every call site of a symbol
+        \\    {s}deps{s}  <path>              dependency graph (--depends-on, --transitive, --max-depth N)
+        \\    {s}glob{s}  <pattern>           match indexed paths by glob
+        \\    {s}ls{s}  [path]                list a directory's indexed children
+        \\    {s}file{s}  <fuzzy-name>        fuzzy file-name search
+        \\    {s}context{s}  <task...>        task-shaped orientation bundle
         \\    {s}serve{s}                     HTTP daemon on :7719
         \\    {s}mcp{s}                       JSON-RPC/MCP server over stdio
         \\    {s}update{s}                    disabled; rebuild from source with zig build
         \\    {s}nuke{s}                      clear caches/snapshots and deregister integrations
         \\
     , .{
+        s.cyan, s.reset,
+        s.cyan, s.reset,
+        s.cyan, s.reset,
+        s.cyan, s.reset,
+        s.cyan, s.reset,
+        s.cyan, s.reset,
+        s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,

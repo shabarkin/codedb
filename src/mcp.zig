@@ -3455,6 +3455,102 @@ fn handleLs(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std
     }
 }
 
+/// CLI⇄MCP parity bridge. Serves the read-only navigation tools that `runQuery`
+/// doesn't render natively — symbol / callers / deps / glob / ls / context and
+/// the fuzzy file-name `file` lookup — by building the MCP argument map and
+/// reusing the same handlers against the warm Explorer. Returns the exit code,
+/// or null if `cmd` isn't one we handle (caller falls through to its own usage
+/// error). The rendered data block is appended to `out`. `root` must be the
+/// resolved absolute project root (used to locate the on-disk word index for
+/// callers/context).
+pub fn runCliTool(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    explorer: *Explorer,
+    root: []const u8,
+    cmd: []const u8,
+    args: []const []const u8,
+    cmd_args_start: usize,
+    out: *std.ArrayList(u8),
+) ?u8 {
+    const pos: ?[]const u8 = if (args.len > cmd_args_start) args[cmd_args_start] else null;
+
+    var m: std.json.ObjectMap = .empty;
+    defer m.deinit(alloc);
+
+    if (std.mem.eql(u8, cmd, "symbol")) {
+        const name = pos orelse return cliUsage(alloc, out, "symbol <name> [--body]");
+        m.put(alloc, "name", .{ .string = name }) catch return 1;
+        for (args[cmd_args_start..]) |a| {
+            if (std.mem.eql(u8, a, "--body")) m.put(alloc, "body", .{ .bool = true }) catch {};
+        }
+        handleSymbol(alloc, &m, out, explorer);
+        return 0;
+    } else if (std.mem.eql(u8, cmd, "callers")) {
+        const name = pos orelse return cliUsage(alloc, out, "callers <name>");
+        m.put(alloc, "name", .{ .string = name }) catch return 1;
+        // handleCallers does a content search (searchContentWithScope), so it
+        // needs the trigram — load the MMAP'd trigram (cheap, reclaimable), NOT
+        // the heap word index. Keeps the footprint at the MCP level.
+        loadProjectTrigramFromDiskIfPresent(io, explorer, root, alloc);
+        handleCallers(alloc, &m, out, explorer);
+        return 0;
+    } else if (std.mem.eql(u8, cmd, "deps")) {
+        const path = pos orelse return cliUsage(alloc, out, "deps <path> [--depends-on] [--transitive] [--max-depth N]");
+        m.put(alloc, "path", .{ .string = path }) catch return 1;
+        var i = cmd_args_start + 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--depends-on")) {
+                m.put(alloc, "direction", .{ .string = "depends_on" }) catch {};
+            } else if (std.mem.eql(u8, a, "--transitive")) {
+                m.put(alloc, "transitive", .{ .bool = true }) catch {};
+            } else if (std.mem.eql(u8, a, "--max-depth") and i + 1 < args.len) {
+                m.put(alloc, "max_depth", .{ .integer = std.fmt.parseInt(i64, args[i + 1], 10) catch 1 }) catch {};
+                i += 1;
+            }
+        }
+        handleDeps(alloc, &m, out, explorer);
+        return 0;
+    } else if (std.mem.eql(u8, cmd, "glob")) {
+        const pattern = pos orelse return cliUsage(alloc, out, "glob <pattern>");
+        m.put(alloc, "pattern", .{ .string = pattern }) catch return 1;
+        handleGlob(alloc, &m, out, explorer);
+        return 0;
+    } else if (std.mem.eql(u8, cmd, "ls")) {
+        if (pos) |p| m.put(alloc, "path", .{ .string = p }) catch return 1;
+        handleLs(alloc, &m, out, explorer);
+        return 0;
+    } else if (std.mem.eql(u8, cmd, "file")) {
+        const query = pos orelse return cliUsage(alloc, out, "file <fuzzy-name>");
+        m.put(alloc, "query", .{ .string = query }) catch return 1;
+        handleFind(alloc, &m, out, explorer);
+        return 0;
+    } else if (std.mem.eql(u8, cmd, "context")) {
+        var task: std.ArrayList(u8) = .empty;
+        defer task.deinit(alloc);
+        var i = cmd_args_start;
+        while (i < args.len) : (i += 1) {
+            if (i > cmd_args_start) task.append(alloc, ' ') catch {};
+            task.appendSlice(alloc, args[i]) catch {};
+        }
+        if (task.items.len == 0) return cliUsage(alloc, out, "context <task...>");
+        m.put(alloc, "task", .{ .string = task.items }) catch return 1;
+        loadProjectWordIndexFromDiskIfPresent(io, explorer, root, alloc);
+        handleContext(io, alloc, &m, out, explorer, root);
+        return 0;
+    }
+    return null;
+}
+
+fn cliUsage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), usage: []const u8) u8 {
+    out.appendSlice(alloc, "usage: codedb [root] ") catch {};
+    out.appendSlice(alloc, usage) catch {};
+    out.appendSlice(alloc, "\n") catch {};
+    return 1;
+}
+
+
 fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer, store: *Store) void {
     _ = store;
     const pipeline_val = args.get("pipeline") orelse {
