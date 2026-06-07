@@ -1066,7 +1066,10 @@ fn mainImpl() !void {
         const needs_word_index = std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine") or
             std.mem.eql(u8, cmd, "index") or std.mem.eql(u8, cmd, "mcp");
         if (snapshot_loaded) {
-            if (std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "bench-engine")) {
+            if (std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "bench-engine") or std.mem.eql(u8, cmd, "cli-daemon")) {
+                // The cli-daemon serves proxied `search`/`callers`; warm the
+                // trigram up front (mmap-backed — cheap RSS) so it doesn't scan
+                // all content per query. Matches the serve/mcp daemon.
                 loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
                 explorer.mu.lockShared();
                 const have_trigrams = explorer.trigram_index.fileCount() > 0;
@@ -1076,13 +1079,13 @@ fn mainImpl() !void {
                     explorer.trigram_index.writeToDisk(io, data_dir, git_head) catch {};
                 }
             }
-            if (std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine")) {
+            if (std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine") or std.mem.eql(u8, cmd, "cli-daemon")) {
                 loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
-                // If the on-disk word index wasn't usable (missing or stale vs
-                // the loaded snapshot), eagerly rebuild + persist here so the
-                // next `codedb word X` invocation loads in ~1ms instead of
-                // re-paying the ~200ms rebuild cost every time.
-                if (!explorer.wordIndexIsComplete()) {
+                // word/bench-engine want a guaranteed-ready index — rebuild + persist
+                // if the on-disk one was missing/stale. The cli-daemon stays lean: if
+                // the mmap load missed, let the first `word`/`context` query rebuild
+                // lazily rather than hold a heap rebuild at startup.
+                if (!std.mem.eql(u8, cmd, "cli-daemon") and !explorer.wordIndexIsComplete()) {
                     explorer.rebuildWordIndex() catch {};
                     persistWordIndexToDisk(io, &explorer, data_dir, git_head);
                 }
