@@ -142,6 +142,364 @@ fn mainInner() void {
         std.process.exit(1);
     };
 }
+/// Read-only query command dispatch, extracted from mainImpl so the same
+/// rendering code can run inside the warm daemon (writing to a socket)
+/// without exiting the daemon process. Returns a u8 exit code; the caller
+/// is responsible for flushing `out`. Covers: tree, outline, find, search,
+/// word, read, hot. Unknown commands return 1.
+fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, root: []const u8, cmd: []const u8, args: []const []const u8, cmd_args_start: usize, out: *Out, s: sty.Style) u8 {
+    const use_color = s.reset.len != 0;
+    if (std.mem.eql(u8, cmd, "tree")) {
+        const t0 = cio.nanoTimestamp();
+        const tree = explorer.getTree(allocator, use_color) catch return 1;
+        defer allocator.free(tree);
+        const elapsed = cio.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        out.p("{s}", .{tree});
+        out.p("{s}{s}{s}\n", .{
+            sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed), s.reset,
+        });
+    } else if (std.mem.eql(u8, cmd, "outline")) {
+        const path = if (args.len > cmd_args_start) args[cmd_args_start] else {
+            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] outline {s}<path>{s}\n", .{
+                s.red, s.reset, s.cyan, s.reset,
+            });
+            return 1;
+        };
+        const t0 = cio.nanoTimestamp();
+        var outline = explorer.getOutline(path, allocator) catch {
+            out.p("{s}\xe2\x9c\x97{s} {s}{s}{s} \xe2\x80\x94 failed to load outline\n", .{
+                s.red, s.reset, s.bold, path, s.reset,
+            });
+            return 1;
+        } orelse {
+            out.p("{s}\xe2\x9c\x97{s} not indexed: {s}{s}{s}\n", .{
+                s.red, s.reset, s.bold, path, s.reset,
+            });
+            return 0;
+        };
+        defer outline.deinit();
+        const elapsed = cio.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        const lang = @tagName(outline.language);
+        out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  {s}{d} lines{s}  {s}{s}{s}\n", .{
+            s.green,                               s.reset,
+            s.bold,                                path,
+            s.reset,                               s.langColor(lang),
+            lang,                                  s.reset,
+            s.dim,                                 outline.line_count,
+            s.reset,                               sty.durationColor(s, elapsed),
+            sty.formatDuration(&dur_buf, elapsed), s.reset,
+        });
+        for (outline.symbols.items) |sym| {
+            const kind = @tagName(sym.kind);
+            out.p("  {s}L{d:<5}{s}  {s}{s:<14}{s}  {s}{s}{s}", .{
+                s.dim,             sym.line_start, s.reset,
+                s.kindColor(kind), kind,           s.reset,
+                s.bold,            sym.name,       s.reset,
+            });
+            if (sym.detail) |d| {
+                out.p("  {s}{s}{s}", .{ s.dim, d, s.reset });
+            }
+            out.p("\n", .{});
+        }
+    } else if (std.mem.eql(u8, cmd, "find")) {
+        const name = if (args.len > cmd_args_start) args[cmd_args_start] else {
+            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] find {s}<symbol>{s}\n", .{
+                s.red, s.reset, s.cyan, s.reset,
+            });
+            return 1;
+        };
+        const t0 = cio.nanoTimestamp();
+        if (explorer.findSymbol(name, allocator) catch return 1) |r| {
+            defer {
+                allocator.free(r.path);
+                allocator.free(r.symbol.name);
+                if (r.symbol.detail) |d| allocator.free(d);
+            }
+            const elapsed = cio.nanoTimestamp() - t0;
+            var dur_buf: [64]u8 = undefined;
+            const kind = @tagName(r.symbol.kind);
+            out.p("{s}\xe2\x9c\x93{s} {s}{s}{s} {s}{s}{s}  {s}{s}{s}:{s}{d}{s}  {s}{s}{s}\n", .{
+                s.green,                       s.reset,
+                s.kindColor(kind),             kind,
+                s.reset,                       s.bold,
+                name,                          s.reset,
+                s.dim,                         r.path,
+                s.reset,                       s.cyan,
+                r.symbol.line_start,           s.reset,
+                sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed),
+                s.reset,
+            });
+            if (r.symbol.detail) |d| {
+                out.p("  {s}{s}{s}\n", .{ s.dim, d, s.reset });
+            }
+        } else {
+            out.p("{s}\xe2\x9c\x97{s} not found: {s}{s}{s}\n", .{
+                s.red, s.reset, s.bold, name, s.reset,
+            });
+        }
+    } else if (std.mem.eql(u8, cmd, "search")) {
+        var use_regex = false;
+        var paths_only = false;
+        var query_arg_start = cmd_args_start;
+        while (args.len > query_arg_start) {
+            const a = args[query_arg_start];
+            if (std.mem.eql(u8, a, "--regex")) {
+                use_regex = true;
+                query_arg_start += 1;
+            } else if (std.mem.eql(u8, a, "--paths-only")) {
+                paths_only = true;
+                query_arg_start += 1;
+            } else {
+                break;
+            }
+        }
+        const query = if (args.len > query_arg_start) args[query_arg_start] else {
+            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] search [--regex] [--paths-only] {s}<query>{s}\n", .{
+                s.red, s.reset, s.cyan, s.reset,
+            });
+            return 1;
+        };
+        const t0 = cio.nanoTimestamp();
+        const results = if (use_regex)
+            explorer.searchContentRegex(query, allocator, 50) catch return 1
+        else
+            explorer.searchContent(query, allocator, 50) catch return 1;
+        defer {
+            for (results) |r| {
+                allocator.free(r.path);
+                allocator.free(r.line_text);
+            }
+            allocator.free(results);
+        }
+        const elapsed = cio.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        const quiet = cio.posixGetenv("CODEDB_QUIET") != null;
+        if (results.len == 0) {
+            if (!quiet) {
+                out.p("{s}\xe2\x9c\x97{s} no results for {s}\"{s}\"{s}\n", .{
+                    s.yellow, s.reset, s.bold, query, s.reset,
+                });
+            }
+        } else {
+            if (!quiet) {
+                const mode_label: []const u8 = if (use_regex) " (regex)" else "";
+                out.p("{s}\xe2\x9c\x93{s} {s}{d}{s} results for {s}\"{s}\"{s}{s}  {s}{s}{s}\n", .{
+                    s.green,                               s.reset,
+                    s.bold,                                results.len,
+                    s.reset,                               s.bold,
+                    query,                                 s.reset,
+                    mode_label,                            sty.durationColor(s, elapsed),
+                    sty.formatDuration(&dur_buf, elapsed), s.reset,
+                });
+            }
+            for (results) |r| {
+                if (paths_only) {
+                    out.p("  {s}{s}{s}:{s}{d}{s}\n", .{
+                        s.cyan, r.path, s.reset,
+                        s.dim,  r.line_num, s.reset,
+                    });
+                } else {
+                    out.p("  {s}{s}{s}:{s}{d}{s}  {s}\n", .{
+                        s.cyan,      r.path,     s.reset,
+                        s.dim,       r.line_num, s.reset,
+                        r.line_text,
+                    });
+                }
+            }
+        }
+    } else if (std.mem.eql(u8, cmd, "word")) {
+        const word = if (args.len > cmd_args_start) args[cmd_args_start] else {
+            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] word {s}<identifier>{s}\n", .{
+                s.red, s.reset, s.cyan, s.reset,
+            });
+            return 1;
+        };
+        const t0 = cio.nanoTimestamp();
+        const hits = explorer.searchWord(word, allocator) catch return 1;
+        defer allocator.free(hits);
+        const elapsed = cio.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        if (hits.len == 0) {
+            out.p("{s}\xe2\x9c\x97{s} no hits for {s}'{s}'{s}\n", .{
+                s.yellow, s.reset, s.bold, word, s.reset,
+            });
+        } else {
+            out.p("{s}\xe2\x9c\x93{s} {s}{d}{s} hits for {s}'{s}'{s}  {s}{s}{s}\n", .{
+                s.green,                       s.reset,
+                s.bold,                        hits.len,
+                s.reset,                       s.bold,
+                word,                          s.reset,
+                sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed),
+                s.reset,
+            });
+            explorer.mu.lockShared();
+            defer explorer.mu.unlockShared();
+            for (hits) |h| {
+                out.p("  {s}{s}{s}:{s}{d}{s}\n", .{
+                    s.cyan, explorer.word_index.hitPath(h), s.reset,
+                    s.dim,  h.line_num,                     s.reset,
+                });
+            }
+        }
+    } else if (std.mem.eql(u8, cmd, "read")) {
+        // CLI counterpart of codedb_read MCP tool. Closes the agentic-eval
+        // gap where the CLI surface lacked a file-read primitive — agents
+        // restricted to `codedb` CLI had to reconstruct file bodies from
+        // 20+ `search` invocations.
+        var line_start: ?u32 = null;
+        var line_end: ?u32 = null;
+        var compact = false;
+        var arg_idx = cmd_args_start;
+        while (args.len > arg_idx) {
+            const a = args[arg_idx];
+            if (std.mem.eql(u8, a, "--compact") or std.mem.eql(u8, a, "-c")) {
+                compact = true;
+                arg_idx += 1;
+            } else if (std.mem.eql(u8, a, "-L") or std.mem.eql(u8, a, "--lines")) {
+                if (arg_idx + 1 >= args.len) break;
+                const range = args[arg_idx + 1];
+                const dash = std.mem.indexOfScalar(u8, range, '-') orelse break;
+                line_start = std.fmt.parseInt(u32, range[0..dash], 10) catch null;
+                const end_str = range[dash + 1 ..];
+                if (std.mem.eql(u8, end_str, "$") or std.mem.eql(u8, end_str, "end")) {
+                    line_end = std.math.maxInt(u32);
+                } else {
+                    line_end = std.fmt.parseInt(u32, end_str, 10) catch null;
+                }
+                arg_idx += 2;
+            } else {
+                break;
+            }
+        }
+        const path = if (args.len > arg_idx) args[arg_idx] else {
+            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] read [-L FROM-TO] [--compact] {s}<path>{s}\n", .{
+                s.red, s.reset, s.cyan, s.reset,
+            });
+            return 1;
+        };
+        // Same safety guards as codedb_read MCP — path must be project-relative
+        // (no leading `/`, no `..` traversal, no null bytes / backslashes) and
+        // must not target sensitive files like .env / id_rsa / .ssh/*. Without
+        // these guards the CLI happily reads /etc/passwd, secrets, or any file
+        // the codedb process can see.
+        if (!mcp_server.isPathSafe(path)) {
+            out.p("{s}\xe2\x9c\x97{s} path must be relative to the project root (no leading `/`, no `..` traversal): {s}{s}{s}\n", .{
+                s.red, s.reset, s.bold, path, s.reset,
+            });
+            return 1;
+        }
+        if (watcher.isSensitivePath(path)) {
+            out.p("{s}\xe2\x9c\x97{s} access to sensitive file blocked: {s}{s}{s}\n", .{
+                s.red, s.reset, s.bold, path, s.reset,
+            });
+            return 1;
+        }
+        const t0 = cio.nanoTimestamp();
+        // Prefer indexed content (matches the indexed view), fall back to disk
+        // reads anchored at the resolved project root — NOT cwd. Pre-fix, an
+        // explicit `codedb /path/to/proj read foo.zig` would read `./foo.zig`
+        // from wherever the user happened to invoke it.
+        const cached = explorer.getContent(path, allocator) catch null;
+        const content_owned = if (cached) |c| c else blk: {
+            var root_dir = std.Io.Dir.cwd().openDir(io, root, .{}) catch {
+                out.p("{s}\xe2\x9c\x97{s} cannot open project root: {s}{s}{s}\n", .{
+                    s.red, s.reset, s.bold, root, s.reset,
+                });
+                return 1;
+            };
+            defer root_dir.close(io);
+            break :blk root_dir.readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024)) catch {
+                out.p("{s}\xe2\x9c\x97{s} not indexed and disk read failed: {s}{s}{s}\n", .{
+                    s.red, s.reset, s.bold, path, s.reset,
+                });
+                return 1;
+            };
+        };
+        defer allocator.free(content_owned);
+        // Binary detection (NUL byte in first 8KB) — stub instead of dumping raw bytes
+        const probe_len = @min(content_owned.len, 8 * 1024);
+        if (std.mem.indexOfScalar(u8, content_owned[0..probe_len], 0) != null) {
+            out.p("{s}\xe2\x9c\x97{s} binary file: {d} bytes\n", .{ s.yellow, s.reset, content_owned.len });
+            return 0;
+        }
+        const elapsed = cio.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        const has_range = line_start != null or line_end != null;
+        const lang = explore_mod.detectLanguage(path);
+        if (has_range or compact) {
+            const start: u32 = line_start orelse 1;
+            const end: u32 = line_end orelse std.math.maxInt(u32);
+            const extracted = explore_mod.extractLines(content_owned, start, end, true, compact, lang, allocator) catch {
+                out.p("{s}\xe2\x9c\x97{s} line extraction failed\n", .{ s.red, s.reset });
+                return 1;
+            };
+            defer allocator.free(extracted);
+            const unbounded = end == std.math.maxInt(u32);
+            if (unbounded) {
+                out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  L{d}-EOF  {s}{s}{s}\n", .{
+                    s.green,                       s.reset,
+                    s.bold,                        path,
+                    s.reset,                       s.langColor(@tagName(lang)),
+                    @tagName(lang),                s.reset,
+                    start,                         sty.durationColor(s, elapsed),
+                    sty.formatDuration(&dur_buf, elapsed), s.reset,
+                });
+            } else {
+                out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  L{d}-{d}  {s}{s}{s}\n", .{
+                    s.green,                       s.reset,
+                    s.bold,                        path,
+                    s.reset,                       s.langColor(@tagName(lang)),
+                    @tagName(lang),                s.reset,
+                    start,                         end,
+                    sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed),
+                    s.reset,
+                });
+            }
+            out.p("{s}", .{extracted});
+        } else {
+            out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  {s}{s}{s}\n", .{
+                s.green,                       s.reset,
+                s.bold,                        path,
+                s.reset,                       s.langColor(@tagName(lang)),
+                @tagName(lang),                s.reset,
+                sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed),
+                s.reset,
+            });
+            var line_num: u32 = 0;
+            var lines = std.mem.splitScalar(u8, content_owned, '\n');
+            while (lines.next()) |line| {
+                line_num += 1;
+                out.p("{d:>5} | {s}\n", .{ line_num, line });
+            }
+        }
+    } else if (std.mem.eql(u8, cmd, "hot")) {
+        const t0 = cio.nanoTimestamp();
+        const hot = explorer.getHotFiles(store, allocator, 10) catch return 1;
+        defer {
+            for (hot) |path| allocator.free(path);
+            allocator.free(hot);
+        }
+        const elapsed = cio.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        out.p("{s}\xe2\x9c\x93{s} {s}recently modified{s}  {s}{s}{s}\n", .{
+            s.green,                       s.reset,
+            s.bold,                        s.reset,
+            sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed),
+            s.reset,
+        });
+        for (hot, 1..) |path, i| {
+            out.p("  {s}{d}{s}  {s}{s}{s}\n", .{
+                s.dim,  i,    s.reset,
+                s.cyan, path, s.reset,
+            });
+        }
+    } else {
+        return 1;
+    }
+    return 0;
+}
 fn mainImpl() !void {
     // Use c_allocator (libc malloc) — better page reclamation than GPA
     const allocator = std.heap.c_allocator;
@@ -522,364 +880,13 @@ fn mainImpl() !void {
         } // end else (no snapshot)
     }
 
-    if (std.mem.eql(u8, cmd, "tree")) {
-        const t0 = cio.nanoTimestamp();
-        const tree = try explorer.getTree(allocator, use_color);
-        defer allocator.free(tree);
-        const elapsed = cio.nanoTimestamp() - t0;
-        var dur_buf: [64]u8 = undefined;
-        out.p("{s}", .{tree});
-        out.p("{s}{s}{s}\n", .{
-            sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed), s.reset,
-        });
-    } else if (std.mem.eql(u8, cmd, "outline")) {
-        const path = if (args.len > cmd_args_start) args[cmd_args_start] else {
-            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] outline {s}<path>{s}\n", .{
-                s.red, s.reset, s.cyan, s.reset,
-            });
-            std.process.exit(1);
-        };
-        const t0 = cio.nanoTimestamp();
-        var outline = explorer.getOutline(path, allocator) catch {
-            out.p("{s}\xe2\x9c\x97{s} {s}{s}{s} \xe2\x80\x94 failed to load outline\n", .{
-                s.red, s.reset, s.bold, path, s.reset,
-            });
-            std.process.exit(1);
-        } orelse {
-            out.p("{s}\xe2\x9c\x97{s} not indexed: {s}{s}{s}\n", .{
-                s.red, s.reset, s.bold, path, s.reset,
-            });
-            return;
-        };
-        defer outline.deinit();
-        const elapsed = cio.nanoTimestamp() - t0;
-        var dur_buf: [64]u8 = undefined;
-        const lang = @tagName(outline.language);
-        out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  {s}{d} lines{s}  {s}{s}{s}\n", .{
-            s.green,                               s.reset,
-            s.bold,                                path,
-            s.reset,                               s.langColor(lang),
-            lang,                                  s.reset,
-            s.dim,                                 outline.line_count,
-            s.reset,                               sty.durationColor(s, elapsed),
-            sty.formatDuration(&dur_buf, elapsed), s.reset,
-        });
-        for (outline.symbols.items) |sym| {
-            const kind = @tagName(sym.kind);
-            out.p("  {s}L{d:<5}{s}  {s}{s:<14}{s}  {s}{s}{s}", .{
-                s.dim,             sym.line_start, s.reset,
-                s.kindColor(kind), kind,           s.reset,
-                s.bold,            sym.name,       s.reset,
-            });
-            if (sym.detail) |d| {
-                out.p("  {s}{s}{s}", .{ s.dim, d, s.reset });
-            }
-            out.p("\n", .{});
-        }
-    } else if (std.mem.eql(u8, cmd, "find")) {
-        const name = if (args.len > cmd_args_start) args[cmd_args_start] else {
-            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] find {s}<symbol>{s}\n", .{
-                s.red, s.reset, s.cyan, s.reset,
-            });
-            std.process.exit(1);
-        };
-        const t0 = cio.nanoTimestamp();
-        if (try explorer.findSymbol(name, allocator)) |r| {
-            defer {
-                allocator.free(r.path);
-                allocator.free(r.symbol.name);
-                if (r.symbol.detail) |d| allocator.free(d);
-            }
-            const elapsed = cio.nanoTimestamp() - t0;
-            var dur_buf: [64]u8 = undefined;
-            const kind = @tagName(r.symbol.kind);
-            out.p("{s}\xe2\x9c\x93{s} {s}{s}{s} {s}{s}{s}  {s}{s}{s}:{s}{d}{s}  {s}{s}{s}\n", .{
-                s.green,                       s.reset,
-                s.kindColor(kind),             kind,
-                s.reset,                       s.bold,
-                name,                          s.reset,
-                s.dim,                         r.path,
-                s.reset,                       s.cyan,
-                r.symbol.line_start,           s.reset,
-                sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed),
-                s.reset,
-            });
-            if (r.symbol.detail) |d| {
-                out.p("  {s}{s}{s}\n", .{ s.dim, d, s.reset });
-            }
-        } else {
-            out.p("{s}\xe2\x9c\x97{s} not found: {s}{s}{s}\n", .{
-                s.red, s.reset, s.bold, name, s.reset,
-            });
-        }
-    } else if (std.mem.eql(u8, cmd, "search")) {
-        var use_regex = false;
-        var paths_only = false;
-        var query_arg_start = cmd_args_start;
-        while (args.len > query_arg_start) {
-            const a = args[query_arg_start];
-            if (std.mem.eql(u8, a, "--regex")) {
-                use_regex = true;
-                query_arg_start += 1;
-            } else if (std.mem.eql(u8, a, "--paths-only")) {
-                paths_only = true;
-                query_arg_start += 1;
-            } else {
-                break;
-            }
-        }
-        const query = if (args.len > query_arg_start) args[query_arg_start] else {
-            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] search [--regex] [--paths-only] {s}<query>{s}\n", .{
-                s.red, s.reset, s.cyan, s.reset,
-            });
-            std.process.exit(1);
-        };
-        const t0 = cio.nanoTimestamp();
-        const results = if (use_regex)
-            explorer.searchContentRegex(query, allocator, 50) catch |err| switch (err) {
-                error.InvalidPattern => {
-                    out.p("{s}\xe2\x9c\x97{s} invalid regex pattern: {s}{s}{s}\n", .{
-                        s.red, s.reset, s.cyan, query, s.reset,
-                    });
-                    std.process.exit(1);
-                },
-                else => return err,
-            }
-        else
-            try explorer.searchContent(query, allocator, 50);
-        defer {
-            for (results) |r| {
-                allocator.free(r.path);
-                allocator.free(r.line_text);
-            }
-            allocator.free(results);
-        }
-        const elapsed = cio.nanoTimestamp() - t0;
-        var dur_buf: [64]u8 = undefined;
-        const quiet = cio.posixGetenv("CODEDB_QUIET") != null;
-        if (results.len == 0) {
-            if (!quiet) {
-                out.p("{s}\xe2\x9c\x97{s} no results for {s}\"{s}\"{s}\n", .{
-                    s.yellow, s.reset, s.bold, query, s.reset,
-                });
-            }
-        } else {
-            if (!quiet) {
-                const mode_label: []const u8 = if (use_regex) " (regex)" else "";
-                out.p("{s}\xe2\x9c\x93{s} {s}{d}{s} results for {s}\"{s}\"{s}{s}  {s}{s}{s}\n", .{
-                    s.green,                               s.reset,
-                    s.bold,                                results.len,
-                    s.reset,                               s.bold,
-                    query,                                 s.reset,
-                    mode_label,                            sty.durationColor(s, elapsed),
-                    sty.formatDuration(&dur_buf, elapsed), s.reset,
-                });
-            }
-            for (results) |r| {
-                if (paths_only) {
-                    out.p("  {s}{s}{s}:{s}{d}{s}\n", .{
-                        s.cyan, r.path,     s.reset,
-                        s.dim,  r.line_num, s.reset,
-                    });
-                } else {
-                    out.p("  {s}{s}{s}:{s}{d}{s}  {s}\n", .{
-                        s.cyan,      r.path,     s.reset,
-                        s.dim,       r.line_num, s.reset,
-                        r.line_text,
-                    });
-                }
-            }
-        }
-    } else if (std.mem.eql(u8, cmd, "word")) {
-        const word = if (args.len > cmd_args_start) args[cmd_args_start] else {
-            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] word {s}<identifier>{s}\n", .{
-                s.red, s.reset, s.cyan, s.reset,
-            });
-            std.process.exit(1);
-        };
-        const t0 = cio.nanoTimestamp();
-        const hits = try explorer.searchWord(word, allocator);
-        defer allocator.free(hits);
-        const elapsed = cio.nanoTimestamp() - t0;
-        var dur_buf: [64]u8 = undefined;
-        if (hits.len == 0) {
-            out.p("{s}\xe2\x9c\x97{s} no hits for {s}'{s}'{s}\n", .{
-                s.yellow, s.reset, s.bold, word, s.reset,
-            });
-        } else {
-            out.p("{s}\xe2\x9c\x93{s} {s}{d}{s} hits for {s}'{s}'{s}  {s}{s}{s}\n", .{
-                s.green,                       s.reset,
-                s.bold,                        hits.len,
-                s.reset,                       s.bold,
-                word,                          s.reset,
-                sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed),
-                s.reset,
-            });
-            explorer.mu.lockShared();
-            defer explorer.mu.unlockShared();
-            for (hits) |h| {
-                out.p("  {s}{s}{s}:{s}{d}{s}\n", .{
-                    s.cyan, explorer.word_index.hitPath(h), s.reset,
-                    s.dim,  h.line_num,                     s.reset,
-                });
-            }
-        }
-    } else if (std.mem.eql(u8, cmd, "read")) {
-        // CLI counterpart of codedb_read MCP tool. Closes the agentic-eval
-        // gap where the CLI surface lacked a file-read primitive — agents
-        // restricted to `codedb` CLI had to reconstruct file bodies from
-        // 20+ `search` invocations.
-        var line_start: ?u32 = null;
-        var line_end: ?u32 = null;
-        var compact = false;
-        var arg_idx = cmd_args_start;
-        while (args.len > arg_idx) {
-            const a = args[arg_idx];
-            if (std.mem.eql(u8, a, "--compact") or std.mem.eql(u8, a, "-c")) {
-                compact = true;
-                arg_idx += 1;
-            } else if (std.mem.eql(u8, a, "-L") or std.mem.eql(u8, a, "--lines")) {
-                if (arg_idx + 1 >= args.len) break;
-                const range = args[arg_idx + 1];
-                const dash = std.mem.indexOfScalar(u8, range, '-') orelse break;
-                line_start = std.fmt.parseInt(u32, range[0..dash], 10) catch null;
-                const end_str = range[dash + 1 ..];
-                if (std.mem.eql(u8, end_str, "$") or std.mem.eql(u8, end_str, "end")) {
-                    line_end = std.math.maxInt(u32);
-                } else {
-                    line_end = std.fmt.parseInt(u32, end_str, 10) catch null;
-                }
-                arg_idx += 2;
-            } else {
-                break;
-            }
-        }
-        const path = if (args.len > arg_idx) args[arg_idx] else {
-            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] read [-L FROM-TO] [--compact] {s}<path>{s}\n", .{
-                s.red, s.reset, s.cyan, s.reset,
-            });
-            std.process.exit(1);
-        };
-        // Same safety guards as codedb_read MCP — path must be project-relative
-        // (no leading `/`, no `..` traversal, no null bytes / backslashes) and
-        // must not target sensitive files like .env / id_rsa / .ssh/*. Without
-        // these guards the CLI happily reads /etc/passwd, secrets, or any file
-        // the codedb process can see.
-        if (!mcp_server.isPathSafe(path)) {
-            out.p("{s}\xe2\x9c\x97{s} path must be relative to the project root (no leading `/`, no `..` traversal): {s}{s}{s}\n", .{
-                s.red, s.reset, s.bold, path, s.reset,
-            });
-            out.flush();
-            std.process.exit(1);
-        }
-        if (watcher.isSensitivePath(path)) {
-            out.p("{s}\xe2\x9c\x97{s} access to sensitive file blocked: {s}{s}{s}\n", .{
-                s.red, s.reset, s.bold, path, s.reset,
-            });
-            out.flush();
-            std.process.exit(1);
-        }
-        const t0 = cio.nanoTimestamp();
-        // Prefer indexed content (matches the indexed view), fall back to disk
-        // reads anchored at the resolved project root — NOT cwd. Pre-fix, an
-        // explicit `codedb /path/to/proj read foo.zig` would read `./foo.zig`
-        // from wherever the user happened to invoke it.
-        const cached = explorer.getContent(path, allocator) catch null;
-        const content_owned = if (cached) |c| c else blk: {
-            var root_dir = std.Io.Dir.cwd().openDir(io, root, .{}) catch {
-                out.p("{s}\xe2\x9c\x97{s} cannot open project root: {s}{s}{s}\n", .{
-                    s.red, s.reset, s.bold, root, s.reset,
-                });
-                out.flush();
-                std.process.exit(1);
-            };
-            defer root_dir.close(io);
-            break :blk path_security.readFileAlloc(io, root_dir, explorer.root_real, path, allocator, .limited(10 * 1024 * 1024)) catch {
-                out.p("{s}\xe2\x9c\x97{s} not indexed and disk read failed: {s}{s}{s}\n", .{
-                    s.red, s.reset, s.bold, path, s.reset,
-                });
-                out.flush();
-                std.process.exit(1);
-            };
-        };
-        defer allocator.free(content_owned);
-        // Binary detection (NUL byte in first 8KB) — stub instead of dumping raw bytes
-        const probe_len = @min(content_owned.len, 8 * 1024);
-        if (std.mem.indexOfScalar(u8, content_owned[0..probe_len], 0) != null) {
-            out.p("{s}\xe2\x9c\x97{s} binary file: {d} bytes\n", .{ s.yellow, s.reset, content_owned.len });
-            return;
-        }
-        const elapsed = cio.nanoTimestamp() - t0;
-        var dur_buf: [64]u8 = undefined;
-        const has_range = line_start != null or line_end != null;
-        const lang = explore_mod.detectLanguage(path);
-        if (has_range or compact) {
-            const start: u32 = line_start orelse 1;
-            const end: u32 = line_end orelse std.math.maxInt(u32);
-            const extracted = explore_mod.extractLines(content_owned, start, end, true, compact, lang, allocator) catch {
-                out.p("{s}\xe2\x9c\x97{s} line extraction failed\n", .{ s.red, s.reset });
-                std.process.exit(1);
-            };
-            defer allocator.free(extracted);
-            const unbounded = end == std.math.maxInt(u32);
-            if (unbounded) {
-                out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  L{d}-EOF  {s}{s}{s}\n", .{
-                    s.green,                               s.reset,
-                    s.bold,                                path,
-                    s.reset,                               s.langColor(@tagName(lang)),
-                    @tagName(lang),                        s.reset,
-                    start,                                 sty.durationColor(s, elapsed),
-                    sty.formatDuration(&dur_buf, elapsed), s.reset,
-                });
-            } else {
-                out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  L{d}-{d}  {s}{s}{s}\n", .{
-                    s.green,                       s.reset,
-                    s.bold,                        path,
-                    s.reset,                       s.langColor(@tagName(lang)),
-                    @tagName(lang),                s.reset,
-                    start,                         end,
-                    sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed),
-                    s.reset,
-                });
-            }
-            out.p("{s}", .{extracted});
-        } else {
-            out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  {s}{s}{s}\n", .{
-                s.green,                       s.reset,
-                s.bold,                        path,
-                s.reset,                       s.langColor(@tagName(lang)),
-                @tagName(lang),                s.reset,
-                sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed),
-                s.reset,
-            });
-            var line_num: u32 = 0;
-            var lines = std.mem.splitScalar(u8, content_owned, '\n');
-            while (lines.next()) |line| {
-                line_num += 1;
-                out.p("{d:>5} | {s}\n", .{ line_num, line });
-            }
-        }
-    } else if (std.mem.eql(u8, cmd, "hot")) {
-        const t0 = cio.nanoTimestamp();
-        const hot = try explorer.getHotFiles(&store, allocator, 10);
-        defer {
-            for (hot) |path| allocator.free(path);
-            allocator.free(hot);
-        }
-        const elapsed = cio.nanoTimestamp() - t0;
-        var dur_buf: [64]u8 = undefined;
-        out.p("{s}\xe2\x9c\x93{s} {s}recently modified{s}  {s}{s}{s}\n", .{
-            s.green,                       s.reset,
-            s.bold,                        s.reset,
-            sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed),
-            s.reset,
-        });
-        for (hot, 1..) |path, i| {
-            out.p("  {s}{d}{s}  {s}{s}{s}\n", .{
-                s.dim,  i,    s.reset,
-                s.cyan, path, s.reset,
-            });
-        }
+    if (std.mem.eql(u8, cmd, "tree") or std.mem.eql(u8, cmd, "outline") or std.mem.eql(u8, cmd, "find") or
+        std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "read") or
+        std.mem.eql(u8, cmd, "hot"))
+    {
+        const code = runQuery(io, allocator, &explorer, &store, root, cmd, args, cmd_args_start, &out, s);
+        out.flush();
+        std.process.exit(code);
     } else if (std.mem.eql(u8, cmd, "bench-engine")) {
         // Engine-vs-engine microbenchmark — bypasses MCP envelope, response
         // formatting, and most of the CLI display path. Lets us compare
