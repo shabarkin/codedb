@@ -1,6 +1,9 @@
 # codedb CLI
 
-A daemon + thin CLI client for codedb. Same code intelligence as MCP, usable from any shell.
+Same code intelligence as MCP, usable from any shell. Two surfaces:
+
+1. **Built-in CLI** — `codedb [root] <command>`, baked into the binary. Full command set, no extra dependencies.
+2. **`codedb-cli` wrapper** — a thin bash + curl + jq client that talks to a running HTTP daemon.
 
 ## Why
 
@@ -13,7 +16,44 @@ codedb's MCP server is designed for AI agents over JSON-RPC stdio. The CLI gives
 | Debuggable | Opaque stdio | curl, jq, logs |
 | Requires | MCP client (Claude, Cursor, etc.) | Just a shell |
 
-## How It Works
+## Built-in CLI
+
+```
+codedb [root] <command> [args...]
+```
+
+If `root` is omitted, the current working directory is used. Per-project data lives in `~/.codedb/projects/<hash>/`.
+
+| Command | Description |
+|---------|-------------|
+| `tree` | File tree with language and symbol counts |
+| `outline <path>` | List all symbols in a file |
+| `find <name>` | Find where a symbol is defined |
+| `search <query>` | Full-text search (`--regex`, `--paths-only`, `--max-results N`) |
+| `word <identifier>` | Exact word lookup via inverted index |
+| `read <path>` | File contents (`-L FROM-TO`, `--compact`) |
+| `hot` | Recently modified files |
+| `status` | Index size, store seq, and index state |
+| `symbol <name>` | Where a symbol is defined, all matches (`--body` for source) |
+| `callers <name>` | Every call site of a symbol |
+| `deps <path>` | Dependency graph (`--depends-on`, `--transitive`, `--max-depth N`) |
+| `glob <pattern>` | Match indexed paths by glob |
+| `ls [path]` | List a directory's indexed children |
+| `file <fuzzy-name>` | Fuzzy file-name search |
+| `context <task...>` | Task-shaped orientation bundle |
+| `compass <task...>` | Intent-shaped overview / define / callers tunnel (`--intent`, `--body`, `--max-files`, `--more`, `--mode`, `--format`) |
+| `serve` | HTTP daemon on :7719 |
+| `mcp` | JSON-RPC/MCP server over stdio |
+| `update` | Disabled — rebuild from source with `zig build` |
+| `nuke` | Clear caches/snapshots and deregister integrations |
+
+Global options: `--config-file <path>` (load `.codedbrc` overrides; default `./.codedbrc`), `--version` / `-v`, `--help` / `-h`.
+
+Exit codes: `0` = success (including a valid query that finds nothing), `1` = usage error, invalid input, or operational failure.
+
+**Warm-daemon proxy:** if a `codedb <root> serve` or `codedb <root> mcp` daemon is already running for the project, query commands are proxied to it over a per-project Unix socket — skipping the per-process snapshot reload. Otherwise the command runs cold against the on-disk index. Set `CODEDB_NO_CLI_PROXY=1` for eval/debug runs that must use the current CLI process instead of an already-running daemon.
+
+## `codedb-cli` wrapper — How It Works
 
 ```
 codedb <root> serve              # HTTP daemon on localhost:7719
@@ -50,7 +90,7 @@ systemctl --user enable --now codedb
 
 Or just run queries — the CLI auto-starts the daemon if it's not running.
 
-## Commands
+## Wrapper Commands
 
 ```
 codedb-cli [root] <command> [args...]
@@ -90,6 +130,8 @@ codedb-cli stop                       # stop daemon
 |----------|---------|-------------|
 | `CODEDB_PORT` | `7719` | HTTP port for the daemon |
 | `CODEDB_BINARY` | `codedb` | Path to the codedb binary |
+| `CODEDB_TOKEN` | — | HTTP auth token (overrides the token file) |
+| `CODEDB_TOKEN_FILE` | `~/.codedb/server-<port>.token` | Path to the daemon's auth token file |
 
 ## Performance
 

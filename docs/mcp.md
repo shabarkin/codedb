@@ -3,7 +3,7 @@
 `codedb mcp` runs as a stdio JSON-RPC server speaking the
 [Model Context Protocol](https://spec.modelcontextprotocol.io/). It exposes
 22 tools for code intelligence — search, outline, callers, deps, edit,
-context, etc. — backed by the indexes in `~/.codedb/projects/<hash>/`.
+context, compass, etc. — backed by the indexes in `~/.codedb/projects/<hash>/`.
 
 This guide covers per-client setup, how codedb decides which project to
 scan, and the most common failure modes.
@@ -177,10 +177,16 @@ comments. Unknown keys are ignored.
 # .codedbrc
 max_cached   = 16384   # in-memory ContentCache size (files); default 16384
 max_versions = 100     # versions kept per file in the change log; default 100
+
+# codedb_compass tuning
+compass_max_files     = 5      # reduced-view file cap per compass response; default 5
+compass_body          = false  # include symbol bodies in define output; default false
+compass_overflow_keep = 50     # overflow artifacts kept on disk; default 50
 ```
 
-Pass an alternative path with `--config-file <path>` to the CLI for
-testing.
+Resolution order: `--config-file <path>` → `$CWD/.codedbrc` →
+`<binary_dir>/.codedbrc` → built-in defaults. Pass an alternative path
+with `--config-file <path>` to the CLI for testing.
 
 ---
 
@@ -225,11 +231,11 @@ call, or restart the client from inside the project directory.
 If you're still seeing this error, rebuild from the latest source and verify
 the client points at the rebuilt binary.
 
-### Tools list looks short / `codedb_context` is missing
+### Tools list looks short / `codedb_context` or `codedb_compass` is missing
 
-`codedb_context` requires a current source build. Rebuild with
-`zig build -Doptimize=ReleaseFast` and verify the client points at the rebuilt
-binary.
+`codedb_context` and `codedb_compass` require a current source build. Rebuild
+with `zig build -Doptimize=ReleaseFast` and verify the client points at the
+rebuilt binary.
 
 ### Snapshot indexer keeps re-scanning
 

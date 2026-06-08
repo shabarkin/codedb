@@ -29,14 +29,14 @@
 >
 > codedb works and is used daily in production AI workflows, but:
 > - **Parser support** — Zig, C/C++, Python, TypeScript/JavaScript, Rust, Go, PHP, Ruby, HCL, R, Dart/Flutter
-> - **Lightweight outline support** — Java, Kotlin, Svelte, Vue, Astro, shell, CSS/SCSS, SQL, protobuf, Fortran, LLVM IR, MLIR, and TableGen
+> - **Lightweight outline support** — Java, Kotlin, Swift, Svelte, Vue, Astro, ReScript, shell, CSS/SCSS, SQL, protobuf, Fortran, LLVM IR, MLIR, and TableGen
 > - **HTTP auth** — localhost server requires `X-Codedb-Token` or `Authorization: Bearer ...`
 > - **Snapshot format** may change between versions
 > - **MCP protocol** is JSON-RPC 2.0 over stdio (stable)
 
 | What works today                                       | What's in progress                       |
 |--------------------------------------------------------|------------------------------------------|
-| 20 MCP tools available by default for full codebase intelligence | Deeper parser coverage and edge-case handling |
+| 22 MCP tools available by default for full codebase intelligence | Deeper parser coverage and edge-case handling |
 | Trigram v2: integer doc IDs, batch-accumulate, merge intersect | Incremental segment-based indexing |
 | Warm, pre-indexed MCP queries can be hundreds of times faster than one-shot ripgrep | WASM target experiments                  |
 | O(1) inverted word index for identifier lookup         | Multi-project support                    |
@@ -118,13 +118,15 @@ zig-out/bin/codedb /path/to/project find AgentRegistry
 zig-out/bin/codedb /path/to/project search "handleAuth"
 zig-out/bin/codedb /path/to/project word Store
 zig-out/bin/codedb /path/to/project hot
+zig-out/bin/codedb /path/to/project context "where is the auth token validated"
+zig-out/bin/codedb /path/to/project compass "how does incremental indexing work"
 ```
 
 ---
 
 ## 🔧 MCP Tools
 
-20 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio):
+22 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio):
 
 | Tool | Description |
 |------|-------------|
@@ -135,6 +137,7 @@ zig-out/bin/codedb /path/to/project hot
 | `codedb_word` | O(1) inverted index lookup for identifiers and their sub-tokens |
 | `codedb_callers` | Heuristic call-site finder — word index ∩ outline scope, in one round-trip |
 | `codedb_context` | Task-shaped composer — pass a NL task, get keywords + symbol defs + ranked files + top snippets in one block (replaces 3–5 sequential calls) |
+| `codedb_compass` | Intent-shaped navigation tunnel — route one task into overview / define / callers with explicit coverage and optional `more` recovery |
 | `codedb_hot` | Most recently modified files |
 | `codedb_deps` | Dependency graph: `imported_by` (default) or `depends_on`; `transitive=true` for full BFS |
 | `codedb_read` | Read file content (line ranges, `if_hash` skip-unchanged, `compact` mode) |
@@ -142,6 +145,7 @@ zig-out/bin/codedb /path/to/project hot
 | `codedb_changes` | Changed files since a sequence number |
 | `codedb_status` | Index status (file count, current sequence, scan phase) |
 | `codedb_snapshot` | Full pre-rendered JSON snapshot of the codebase |
+| `codedb_bundle` | Run up to 20 `codedb_*` calls in one round-trip |
 | `codedb_projects` | List all locally indexed projects on this machine |
 | `codedb_index` | Index a local folder and write `codedb.snapshot` |
 | `codedb_find` | Fuzzy **file-name** search (typo-tolerant subsequence match against indexed paths — not a content/symbol search) |
@@ -167,7 +171,16 @@ in MCP search/glob/query filters so nested files are included by default.
 | `codedb search --regex <pattern>` | Regex search |
 | `codedb word <identifier>` | Identifier/sub-token lookup via inverted index |
 | `codedb read <path>` | Read file contents (supports `-L FROM-TO`, `--compact`) |
+| `codedb symbol <name>` | Where a symbol is defined, all matches (`--body` for source) |
+| `codedb callers <name>` | Every call site of a symbol |
+| `codedb deps <path>` | Dependency graph (`--depends-on`, `--transitive`, `--max-depth N`) |
+| `codedb glob <pattern>` | Match indexed paths by glob |
+| `codedb ls [path]` | List a directory's indexed children |
+| `codedb file <fuzzy-name>` | Fuzzy file-name search |
+| `codedb context <task...>` | Task-shaped orientation bundle |
+| `codedb compass <task...>` | Intent-shaped overview / define / callers tunnel (`--intent`, `--body`, `--max-files`, `--more`, `--mode`, `--format`) |
 | `codedb hot` | Recently modified files |
+| `codedb status` | Index size, store seq, and index state |
 | `codedb snapshot` | Write codedb.snapshot to project root |
 | `codedb serve` | HTTP daemon on :7719 |
 | `codedb [root] mcp` | JSON-RPC/MCP server over stdio |
@@ -334,7 +347,7 @@ The watcher now stats `.git/HEAD` mtime before forking `git rev-parse HEAD`. On 
 
 **No SQLite. No dependencies.** Purpose-built data model:
 
-- **Explorer** — structural index engine. Parses Zig, Python, TypeScript/JavaScript, Rust, Go, PHP, Ruby, HCL, R, and Dart. Maintains outlines, trigram index, inverted word index, content cache, and dependency graph behind a single mutex.
+- **Explorer** — structural index engine. Parses Zig, C/C++, Python, TypeScript/JavaScript, Rust, Go, PHP, Ruby, HCL, R, and Dart. Maintains outlines, trigram index, inverted word index, content cache, and dependency graph behind a single mutex.
 - **Store** — append-only version log. Every mutation (snapshot, edit, delete) gets a monotonically increasing sequence number. Version history capped at 100 per file.
 - **Watcher** — polling file watcher (2s interval). `FilteredWalker` prunes `.git`, `node_modules`, `zig-cache`, `__pycache__`, etc. before descending.
 - **Agents** — first-class structs with cursors, heartbeats, and exclusive file locks. Stale agents reaped after 30s.

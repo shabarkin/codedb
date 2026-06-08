@@ -22,11 +22,25 @@ Parses args, resolves the project root, runs an initial scan, then dispatches to
 | `tree` | Print file tree with symbol counts |
 | `outline <path>` | Show symbols in a file |
 | `find <name>` | Find a symbol definition |
-| `search <query>` | Full-text search (trigram-accelerated) |
+| `search <query>` | Full-text search (trigram-accelerated; `--regex`, `--paths-only`, `--max-results`) |
 | `word <id>` | Identifier/sub-token lookup (inverted index, O(1)) |
+| `read <path>` | File contents (`-L FROM-TO`, `--compact`) |
 | `hot` | Recently modified files |
+| `status` | Index size, store seq, and index state |
+| `symbol <name>` | All definition sites of a symbol (`--body`) |
+| `callers <name>` | Every call site of a symbol |
+| `deps <path>` | Dependency graph (`--depends-on`, `--transitive`, `--max-depth`) |
+| `glob <pattern>` | Match indexed paths by glob |
+| `ls [path]` | List a directory's indexed children |
+| `file <fuzzy>` | Fuzzy file-name search |
+| `context <task...>` | Task-shaped orientation bundle |
+| `compass <task...>` | Intent-shaped overview / define / callers tunnel |
 | `serve` | Start HTTP daemon on :7719 |
 | `mcp` | Start MCP server (JSON-RPC over stdio) |
+| `snapshot` | Write `codedb.snapshot` to the project root |
+| `nuke` | Clear caches/snapshots, deregister integrations |
+
+Navigation commands not rendered natively (`symbol`, `callers`, `deps`, `glob`, `ls`, `file`, `context`, `compass`) bridge to the same warm handlers the MCP surface exposes. When a `serve`/`mcp` daemon is already running for the project, query commands proxy to it over a per-project Unix socket instead of reloading the snapshot.
 
 Data is stored per-project at `~/.codedb/projects/<hash>/`.
 
@@ -41,7 +55,7 @@ The central struct. Holds all indexed data behind a single mutex.
 - `word_index: WordIndex` — inverted word index for O(1) identifier lookup
 - `trigram_index: TrigramIndex` — trigram index for fast substring search
 
-**Language parsers:** Zig, Python, TypeScript/JavaScript, Rust, Go, PHP, Ruby, HCL, R, and Dart. Each parser extracts functions, classes/structs, constants, imports, and test declarations from source lines.
+**Language parsers:** Zig, C/C++, Python, TypeScript/JavaScript, Rust, Go, PHP, Ruby, HCL, R, and Dart. Each parser extracts functions, classes/structs, constants, imports, and test declarations from source lines. Lightweight outline support also covers Java, Kotlin, Swift, Svelte, Vue, Astro, ReScript, shell, CSS/SCSS, SQL, protobuf, Fortran, LLVM IR, MLIR, and TableGen.
 
 **Key operations:**
 - `indexFile(path, content)` — parse + index a file (outline, content, words, trigrams, deps)
@@ -114,6 +128,7 @@ Thread-per-connection HTTP server on `:7719`. Parses raw HTTP/1.1 requests, requ
 | `/explore/deps?path=` | GET | Reverse dependencies |
 | `/explore/word?q=` | GET | Inverted index word lookup |
 | `/explore/search?q=` | GET | Full-text search |
+| `/compass` | POST | Compass navigation (`task`, `intent`, `target`, `body`, `max_files`, `mode`, `format`, `more`) |
 | `/snapshot` | GET | Full pre-rendered JSON snapshot |
 | `/seq` | GET | Current sequence number |
 
@@ -123,7 +138,7 @@ Thread-per-connection HTTP server on `:7719`. Parses raw HTTP/1.1 requests, requ
 
 JSON-RPC 2.0 over stdio with Content-Length framing. Implements the Model Context Protocol for LLM tool use.
 
-**Tools exposed include:**
+**22 tools exposed:**
 
 | Tool | Description |
 |------|-------------|
@@ -132,6 +147,9 @@ JSON-RPC 2.0 over stdio with Content-Length framing. Implements the Model Contex
 | `codedb_symbol` | Symbol lookup |
 | `codedb_search` | Full-text search (trigram, regex, scoped) |
 | `codedb_word` | Word index lookup |
+| `codedb_callers` | Heuristic call-site finder (word index ∩ outline scope) |
+| `codedb_context` | Task-shaped composer: NL task → keywords + defs + ranked files + snippets |
+| `codedb_compass` | Intent-shaped navigation tunnel (overview / define / callers) |
 | `codedb_hot` | Hot files |
 | `codedb_deps` | Reverse dependencies |
 | `codedb_read` | Read file content (line ranges, hash caching) |
@@ -142,7 +160,27 @@ JSON-RPC 2.0 over stdio with Content-Length framing. Implements the Model Contex
 | `codedb_bundle` | Batch multiple queries (max 20 ops) |
 | `codedb_projects` | List locally indexed projects |
 | `codedb_index` | Index a local folder |
+| `codedb_find` | Fuzzy file-name search (typo-tolerant subsequence match) |
+| `codedb_query` | Composable pipeline (chain find/glob/search/word/symbol/filter/deps/outline/read/sort/limit) |
+| `codedb_glob` | Match indexed paths against a glob |
+| `codedb_ls` | List immediate children of a directory |
+
 **Safety:** path validation, oversized message handling (drains >1MB lines instead of killing the loop).
+
+### `compass.zig` — Intent-Shaped Navigation
+
+Collapses multi-step navigation (find → search → symbol → callers) into one in-process call against the warm `Explorer`. Exposed as the `codedb_compass` MCP tool, the `compass` CLI command, and `POST /compass` over HTTP.
+
+- **Intents:** `overview` (keywords, definitions, ranked files, callers), `define` (definitions + fallback sites), `callers` (call sites of a symbol). Declared explicitly or routed from the natural-language task by a rule-based scorer.
+- **Modes:** `summary` (default), `evidence`, `raw`; output `format` is `text` or `json`.
+- **Coverage:** results report "X of N" — truncation is always explicit. When a reduced view truncates, the full result persists as an overflow artifact recoverable via `more`.
+- **Tuning:** `.codedbrc` keys `compass_max_files` (default 5), `compass_body` (default false), `compass_overflow_keep` (default 50).
+
+Shared request/render types live in `compass_shared.zig` and `compass_render.zig`; per-project artifact paths in `project_paths.zig`.
+
+### `config.zig` — `.codedbrc` Loader
+
+INI-style `key = value` config. Resolution order: `--config-file=<path>` → `$CWD/.codedbrc` → `<binary_dir>/.codedbrc` → defaults. Keys: `max_versions` (100), `max_cached` (16384), `compass_max_files` (5), `compass_body` (false), `compass_overflow_keep` (50). Unknown keys are ignored; malformed values for known keys are errors.
 
 ### `edit.zig` — File Editor
 
@@ -164,9 +202,12 @@ Multi-agent support. Agents register with names, get assigned integer IDs. Suppo
 
 Zig 0.16 build system. Produces:
 - `codedb` CLI executable
-- Test runner (`zig build test`)
-- Benchmarks (`zig build bench`)
+- Test runner (`zig build test`, filter with `-Dtest-filter=<substring>`); each `src/test_*.zig` suite also has its own step (`test-core`, `test-explore`, `test-index`, `test-parser`, `test-search`, `test-snapshot`, `test-mcp`, `test-compass`, `test-query`, `test-bench`)
+- Benchmarks (`zig build bench`; repo benchmark via `zig build benchmark -- --root /path`)
+- WASM module for Cloudflare Workers (`zig build wasm`)
 - Importable `codedb` module via `src/lib.zig`
+
+Build options: `-Dtree-sitter` (vendored tree-sitter parsers, default true), `-Dcodesign-identity` (macOS), `-Dtest-filter`.
 
 ## Architecture Diagram
 

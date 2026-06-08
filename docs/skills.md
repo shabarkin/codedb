@@ -106,6 +106,11 @@ that project. Full keys + defaults:
 # .codedbrc
 max_cached   = 16384   # in-memory ContentCache size (files); v0.2.5815+
 max_versions = 100     # versions kept per file in the change log
+
+# codedb_compass tuning
+compass_max_files     = 5      # reduced-view file cap per compass response
+compass_body          = false  # include symbol bodies in define output
+compass_overflow_keep = 50     # overflow artifacts kept on disk
 ```
 
 INI-style `key = value`, one per line, `#` for comments, unknown keys
@@ -155,6 +160,9 @@ profile file teaches the agent **how** to use it — e.g.:
 - Use `codedb_tree` first to orient.
 - Use `codedb_context` with a natural-language task when starting work
   on an unfamiliar area — one call replaces 3–5 search/word/symbol calls.
+- Use `codedb_compass` when the intent is clear — `overview`, `define`,
+  or `callers` — one task routes through the matching tunnel with
+  explicit "X of N" coverage.
 - Use `codedb_symbol` for exact definition lookups, `codedb_search` for
   substring matches, `codedb_word` for single-identifier lookups.
 - Use `codedb_callers` to find likely call sites of a symbol before refactoring.

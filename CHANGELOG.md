@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Compass — intent-shaped navigation
+
+- New `codedb_compass` MCP tool, `codedb compass <task...>` CLI command, and
+  `POST /compass` HTTP endpoint. One call routes a task into an `overview` /
+  `define` / `callers` tunnel against the warm Explorer, with explicit
+  "X of N" coverage and overflow recovery via `more`.
+- New `.codedbrc` keys: `compass_max_files` (default 5), `compass_body`
+  (default false), `compass_overflow_keep` (default 50).
+- New `src/test_compass.zig` suite wired into `zig build test`
+  (own step: `zig build test-compass`).
+
 ### Local-only hardening
 
 - Removed the old remote MCP tool and its API fetch path so MCP clients only
