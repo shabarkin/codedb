@@ -17,6 +17,8 @@ const snapshot_json = @import("snapshot_json.zig");
 const watcher = @import("watcher.zig");
 const edit_mod = @import("edit.zig");
 const path_security = @import("path_security.zig");
+const compass_mod = @import("compass.zig");
+const project_paths = @import("project_paths.zig");
 
 pub const Listener = std.Io.net.Server;
 
@@ -484,6 +486,92 @@ fn handleConnection(
         const w = cio.listWriter(&out, allocator);
         w.print("{{\"seq\":{d},\"hash\":{d},\"size\":{d}}}", .{ result.seq, result.new_hash, result.new_size }) catch return;
         respondJson(&conn, "200 OK", out.items);
+        return;
+    }
+
+    // ── Compass ──
+    if (std.mem.startsWith(u8, request, "POST /compass")) {
+        const body = extractBody(request);
+        if (body.len == 0) {
+            respondJson(&conn, "400 Bad Request", "{\"error\":\"missing body\"}");
+            return;
+        }
+        const parsed_body = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+            respondJson(&conn, "400 Bad Request", "{\"error\":\"invalid json\"}");
+            return;
+        };
+        defer parsed_body.deinit();
+        if (parsed_body.value != .object) {
+            respondJson(&conn, "400 Bad Request", "{\"error\":\"body must be object\"}");
+            return;
+        }
+
+        var req: compass_mod.CompassRequest = .{};
+        const body_obj = &parsed_body.value.object;
+        if (jsonString(body_obj, "task")) |task| req.task = task;
+        if (jsonString(body_obj, "target")) |target| req.target = target;
+        if (jsonString(body_obj, "more")) |more| req.more = more;
+        if (jsonString(body_obj, "intent")) |intent_raw| {
+            req.intent = compass_mod.parseIntent(intent_raw) orelse {
+                respondJson(&conn, "400 Bad Request", "{\"error\":\"invalid intent\"}");
+                return;
+            };
+        }
+        if (jsonString(body_obj, "mode")) |mode_raw| {
+            req.mode = compass_mod.parseMode(mode_raw) orelse {
+                respondJson(&conn, "400 Bad Request", "{\"error\":\"invalid mode\"}");
+                return;
+            };
+        }
+        if (jsonString(body_obj, "format")) |format_raw| {
+            req.format = compass_mod.parseFormat(format_raw) orelse {
+                respondJson(&conn, "400 Bad Request", "{\"error\":\"invalid format\"}");
+                return;
+            };
+        }
+        if (body_obj.get("body")) |value| {
+            switch (value) {
+                .bool => |b| req.want_body = b,
+                else => {
+                    respondJson(&conn, "400 Bad Request", "{\"error\":\"body must be boolean\"}");
+                    return;
+                },
+            }
+        }
+        if (jsonU64(body_obj, "max_files")) |max_files| {
+            if (max_files == 0) {
+                respondJson(&conn, "400 Bad Request", "{\"error\":\"max_files must be >= 1\"}");
+                return;
+            }
+            req.max_files = @intCast(@min(max_files, 100));
+        }
+        if (req.more == null and req.task.len == 0 and req.target == null) {
+            respondJson(&conn, "400 Bad Request", "{\"error\":\"missing task\"}");
+            return;
+        }
+
+        const data_dir = project_paths.ensureProjectDataDir(io, allocator, explorer.root_real) catch {
+            respondJson(&conn, "500 Internal Server Error", "{\"error\":\"data dir unavailable\"}");
+            return;
+        };
+        defer allocator.free(data_dir);
+
+        var result_out: std.ArrayList(u8) = .empty;
+        defer result_out.deinit(allocator);
+        compass_mod.run(io, allocator, req, explorer, store, data_dir, compass_mod.default_settings, &result_out);
+
+        var wrapped: std.ArrayList(u8) = .empty;
+        defer wrapped.deinit(allocator);
+        if (req.format == .json) {
+            wrapped.appendSlice(allocator, "{\"result\":") catch return;
+            wrapped.appendSlice(allocator, result_out.items) catch return;
+            wrapped.appendSlice(allocator, "}") catch return;
+        } else {
+            wrapped.appendSlice(allocator, "{\"result\":\"") catch return;
+            writeJsonEscaped(&wrapped, allocator, result_out.items) catch return;
+            wrapped.appendSlice(allocator, "\"}") catch return;
+        }
+        respondJson(&conn, "200 OK", wrapped.items);
         return;
     }
 

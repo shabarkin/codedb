@@ -1468,6 +1468,27 @@ test "issue-443: codedb_bundle is advertised when CODEDB_BUNDLE_ENABLED=1" {
     try testing.expect(saw_bundle);
 }
 
+test "compass: tools/list advertises codedb_compass" {
+    const response = try mcp_mod.buildToolsListResponse(testing.allocator, .{
+        .bundle_enabled = false,
+        .discriminated_opt_in = false,
+    });
+    defer testing.allocator.free(response);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, response, .{});
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("tools").?.array;
+    var saw_compass = false;
+    for (tools.items) |tool| {
+        if (std.mem.eql(u8, tool.object.get("name").?.string, "codedb_compass")) {
+            saw_compass = true;
+            break;
+        }
+    }
+    try testing.expect(saw_compass);
+}
+
 test "issue-434: codedb_bundle ops items schema requires arguments field" {
     // The codedb_bundle inputSchema in tools_list advertises ops items as
     // {required: ["tool"]} with arguments as a bare {type: "object"} that
@@ -1923,13 +1944,15 @@ test "cli-mcp-parity: runCliTool bridges navigation commands to MCP handlers" {
     const aa = arena.allocator();
 
     var explorer = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(aa);
+    defer store.deinit();
     try explorer.indexFile("src/store.zig", "pub const Store = struct {};\n");
     try explorer.indexFile("src/main.zig", "const Store = @import(\"store.zig\").Store;\npub fn main() void {}\n");
 
     {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(aa);
-        const code = mcp_mod.runCliTool(io, aa, &explorer, ".", "glob", &.{ "codedb", ".", "glob", "src/*.zig" }, 3, &out);
+        const code = mcp_mod.runCliTool(io, aa, &explorer, &store, ".", "glob", &.{ "codedb", ".", "glob", "src/*.zig" }, 3, &out);
         try testing.expectEqual(@as(?u8, 0), code);
         try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
         try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
@@ -1938,7 +1961,7 @@ test "cli-mcp-parity: runCliTool bridges navigation commands to MCP handlers" {
     {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(aa);
-        const code = mcp_mod.runCliTool(io, aa, &explorer, ".", "symbol", &.{ "codedb", ".", "symbol", "Store" }, 3, &out);
+        const code = mcp_mod.runCliTool(io, aa, &explorer, &store, ".", "symbol", &.{ "codedb", ".", "symbol", "Store" }, 3, &out);
         try testing.expectEqual(@as(?u8, 0), code);
         try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
     }
@@ -1946,15 +1969,46 @@ test "cli-mcp-parity: runCliTool bridges navigation commands to MCP handlers" {
     {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(aa);
-        try testing.expectEqual(@as(?u8, null), mcp_mod.runCliTool(io, aa, &explorer, ".", "bogus", &.{ "codedb", ".", "bogus" }, 3, &out));
+        try testing.expectEqual(@as(?u8, null), mcp_mod.runCliTool(io, aa, &explorer, &store, ".", "bogus", &.{ "codedb", ".", "bogus" }, 3, &out));
     }
 
     {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(aa);
-        try testing.expectEqual(@as(?u8, 1), mcp_mod.runCliTool(io, aa, &explorer, ".", "glob", &.{ "codedb", ".", "glob" }, 3, &out));
+        try testing.expectEqual(@as(?u8, 1), mcp_mod.runCliTool(io, aa, &explorer, &store, ".", "glob", &.{ "codedb", ".", "glob" }, 3, &out));
         try testing.expect(std.mem.indexOf(u8, out.items, "usage") != null);
     }
+}
+
+test "compass: MCP dispatch returns routed overview output" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var explorer = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(aa);
+    var agents = AgentRegistry.init(aa);
+    defer agents.deinit();
+
+    try explorer.indexFile("src/auth.zig", "pub fn parseConfig() void {}\npub fn authFlow() void { parseConfig(); }\n");
+    try explorer.indexFile("src/main.zig", "const auth = @import(\"auth.zig\");\npub fn main() void { auth.authFlow(); }\n");
+
+    var bench_ctx = mcp_mod.BenchContext.init(aa, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, aa,
+        \\{"task":"what does auth look like here"}
+    , .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(aa);
+    bench_ctx.runDispatch(io, aa, .codedb_compass, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.startsWith(u8, out.items, "## ROUTE"));
+    try testing.expect(std.mem.indexOf(u8, out.items, "## FILES") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "## COVERAGE") != null);
+    try testing.expect(!std.mem.startsWith(u8, out.items, "error:"));
 }
 
 // ── #528: CLI parsing / validation / exit-code regressions ──────────────────

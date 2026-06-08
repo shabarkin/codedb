@@ -22,6 +22,8 @@ const update_mod = @import("update.zig");
 const release_info = @import("release_info.zig");
 const Config = @import("config.zig").Config;
 const path_security = @import("path_security.zig");
+const compass_mod = @import("compass.zig");
+const project_paths = @import("project_paths.zig");
 
 /// Buffered stdout wrapper. Formats into a 64KB stack-buffered window and
 /// flushes lazily; an explicit `flush()` runs from mainImpl's deferred cleanup.
@@ -569,7 +571,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
         // reach the same warm tools the MCP surface exposes.
         var nav: std.ArrayList(u8) = .empty;
         defer nav.deinit(allocator);
-        if (mcp_server.runCliTool(io, allocator, explorer, root, cmd, args, cmd_args_start, &nav)) |code| {
+        if (mcp_server.runCliTool(io, allocator, explorer, store, root, cmd, args, cmd_args_start, &nav)) |code| {
             out.p("{s}", .{nav.items});
             return code;
         }
@@ -659,7 +661,7 @@ fn cliWriteFull(fd: c_int, data: []const u8) bool {
 /// will proxy. Everything else (serve, mcp, snapshot, index, ...) is handled
 /// only by the cold path.
 fn cliIsQueryCmd(cmd: []const u8) bool {
-    const cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "symbol", "callers", "deps", "glob", "ls", "file", "context" };
+    const cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "symbol", "callers", "deps", "glob", "ls", "file", "context", "compass" };
     for (cmds) |c| {
         if (std.mem.eql(u8, cmd, c)) return true;
     }
@@ -1053,7 +1055,7 @@ fn mainImpl() !void {
     // and skip the per-invocation snapshot reload entirely. Falls through to
     // the cold in-process path below when no daemon answers. Must run before
     // getDataDir + the load section so the proxied call pays none of that cost.
-    if (cliIsQueryCmd(cmd)) {
+    if (cliIsQueryCmd(cmd) and cio.posixGetenv("CODEDB_NO_CLI_PROXY") == null) {
         if (cliTryProxy(io, allocator, abs_root, args, use_color)) |code| {
             out.flush();
             std.process.exit(code);
@@ -1083,6 +1085,11 @@ fn mainImpl() !void {
     const cfg = loadUserConfig(io, allocator, explicit_config) catch |err| blk: {
         std.log.warn("config load failed ({s}) — using defaults", .{@errorName(err)});
         break :blk Config.default;
+    };
+    compass_mod.default_settings = .{
+        .max_files = cfg.compass_max_files,
+        .body = cfg.compass_body,
+        .overflow_keep = cfg.compass_overflow_keep,
     };
 
     var store = Store.init(allocator);
@@ -1297,7 +1304,7 @@ fn mainImpl() !void {
         std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "read") or
         std.mem.eql(u8, cmd, "hot") or std.mem.eql(u8, cmd, "symbol") or std.mem.eql(u8, cmd, "callers") or
         std.mem.eql(u8, cmd, "deps") or std.mem.eql(u8, cmd, "glob") or std.mem.eql(u8, cmd, "ls") or
-        std.mem.eql(u8, cmd, "file") or std.mem.eql(u8, cmd, "context") or
+        std.mem.eql(u8, cmd, "file") or std.mem.eql(u8, cmd, "context") or std.mem.eql(u8, cmd, "compass") or
         std.mem.eql(u8, cmd, "status"))
     {
         const code = runQuery(io, allocator, &explorer, &store, abs_root, cmd, args, cmd_args_start, &out, s);
@@ -1878,7 +1885,7 @@ pub fn isValidMcpFlag(arg: []const u8) bool {
 }
 
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "deps", "glob", "ls", "file", "context", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
+    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "deps", "glob", "ls", "file", "context", "compass", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
     for (commands) |c| {
         if (std.mem.eql(u8, arg, c)) return true;
     }
@@ -1946,17 +1953,7 @@ fn loadBestSnapshot(
 }
 
 fn getDataDir(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8) ![]u8 {
-    const hash = std.hash.Wyhash.hash(0, abs_root);
-    const home_env = cio.posixGetenv("HOME") orelse {
-        return std.fmt.allocPrint(allocator, "{s}/.codedb", .{abs_root});
-    };
-    const home = try allocator.dupe(u8, home_env);
-    defer allocator.free(home);
-    const dir = try std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}", .{ home, hash });
-    std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
-        std.log.warn("could not create data dir {s}: {}", .{ dir, err });
-    };
-    return dir;
+    return project_paths.ensureProjectDataDir(io, allocator, abs_root);
 }
 
 fn pruneCoveredSkipTrigramFilesLocked(explorer: *Explorer, allocator: std.mem.Allocator) bool {
@@ -2244,12 +2241,14 @@ fn printUsage(out: *Out, s: sty.Style) void {
         \\    {s}ls{s}  [path]                list a directory's indexed children
         \\    {s}file{s}  <fuzzy-name>        fuzzy file-name search
         \\    {s}context{s}  <task...>        task-shaped orientation bundle
+        \\    {s}compass{s}  <task...>        intent-shaped overview / define / callers tunnel
         \\    {s}serve{s}                     HTTP daemon on :7719
         \\    {s}mcp{s}                       JSON-RPC/MCP server over stdio
         \\    {s}update{s}                    disabled; rebuild from source with zig build
         \\    {s}nuke{s}                      clear caches/snapshots and deregister integrations
         \\
     , .{
+        s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,

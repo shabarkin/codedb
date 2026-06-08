@@ -24,6 +24,9 @@ const git_mod = @import("git.zig");
 const root_policy = @import("root_policy.zig");
 const release_info = @import("release_info.zig");
 const path_security = @import("path_security.zig");
+const compass_mod = @import("compass.zig");
+const shared = @import("compass_shared.zig");
+const project_paths = @import("project_paths.zig");
 pub const DeferredScan = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -204,12 +207,7 @@ const ProjectCtx = struct {
 };
 
 fn getProjectDataDir(allocator: std.mem.Allocator, project_path: []const u8) ?[]u8 {
-    const hash = std.hash.Wyhash.hash(0, project_path);
-    const home = cio.posixGetenv("HOME") orelse {
-        return std.fmt.allocPrint(allocator, "{s}/.codedb", .{project_path}) catch null;
-    };
-
-    return std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}", .{ home, hash }) catch null;
+    return project_paths.projectDataDir(allocator, project_path) catch null;
 }
 
 fn loadProjectTrigramFromDiskIfPresent(io: std.Io, explorer: *Explorer, project_path: []const u8, allocator: std.mem.Allocator) void {
@@ -593,6 +591,7 @@ pub const Tool = enum {
     codedb_glob,
     codedb_ls,
     codedb_context,
+    codedb_compass,
 };
 
 pub const tools_list =
@@ -604,6 +603,7 @@ pub const tools_list =
     \\{"name":"codedb_word","description":"Identifier/sub-token lookup via inverted index — O(1) access to one token and its occurrences. Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Identifier or sub-token to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
     \\{"name":"codedb_callers","description":"Heuristic call-site finder for a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum likely call sites to return (default: 30, max: 10000)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
     \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
+    \\{"name":"codedb_compass","description":"Intent-shaped navigation tunnel. Pass a task and optional intent (overview, define, callers); codedb routes and gathers one lean answer with explicit coverage counts and optional overflow recovery via more.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars)."},"intent":{"type":"string","enum":["overview","define","callers"],"description":"Optional explicit intent override."},"target":{"type":"string","description":"Optional explicit target identifier or path hint."},"body":{"type":"boolean","description":"Include larger definition bodies when available (default: false)."},"max_files":{"type":"integer","description":"Maximum files to surface in the reduced view (default: 5)."},"mode":{"type":"string","enum":["summary","evidence","raw"],"description":"Optional reduction mode."},"format":{"type":"string","enum":["text","json"],"description":"Response format (default: text)."},"more":{"type":"string","description":"Overflow handle returned by a prior truncated response."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_hot","description":"Most recently modified files in the project, newest first.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Dependency graph: who imports a file (default) or what a file imports (direction=depends_on). Set transitive=true for the full BFS blast radius.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"direction":{"type":"string","enum":["imported_by","depends_on"],"description":"imported_by (default): who imports this file. depends_on: what this file imports."},"transitive":{"type":"boolean","description":"Follow dependency chain transitively (default: false)"},"max_depth":{"type":"integer","description":"Max traversal depth for transitive queries (default: unlimited)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_read","description":"Read file contents, optionally a line range. Run codedb_outline first to pick the range — large files burn tokens fast. Pass if_hash to skip re-reads when the file is unchanged.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"line_start":{"type":"integer","description":"Start line (1-indexed, inclusive). Omit for full file."},"line_end":{"type":"integer","description":"End line (1-indexed, inclusive). Omit to read to EOF."},"if_hash":{"type":"string","description":"Previous content hash. If unchanged, returns short 'unchanged:HASH' response."},"compact":{"type":"boolean","description":"Skip comment and blank lines (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
@@ -1304,7 +1304,7 @@ fn dispatch(
         waitForScanReady(scan_wait_timeout_ms);
     }
 
-    if (tool == .codedb_word or tool == .codedb_context or (tool == .codedb_search and shouldLoadWordIndexForSearch(args))) {
+    if (tool == .codedb_word or tool == .codedb_context or tool == .codedb_compass or (tool == .codedb_search and shouldLoadWordIndexForSearch(args))) {
         const effective_project = project_path orelse cache.default_path;
         loadProjectWordIndexFromDiskIfPresent(io, ctx.explorer, effective_project, alloc);
     }
@@ -1331,6 +1331,7 @@ fn dispatch(
         .codedb_glob => handleGlob(alloc, args, out, ctx.explorer),
         .codedb_ls => handleLs(alloc, args, out, ctx.explorer),
         .codedb_context => handleContext(io, alloc, args, out, ctx.explorer, project_path orelse cache.default_path),
+        .codedb_compass => handleCompass(io, alloc, args, out, ctx.explorer, ctx.store, project_path orelse cache.default_path),
     }
     appendScanProgressHint(alloc, out, tool);
 }
@@ -1357,6 +1358,7 @@ fn appendScanProgressHint(alloc: std.mem.Allocator, out: *std.ArrayList(u8), too
 fn toolDependsOnScannedIndex(tool: Tool) bool {
     return switch (tool) {
         .codedb_search, .codedb_word, .codedb_callers, .codedb_outline, .codedb_symbol, .codedb_find, .codedb_glob, .codedb_tree, .codedb_ls, .codedb_deps => true,
+        .codedb_compass => true,
         else => false,
     };
 }
@@ -1929,16 +1931,7 @@ fn isIdentChar(c: u8) bool {
 /// characters (or string boundary) on both sides — i.e. as a whole-word
 /// identifier match, not as a substring inside a longer identifier.
 fn hasWholeWordMatch(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0 or haystack.len < needle.len) return false;
-    var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, search_from, needle)) |pos| {
-        const before_ok = pos == 0 or !isIdentChar(haystack[pos - 1]);
-        const after_idx = pos + needle.len;
-        const after_ok = after_idx >= haystack.len or !isIdentChar(haystack[after_idx]);
-        if (before_ok and after_ok) return true;
-        search_from = pos + 1;
-    }
-    return false;
+    return shared.hasWholeWordMatch(haystack, needle);
 }
 
 /// Languages where the concept of a "call site" is meaningful. Excludes
@@ -1946,10 +1939,7 @@ fn hasWholeWordMatch(haystack: []const u8, needle: []const u8) bool {
 /// declarative schemas (protobuf), and unknown files — callers found
 /// inside these are mentions in prose or config, not real invocations.
 fn langHasCallSites(lang: explore_mod.Language) bool {
-    return switch (lang) {
-        .markdown, .json, .yaml, .css, .scss, .protobuf, .unknown => false,
-        else => true,
-    };
+    return shared.langHasCallSites(lang);
 }
 
 // ── codedb_context ──────────────────────────────────────────────────────────
@@ -1966,31 +1956,7 @@ fn isContextIdentCont(c: u8) bool {
     return isContextIdentStart(c) or (c >= '0' and c <= '9');
 }
 fn looksLikeContextIdentifier(tok: []const u8) bool {
-    // Filter out sentence-leading English words ("Find", "React", "Want")
-    // that incidentally start with a capital, while keeping real identifiers.
-    // Rules:
-    //   - snake_case (any underscore)              → always pass
-    //   - all-caps acronym, 3-8 chars (API, TODO)  → pass
-    //   - camelCase / PascalCase with an internal
-    //     lower→upper transition (getNextLanes)    → pass
-    //   - everything else                          → reject
-    if (tok.len < 3) return false;
-    if (std.mem.indexOfScalar(u8, tok, '_') != null) return true;
-    var all_upper = true;
-    for (tok) |c| {
-        if (c < 'A' or c > 'Z') {
-            all_upper = false;
-            break;
-        }
-    }
-    if (all_upper) return tok.len <= 8;
-    var i: usize = 1;
-    while (i < tok.len) : (i += 1) {
-        const prev_lower = tok[i - 1] >= 'a' and tok[i - 1] <= 'z';
-        const cur_upper = tok[i] >= 'A' and tok[i] <= 'Z';
-        if (prev_lower and cur_upper) return true;
-    }
-    return false;
+    return shared.looksLikeContextIdentifier(tok);
 }
 
 // Cap at 3 candidates instead of 5. handleContext does one searchContent +
@@ -2009,42 +1975,7 @@ const CONTEXT_TOP_FILES: usize = 5;
 const CONTEXT_TOP_LINES_PER_FILE: usize = 3;
 
 fn extractContextCandidates(task: []const u8, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) void {
-    var seen = std.StringHashMap(void).init(alloc);
-    defer seen.deinit();
-    var i: usize = 0;
-    while (i < task.len) {
-        const c = task[i];
-        // Quoted strings — taken literally as identifiers.
-        if (c == '"' or c == '`') {
-            const q = c;
-            const start = i + 1;
-            var j = start;
-            while (j < task.len and task[j] != q) : (j += 1) {}
-            if (j > start and j - start <= 64 and j - start >= 3) {
-                const slice = task[start..j];
-                if (!seen.contains(slice)) {
-                    seen.put(slice, {}) catch {};
-                    out.append(alloc, slice) catch {};
-                    if (out.items.len >= CONTEXT_MAX_CANDIDATES) return;
-                }
-            }
-            i = j + 1;
-            continue;
-        }
-        // Identifier-like tokens.
-        if (isContextIdentStart(c)) {
-            const start = i;
-            while (i < task.len and isContextIdentCont(task[i])) : (i += 1) {}
-            const tok = task[start..i];
-            if (tok.len >= 3 and tok.len <= 64 and looksLikeContextIdentifier(tok) and !seen.contains(tok)) {
-                seen.put(tok, {}) catch {};
-                out.append(alloc, tok) catch {};
-                if (out.items.len >= CONTEXT_MAX_CANDIDATES) return;
-            }
-            continue;
-        }
-        i += 1;
-    }
+    shared.extractContextCandidates(task, alloc, out, CONTEXT_MAX_CANDIDATES);
 }
 
 fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer, project_root: []const u8) void {
@@ -2161,23 +2092,10 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     var iter = by_file.iterator();
     while (iter.next()) |entry| {
         const path = entry.key_ptr.*;
-        var score: i32 = @intCast(entry.value_ptr.total);
-        if (symbol_files.contains(path)) score += 5; // definition beats pure usage
-        const is_test = std.mem.indexOf(u8, path, "/test") != null or
-            std.mem.indexOf(u8, path, "_test.") != null or
-            std.mem.indexOf(u8, path, ".test.") != null or
-            std.mem.indexOf(u8, path, "/__tests__/") != null or
-            std.mem.indexOf(u8, path, "/spec/") != null or
-            std.mem.indexOf(u8, path, "/fixtures/") != null;
-        const is_doc = std.mem.endsWith(u8, path, ".md") or
-            std.mem.endsWith(u8, path, ".rst") or
-            std.mem.indexOf(u8, path, "/docs/") != null;
-        if (is_test) score -= 3;
-        if (is_doc) score -= 2;
         ranked.append(A, .{
             .path = path,
             .hits = entry.value_ptr.total,
-            .score = score,
+            .score = shared.scoreContextFile(path, entry.value_ptr.total, symbol_files.contains(path)),
             .top = entry.value_ptr.top.items,
         }) catch break;
     }
@@ -2271,15 +2189,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     // Skip the definition site itself
                     if (r.line_num == sr.line and std.mem.eql(u8, r.path, sr.path)) continue;
                     // Skip test/spec/fixture paths
-                    const is_test = std.mem.startsWith(u8, r.path, "tests/") or
-                        std.mem.startsWith(u8, r.path, "test/") or
-                        std.mem.indexOf(u8, r.path, "/test") != null or
-                        std.mem.indexOf(u8, r.path, "_test.") != null or
-                        std.mem.indexOf(u8, r.path, ".test.") != null or
-                        std.mem.indexOf(u8, r.path, "/__tests__/") != null or
-                        std.mem.indexOf(u8, r.path, "/spec/") != null or
-                        std.mem.indexOf(u8, r.path, "/fixtures/") != null;
-                    if (is_test) continue;
+                    if (shared.isTestLikePath(r.path)) continue;
                     if (r.scope_kind) |sk| {
                         if (sk == .import or sk == .type_alias or sk == .constant) continue;
                     }
@@ -2384,6 +2294,60 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
             w.print("{s}:{d}  {s}\n", .{ f.path, h.line, h.text }) catch {};
         }
     }
+}
+
+fn handleCompass(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    args: *const std.json.ObjectMap,
+    out: *std.ArrayList(u8),
+    explorer: *Explorer,
+    store: *Store,
+    project_root: []const u8,
+) void {
+    var req: compass_mod.CompassRequest = .{};
+    if (getStr(args, "task")) |task| req.task = task;
+    if (getStr(args, "target")) |target| req.target = target;
+    if (getStr(args, "more")) |more| req.more = more;
+    if (args.get("body")) |_| req.want_body = getBool(args, "body");
+    if (getInt(args, "max_files")) |n| {
+        if (n <= 0) {
+            out.appendSlice(alloc, "error: max_files must be >= 1") catch {};
+            return;
+        }
+        req.max_files = @intCast(@min(n, 100));
+    }
+    if (getStr(args, "intent")) |intent_raw| {
+        req.intent = compass_mod.parseIntent(intent_raw) orelse {
+            out.appendSlice(alloc, "error: invalid intent") catch {};
+            return;
+        };
+    }
+    if (getStr(args, "mode")) |mode_raw| {
+        req.mode = compass_mod.parseMode(mode_raw) orelse {
+            out.appendSlice(alloc, "error: invalid mode") catch {};
+            return;
+        };
+    }
+    if (getStr(args, "format")) |format_raw| {
+        req.format = compass_mod.parseFormat(format_raw) orelse {
+            out.appendSlice(alloc, "error: invalid format") catch {};
+            return;
+        };
+    }
+    if (req.more == null and req.task.len == 0 and req.target == null) {
+        out.appendSlice(alloc, "error: missing 'task' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
+        return;
+    }
+
+    loadProjectTrigramFromDiskIfPresent(io, explorer, project_root, alloc);
+    const data_dir = project_paths.ensureProjectDataDir(io, alloc, project_root) catch {
+        out.appendSlice(alloc, "error: could not resolve project data dir") catch {};
+        return;
+    };
+    defer alloc.free(data_dir);
+    compass_mod.run(io, alloc, req, explorer, store, data_dir, compass_mod.default_settings, out);
 }
 
 fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
@@ -3495,7 +3459,8 @@ fn handleLs(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std
 }
 
 /// CLI⇄MCP parity bridge. Serves the read-only navigation tools that `runQuery`
-/// doesn't render natively — symbol / callers / deps / glob / ls / context and
+/// doesn't render natively — symbol / callers / deps / glob / ls / context /
+/// compass and
 /// the fuzzy file-name `file` lookup — by building the MCP argument map and
 /// reusing the same handlers against the warm Explorer. Returns the exit code,
 /// or null if `cmd` isn't one we handle (caller falls through to its own usage
@@ -3506,6 +3471,7 @@ pub fn runCliTool(
     io: std.Io,
     alloc: std.mem.Allocator,
     explorer: *Explorer,
+    store: *Store,
     root: []const u8,
     cmd: []const u8,
     args: []const []const u8,
@@ -3569,6 +3535,59 @@ pub fn runCliTool(
         m.put(alloc, "task", .{ .string = task.items }) catch return 1;
         loadProjectWordIndexFromDiskIfPresent(io, explorer, root, alloc);
         handleContext(io, alloc, &m, out, explorer, root);
+        return finishCli(out, out_start);
+    } else if (std.mem.eql(u8, cmd, "compass")) {
+        var req: compass_mod.CompassRequest = .{};
+        var task: std.ArrayList(u8) = .empty;
+        defer task.deinit(alloc);
+        var i = cmd_args_start;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "--body")) {
+                req.want_body = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--intent")) {
+                if (i + 1 >= args.len) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                i += 1;
+                req.intent = compass_mod.parseIntent(args[i]) orelse return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--max-files")) {
+                if (i + 1 >= args.len) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                i += 1;
+                const parsed = std.fmt.parseInt(u32, args[i], 10) catch return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                req.max_files = parsed;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--more")) {
+                if (i + 1 >= args.len) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                i += 1;
+                req.more = args[i];
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--format")) {
+                if (i + 1 >= args.len) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                i += 1;
+                req.format = compass_mod.parseFormat(args[i]) orelse return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--mode")) {
+                if (i + 1 >= args.len) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                i += 1;
+                req.mode = compass_mod.parseMode(args[i]) orelse return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                continue;
+            }
+            if (task.items.len > 0) task.append(alloc, ' ') catch {};
+            task.appendSlice(alloc, arg) catch {};
+        }
+        req.task = task.items;
+        if (req.more == null and req.task.len == 0) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+        loadProjectWordIndexFromDiskIfPresent(io, explorer, root, alloc);
+        loadProjectTrigramFromDiskIfPresent(io, explorer, root, alloc);
+        const data_dir = project_paths.ensureProjectDataDir(io, alloc, root) catch return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+        defer alloc.free(data_dir);
+        compass_mod.run(io, alloc, req, explorer, store, data_dir, compass_mod.default_settings, out);
         return finishCli(out, out_start);
     }
     return null;
@@ -4632,6 +4651,7 @@ fn mcpToolIcon(tool_name: []const u8) []const u8 {
     if (eql(tool_name, "codedb_read")) return MCP_BLUE ++ MCP_DOT ++ MCP_RESET;
     if (eql(tool_name, "codedb_search")) return MCP_MAGENTA ++ MCP_DOT ++ MCP_RESET;
     if (eql(tool_name, "codedb_word")) return MCP_CYAN ++ MCP_DOT ++ MCP_RESET;
+    if (eql(tool_name, "codedb_compass")) return MCP_MAGENTA ++ MCP_DOT ++ MCP_RESET;
     if (eql(tool_name, "codedb_edit")) return MCP_YELLOW ++ MCP_DOT ++ MCP_RESET;
     if (eql(tool_name, "codedb_tree")) return MCP_GREEN ++ MCP_DOT ++ MCP_RESET;
     if (eql(tool_name, "codedb_hot")) return MCP_YELLOW ++ MCP_DOT ++ MCP_RESET;
