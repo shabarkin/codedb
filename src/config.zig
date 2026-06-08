@@ -17,6 +17,12 @@ pub const Config = struct {
     max_versions: usize = 100,
     /// Cap on files kept in the Explorer's in-memory content cache. Default 16384.
     max_cached: u32 = 16384,
+    /// Default reduced-view file cap for compass. Default 5.
+    compass_max_files: u32 = 5,
+    /// Default body mode for compass definition output. Default false.
+    compass_body: bool = false,
+    /// Number of compass overflow artifacts to keep. Default 50.
+    compass_overflow_keep: u32 = 50,
 
     pub const default: Config = .{};
 
@@ -37,6 +43,20 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, key, "max_cached")) {
                 cfg.max_cached = std.fmt.parseInt(u32, val, 10) catch return error.InvalidMaxCached;
                 if (cfg.max_cached == 0) return error.InvalidMaxCached;
+            } else if (std.mem.eql(u8, key, "compass_max_files")) {
+                cfg.compass_max_files = std.fmt.parseInt(u32, val, 10) catch return error.InvalidCompassMaxFiles;
+                if (cfg.compass_max_files == 0) return error.InvalidCompassMaxFiles;
+            } else if (std.mem.eql(u8, key, "compass_body")) {
+                if (std.mem.eql(u8, val, "true")) {
+                    cfg.compass_body = true;
+                } else if (std.mem.eql(u8, val, "false")) {
+                    cfg.compass_body = false;
+                } else {
+                    return error.InvalidCompassBody;
+                }
+            } else if (std.mem.eql(u8, key, "compass_overflow_keep")) {
+                cfg.compass_overflow_keep = std.fmt.parseInt(u32, val, 10) catch return error.InvalidCompassOverflowKeep;
+                if (cfg.compass_overflow_keep == 0) return error.InvalidCompassOverflowKeep;
             }
         }
         return cfg;
@@ -99,6 +119,9 @@ test "config: defaults" {
     const cfg = Config.default;
     try testing.expectEqual(@as(usize, 100), cfg.max_versions);
     try testing.expectEqual(@as(u32, 16384), cfg.max_cached);
+    try testing.expectEqual(@as(u32, 5), cfg.compass_max_files);
+    try testing.expectEqual(false, cfg.compass_body);
+    try testing.expectEqual(@as(u32, 50), cfg.compass_overflow_keep);
 }
 
 test "config: parse single key" {
@@ -113,11 +136,17 @@ test "config: parse both keys with comments and whitespace" {
         \\
         \\max_versions = 200
         \\  max_cached   =   2048
+        \\compass_max_files = 7
+        \\compass_body = true
+        \\compass_overflow_keep = 12
         \\# trailing comment
         \\
     );
     try testing.expectEqual(@as(usize, 200), cfg.max_versions);
     try testing.expectEqual(@as(u32, 2048), cfg.max_cached);
+    try testing.expectEqual(@as(u32, 7), cfg.compass_max_files);
+    try testing.expectEqual(true, cfg.compass_body);
+    try testing.expectEqual(@as(u32, 12), cfg.compass_overflow_keep);
 }
 
 test "config: unknown keys are ignored" {
@@ -129,4 +158,7 @@ test "config: malformed value rejected" {
     try testing.expectError(error.InvalidMaxVersions, Config.parse("max_versions = not_a_number\n"));
     try testing.expectError(error.InvalidMaxVersions, Config.parse("max_versions = 0\n"));
     try testing.expectError(error.InvalidMaxCached, Config.parse("max_cached = 0\n"));
+    try testing.expectError(error.InvalidCompassMaxFiles, Config.parse("compass_max_files = 0\n"));
+    try testing.expectError(error.InvalidCompassBody, Config.parse("compass_body = maybe\n"));
+    try testing.expectError(error.InvalidCompassOverflowKeep, Config.parse("compass_overflow_keep = 0\n"));
 }

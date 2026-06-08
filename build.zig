@@ -156,6 +156,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "test-search", .path = "src/test_search.zig", .needs_mcp = true, .needs_nanoregex = true },
         .{ .name = "test-snapshot", .path = "src/test_snapshot.zig", .needs_mcp = false, .needs_nanoregex = true },
         .{ .name = "test-mcp", .path = "src/test_mcp.zig", .needs_mcp = true, .needs_nanoregex = true },
+        .{ .name = "test-compass", .path = "src/test_compass.zig", .needs_mcp = true, .needs_nanoregex = true },
         .{ .name = "test-query", .path = "src/test_query.zig", .needs_mcp = true, .needs_nanoregex = true },
         .{ .name = "test-bench", .path = "src/test_bench.zig", .needs_mcp = false, .needs_nanoregex = true },
     };

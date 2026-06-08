@@ -57,6 +57,7 @@ pub const EditResult = @import("edit.zig").EditResult;
 pub const applyEdit = @import("edit.zig").applyEdit;
 
 pub const watcher = @import("watcher.zig");
+pub const compass = @import("compass.zig");
 pub const mcp = @import("mcp.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const snapshot_json = @import("snapshot_json.zig");
