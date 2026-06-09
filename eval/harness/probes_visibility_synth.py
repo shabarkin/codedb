@@ -37,7 +37,7 @@ ROOT = "synth"
 SELF_MANAGED = False
 
 RG = "/opt/homebrew/bin/rg"
-FD = "/Users/shabarkin/.local/bin/fd"
+FD = os.path.expanduser("~/.local/bin/fd")
 
 NFC_PY = SYNTH_TOKENS["NEEDLE_NFC_CAFE"][0]   # unicode/nfc/café.py (NFC bytes)
 NFD_PY = SYNTH_TOKENS["NEEDLE_NFD_CAFE"][0]   # unicode/nfd/café.py (NFD bytes)

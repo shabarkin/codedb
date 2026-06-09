@@ -7,7 +7,7 @@
 set -euo pipefail
 
 EVAL_DIR="$(cd "$(dirname "$0")" && pwd)"
-CODEX_ROOT="${1:-/Users/shabarkin/codex}"
+CODEX_ROOT="${1:-${CODEDB_CODEX_ROOT:-$HOME/codex}}"
 
 "$EVAL_DIR/make-corpus.sh"
 

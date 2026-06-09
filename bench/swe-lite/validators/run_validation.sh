@@ -4,9 +4,9 @@ set -uo pipefail
 
 API_KEY="${SANDBOX_API_KEY:?set SANDBOX_API_KEY to your sandbox.trilok.ai API key}"
 BASE=https://sandbox.trilok.ai
-PATCH_DIR="/Users/rachpradhan/codedb/bench/swe-lite/results-deepswe-big/clean"
-VAL_DIR="/Users/rachpradhan/codedb/bench/swe-lite/validators"
-OUT_DIR="/Users/rachpradhan/codedb/bench/swe-lite/validators/results"
+PATCH_DIR="/Users/dev/codedb/bench/swe-lite/results-deepswe-big/clean"
+VAL_DIR="/Users/dev/codedb/bench/swe-lite/validators"
+OUT_DIR="/Users/dev/codedb/bench/swe-lite/validators/results"
 mkdir -p "$OUT_DIR"
 
 # Function-based meta lookup (bash 3.x compatible)

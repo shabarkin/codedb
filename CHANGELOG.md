@@ -76,7 +76,7 @@ releases catch this exact client-wrapper failure mode.
 - `zig build test -Dtest-filter=issue-512`
 - `zig build test`
 - `zig build`
-- `python3 scripts/e2e_mcp_test.py --binary zig-out/bin/codedb --project /Users/blackfloofie/codedb-release-0.2.5823`
+- `python3 scripts/e2e_mcp_test.py --binary zig-out/bin/codedb --project /Users/dev/codedb-release-0.2.5823`
   — **20/20 passed**
 - GitHub PR bench-regression for #513: **success**
 - Historical release-asset workflow notes are no longer applicable after codedb
@@ -157,7 +157,7 @@ unsigned until the Zig/Mach-O signing issue is resolved.
 - `zig build test-query -Dtest-filter="issue-511"`
 - `zig build test-mcp -Doptimize=ReleaseFast`
 - `zig build`
-- `python3 scripts/e2e_mcp_test.py --binary zig-out/bin/codedb --project /Users/blackfloofie/codedb`
+- `python3 scripts/e2e_mcp_test.py --binary zig-out/bin/codedb --project /Users/dev/codedb`
   — **17/17 passed**
 - Rosetta x86_64 release test:
   - published signed `v0.2.5821` asset: `--help` exit `139`

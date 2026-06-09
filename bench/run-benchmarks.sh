@@ -3,9 +3,9 @@ set -euo pipefail
 
 CODEDB="./zig-out/bin/codedb"
 REPOS=(
-  "/Users/rachpradhan/codedb|codedb|20 files, 12.6k lines"
-  "/Users/rachpradhan/merjs|merjs|100 files, 17.3k lines"
-  "/Users/rachpradhan/turboAPI|turboAPI|160 files, 41.2k lines"
+  "/Users/dev/codedb|codedb|20 files, 12.6k lines"
+  "/Users/dev/merjs|merjs|100 files, 17.3k lines"
+  "/Users/dev/turboAPI|turboAPI|160 files, 41.2k lines"
 )
 
 W='\033[1;37m' G='\033[0;32m' C='\033[0;36m' D='\033[0;90m' Y='\033[0;33m' N='\033[0m'

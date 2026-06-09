@@ -42,7 +42,7 @@ PROBE_NAME = "glob parity + [...] classes"
 ROOT = "codex"
 SELF_MANAGED = False
 
-FD = "/Users/shabarkin/.local/bin/fd"
+FD = os.path.expanduser("~/.local/bin/fd")
 RG = "/opt/homebrew/bin/rg"
 ZSH = "/bin/zsh"
 GLOB_CAP = 5000

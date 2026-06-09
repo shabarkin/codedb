@@ -2,13 +2,13 @@
   {
     "id": "codedb",
     "name": "codedb (default MCP)",
-    "constraint_prompt": "Use ONLY via Bash:\n- /Users/blackfloofie/codedb-negq/zig-out/bin/codedb /Users/blackfloofie/codedb-bench/react search <query>\n- /Users/blackfloofie/codedb-negq/zig-out/bin/codedb /Users/blackfloofie/codedb-bench/react find <name>\n- /Users/blackfloofie/codedb-negq/zig-out/bin/codedb /Users/blackfloofie/codedb-bench/react word <ident>\n- /Users/blackfloofie/codedb-negq/zig-out/bin/codedb /Users/blackfloofie/codedb-bench/react outline <relpath>\nForbidden: Read, grep, rg, find, cat, ls, head, tail, sed, lean-ctx, sqlite3, any mcp__*.",
+    "constraint_prompt": "Use ONLY via Bash:\n- /Users/dev/codedb-negq/zig-out/bin/codedb /Users/dev/codedb-bench/react search <query>\n- /Users/dev/codedb-negq/zig-out/bin/codedb /Users/dev/codedb-bench/react find <name>\n- /Users/dev/codedb-negq/zig-out/bin/codedb /Users/dev/codedb-bench/react word <ident>\n- /Users/dev/codedb-negq/zig-out/bin/codedb /Users/dev/codedb-bench/react outline <relpath>\nForbidden: Read, grep, rg, find, cat, ls, head, tail, sed, lean-ctx, sqlite3, any mcp__*.",
     "env": {}
   },
   {
     "id": "codedb_LEAN",
     "name": "codedb (LEAN env + paths-only flag)",
-    "constraint_prompt": "Use ONLY via Bash. All codedb invocations should set CODEDB_QUIET=1; use --paths-only on search when only locations matter:\n- CODEDB_QUIET=1 /Users/blackfloofie/codedb-negq/zig-out/bin/codedb /Users/blackfloofie/codedb-bench/react search [--paths-only] <query>\n- CODEDB_QUIET=1 /Users/blackfloofie/codedb-negq/zig-out/bin/codedb /Users/blackfloofie/codedb-bench/react find <name>\n- CODEDB_QUIET=1 /Users/blackfloofie/codedb-negq/zig-out/bin/codedb /Users/blackfloofie/codedb-bench/react word <ident>\n- CODEDB_QUIET=1 /Users/blackfloofie/codedb-negq/zig-out/bin/codedb /Users/blackfloofie/codedb-bench/react outline <relpath>\nForbidden: Read, grep, rg, find, cat, ls, head, tail, sed, lean-ctx, sqlite3, any mcp__*.",
+    "constraint_prompt": "Use ONLY via Bash. All codedb invocations should set CODEDB_QUIET=1; use --paths-only on search when only locations matter:\n- CODEDB_QUIET=1 /Users/dev/codedb-negq/zig-out/bin/codedb /Users/dev/codedb-bench/react search [--paths-only] <query>\n- CODEDB_QUIET=1 /Users/dev/codedb-negq/zig-out/bin/codedb /Users/dev/codedb-bench/react find <name>\n- CODEDB_QUIET=1 /Users/dev/codedb-negq/zig-out/bin/codedb /Users/dev/codedb-bench/react word <ident>\n- CODEDB_QUIET=1 /Users/dev/codedb-negq/zig-out/bin/codedb /Users/dev/codedb-bench/react outline <relpath>\nForbidden: Read, grep, rg, find, cat, ls, head, tail, sed, lean-ctx, sqlite3, any mcp__*.",
     "env": {
       "CODEDB_QUIET": "1",
       "CODEDB_MCP_LEAN": "1"
@@ -23,7 +23,7 @@
   {
     "id": "leanctx",
     "name": "lean-ctx (CLI)",
-    "constraint_prompt": "Use ONLY via Bash (cd into corpus first):\n- cd /Users/blackfloofie/codedb-bench/react && lean-ctx grep <pattern>\n- cd /Users/blackfloofie/codedb-bench/react && lean-ctx find <pattern>\n- cd /Users/blackfloofie/codedb-bench/react && lean-ctx read <relpath>\n- cd /Users/blackfloofie/codedb-bench/react && lean-ctx read <relpath> -m signatures\n- cd /Users/blackfloofie/codedb-bench/react && lean-ctx ls <relpath>\nForbidden: Read, grep, rg, find, cat, ls, head, tail, sed, codedb, sqlite3, any mcp__*.",
+    "constraint_prompt": "Use ONLY via Bash (cd into corpus first):\n- cd /Users/dev/codedb-bench/react && lean-ctx grep <pattern>\n- cd /Users/dev/codedb-bench/react && lean-ctx find <pattern>\n- cd /Users/dev/codedb-bench/react && lean-ctx read <relpath>\n- cd /Users/dev/codedb-bench/react && lean-ctx read <relpath> -m signatures\n- cd /Users/dev/codedb-bench/react && lean-ctx ls <relpath>\nForbidden: Read, grep, rg, find, cat, ls, head, tail, sed, codedb, sqlite3, any mcp__*.",
     "env": {}
   },
   {

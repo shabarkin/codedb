@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Probe orchestrator: runs all probe modules against the synthetic corpus
-and /Users/shabarkin/codex, sequentially (never two servers on one root),
+and the codex repo (CODEDB_CODEX_ROOT, default ~/codex), sequentially (never two servers on one root),
 and writes a single JSON results file recording corpus paths, corpus SHA,
 codedb SHA, and per-probe verdicts.
 
@@ -20,7 +20,7 @@ sys.path.insert(0, HERE)
 from driver import CodedbClient  # noqa: E402
 
 SYNTH_DEFAULT = os.path.normpath(os.path.join(HERE, "..", "corpus-synthetic"))
-CODEX_DEFAULT = "/Users/shabarkin/codex"
+CODEX_DEFAULT = os.environ.get("CODEDB_CODEX_ROOT", os.path.expanduser("~/codex"))
 OUT_DEFAULT = os.path.normpath(
     os.path.join(HERE, "..", "results", "probe-results.json")
 )

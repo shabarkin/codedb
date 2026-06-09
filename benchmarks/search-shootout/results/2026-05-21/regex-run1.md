@@ -1,7 +1,7 @@
 # search-shootout — regex
 
 **Date:** 2026-05-21 10:27
-**Corpus:** `/Users/blackfloofie/codedb-bench/regex`
+**Corpus:** `/Users/dev/codedb-bench/regex`
 **Indexed files:** 285
 **Corpus bytes:** 5.9 MB
 **Iterations:** 20 warm

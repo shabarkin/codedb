@@ -11,7 +11,7 @@ Sub-checks:
   10d  staleness honesty on info['synth_root'] (mutate control.c, poll)
 
 Ground truth for the symbol table was collected read-only with rg 15.1.0 on
-/Users/shabarkin/codex @ c9ae0f48a13022191285d998bf10234ccf20313a.
+the codex repo @ c9ae0f48a13022191285d998bf10234ccf20313a.
 """
 import json
 import os

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Probe 2a: codex full-inventory reconciliation.
 
-Reconciles codedb's ENTIRE indexed file set for /Users/shabarkin/codex
+Reconciles codedb's ENTIRE indexed file set for the codex repo
 against refpolicy.expected_indexed (the mechanical replica of codedb's
 documented visibility policy, with git check-ignore as gitignore oracle).
 

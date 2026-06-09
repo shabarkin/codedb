@@ -1,5 +1,5 @@
 === run 1/4 react ===
-corpus: /Users/blackfloofie/codedb-bench/react
+corpus: /Users/dev/codedb-bench/react
   indexable files: 6,620, bytes: 26,477,609
   iterations per query: 20
 
@@ -8,11 +8,11 @@ corpus: /Users/blackfloofie/codedb-bench/react
 [build] fts5_unicode61 ...
         0.44s, 6620 docs, 36.3 MB
 [build] codedb (cleaning matching snapshot first) ...
-        1.18s, ~69.5 MB (/Users/blackfloofie/.codedb/projects/dab61953ae243e54)
+        1.18s, ~69.5 MB (/Users/dev/.codedb/projects/dab61953ae243e54)
 [build] lean-ctx ...
         8.25s, ~0.0 MB
 [build] codegraph ...
-        15.12s, ~195.5 MB (/Users/blackfloofie/codedb-bench/react/.codegraph)
+        15.12s, ~195.5 MB (/Users/dev/codedb-bench/react/.codegraph)
 
 [query]
   query | fts5_tri p50/p99 (hits) | fts5_uni p50/p99 (hits) | codedb p50/p99 (hits) | leanctx p50/p99 (hits) | codegraph p50/p99 (hits)
@@ -34,16 +34,16 @@ corpus: /Users/blackfloofie/codedb-bench/react
 
 report: results/2026-05-21/react-run1.md
 === run 2/4 react ===
-corpus: /Users/blackfloofie/codedb-bench/react
+corpus: /Users/dev/codedb-bench/react
   indexable files: 6,620, bytes: 26,477,609
   iterations per query: 20
 
 [build] codedb (cleaning matching snapshot first) ...
-        1.13s, ~69.5 MB (/Users/blackfloofie/.codedb/projects/dab61953ae243e54)
+        1.13s, ~69.5 MB (/Users/dev/.codedb/projects/dab61953ae243e54)
 [build] lean-ctx ...
         8.31s, ~0.0 MB
 [build] codegraph ...
-        15.05s, ~195.5 MB (/Users/blackfloofie/codedb-bench/react/.codegraph)
+        15.05s, ~195.5 MB (/Users/dev/codedb-bench/react/.codegraph)
 
 [query]
   query | codedb p50/p99 (hits) | leanctx p50/p99 (hits) | codegraph p50/p99 (hits)
@@ -65,7 +65,7 @@ corpus: /Users/blackfloofie/codedb-bench/react
 
 report: results/2026-05-21/react-run2.md
 === run 3/4 regex ===
-corpus: /Users/blackfloofie/codedb-bench/regex
+corpus: /Users/dev/codedb-bench/regex
   indexable files: 285, bytes: 5,902,759
   iterations per query: 20
 
@@ -74,11 +74,11 @@ corpus: /Users/blackfloofie/codedb-bench/regex
 [build] fts5_unicode61 ...
         0.12s, 285 docs, 7.8 MB
 [build] codedb (cleaning matching snapshot first) ...
-        0.15s, ~13.5 MB (/Users/blackfloofie/.codedb/projects/8085066150815f80)
+        0.15s, ~13.5 MB (/Users/dev/.codedb/projects/8085066150815f80)
 [build] lean-ctx ...
         8.17s, ~0.0 MB
 [build] codegraph ...
-        2.56s, ~17.6 MB (/Users/blackfloofie/codedb-bench/regex/.codegraph)
+        2.56s, ~17.6 MB (/Users/dev/codedb-bench/regex/.codegraph)
 
 [query]
   query | fts5_tri p50/p99 (hits) | fts5_uni p50/p99 (hits) | codedb p50/p99 (hits) | leanctx p50/p99 (hits) | codegraph p50/p99 (hits)
@@ -100,7 +100,7 @@ corpus: /Users/blackfloofie/codedb-bench/regex
 
 report: results/2026-05-21/regex-run1.md
 === run 4/4 flask ===
-corpus: /Users/blackfloofie/codedb-bench/flask
+corpus: /Users/dev/codedb-bench/flask
   indexable files: 127, bytes: 626,841
   iterations per query: 20
 
@@ -109,11 +109,11 @@ corpus: /Users/blackfloofie/codedb-bench/flask
 [build] fts5_unicode61 ...
         0.01s, 127 docs, 0.9 MB
 [build] codedb (cleaning matching snapshot first) ...
-        0.05s, ~3.6 MB (/Users/blackfloofie/.codedb/projects/c056807dc334e7c1)
+        0.05s, ~3.6 MB (/Users/dev/.codedb/projects/c056807dc334e7c1)
 [build] lean-ctx ...
         8.29s, ~0.0 MB
 [build] codegraph ...
-        0.58s, ~3.7 MB (/Users/blackfloofie/codedb-bench/flask/.codegraph)
+        0.58s, ~3.7 MB (/Users/dev/codedb-bench/flask/.codegraph)
 
 [query]
   query | fts5_tri p50/p99 (hits) | fts5_uni p50/p99 (hits) | codedb p50/p99 (hits) | leanctx p50/p99 (hits) | codegraph p50/p99 (hits)

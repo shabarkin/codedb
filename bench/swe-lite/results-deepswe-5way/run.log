@@ -4,7 +4,7 @@
 [1;37m══════════════════════════════════════════════════════════════[0m
 [0;90m  Budget/run: $5.00 | Model: Sonnet 4.6[0m
 [0;90m  Date:       2026-05-28 01:20[0m
-[0;90m  Traces:     /Users/rachpradhan/codedb/bench/swe-lite/results-deepswe-5way/traces[0m
+[0;90m  Traces:     /Users/dev/codedb/bench/swe-lite/results-deepswe-5way/traces[0m
 
 [1;37m━━━ [1/7] httpx-streaming-json-iteration (encode/httpx) ━━━[0m
   [0;90mrepo already cloned[0m
@@ -170,6 +170,6 @@ vulture-persistent-analysis-cache          $1.56 37T $1.60 35T $1.29 33T $1.41 2
 TOTAL                                      $13.98 252T $12.06 306T $13.90 296T $14.80 306T $16.85 340T
 
 
-[0;90mTraces saved to: /Users/rachpradhan/codedb/bench/swe-lite/results-deepswe-5way/traces[0m
-[0;90mFull logs in: /Users/rachpradhan/codedb/bench/swe-lite/results-deepswe-5way[0m
+[0;90mTraces saved to: /Users/dev/codedb/bench/swe-lite/results-deepswe-5way/traces[0m
+[0;90mFull logs in: /Users/dev/codedb/bench/swe-lite/results-deepswe-5way[0m
 

@@ -2,8 +2,8 @@
 import subprocess, json, time, os, select, statistics, math
 
 OLD  = "/tmp/codedb-0.2.572"
-NEW  = "/Users/rachpradhan/codedb2/zig-out/bin/codedb"
-REPO = "/Users/rachpradhan/codedb"
+NEW  = "/Users/dev/codedb2/zig-out/bin/codedb"
+REPO = "/Users/dev/codedb"
 ITERS = 25
 MAX_RESULTS = 20
 

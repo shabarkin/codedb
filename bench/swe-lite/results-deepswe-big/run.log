@@ -4,7 +4,7 @@
 [1;37m══════════════════════════════════════════════════════════════[0m
 [0;90m  Budget/run: $5.00 | Model: Sonnet 4.6[0m
 [0;90m  Date:       2026-05-28 07:25[0m
-[0;90m  Traces:     /Users/rachpradhan/codedb/bench/swe-lite/results-deepswe-big/traces[0m
+[0;90m  Traces:     /Users/dev/codedb/bench/swe-lite/results-deepswe-big/traces[0m
 
 [1;37m━━━ [1/5] langchain-request-coalescing (langchain-ai/langchain) ━━━[0m
   [0;36mcloning langchain-ai/langchain...[0m [0;32mdone[0m

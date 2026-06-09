@@ -63,7 +63,7 @@ def build_judge_prompt(task, answer):
 +1 explanation_accurate  (description/trace is what the code actually does, no hallucinations)
 +1 completeness          (addresses ALL parts of the asked-for answer shape)
 
-You may use `Read` or `grep` against /Users/blackfloofie/codedb-bench/react to verify references — but bound your verification effort. Don't burn 10 tool calls on one answer.
+You may use `Read` or `grep` against /Users/dev/codedb-bench/react to verify references — but bound your verification effort. Don't burn 10 tool calls on one answer.
 
 # Output
 End your response with EXACTLY this JSON on the last line, nothing after:

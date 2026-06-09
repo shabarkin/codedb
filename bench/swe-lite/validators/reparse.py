@@ -1,7 +1,7 @@
 """Re-parse validator outputs to extract JSON even when warnings precede/follow it."""
 import json, os, re, sys
 
-results_dir = "/Users/rachpradhan/codedb/bench/swe-lite/validators/results"
+results_dir = "/Users/dev/codedb/bench/swe-lite/validators/results"
 
 # For each .json file marked validator_crashed, try to extract embedded JSON from raw_output
 fixed = 0

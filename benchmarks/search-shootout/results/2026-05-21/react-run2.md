@@ -1,7 +1,7 @@
 # search-shootout — react
 
 **Date:** 2026-05-21 10:24
-**Corpus:** `/Users/blackfloofie/codedb-bench/react`
+**Corpus:** `/Users/dev/codedb-bench/react`
 **Indexed files:** 6,620
 **Corpus bytes:** 26.5 MB
 **Iterations:** 20 warm

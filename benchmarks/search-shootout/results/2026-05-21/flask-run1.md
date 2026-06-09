@@ -1,7 +1,7 @@
 # search-shootout — flask
 
 **Date:** 2026-05-21 10:29
-**Corpus:** `/Users/blackfloofie/codedb-bench/flask`
+**Corpus:** `/Users/dev/codedb-bench/flask`
 **Indexed files:** 127
 **Corpus bytes:** 0.6 MB
 **Iterations:** 20 warm
