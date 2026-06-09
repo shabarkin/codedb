@@ -35,13 +35,13 @@ If `root` is omitted, the current working directory is used. Per-project data li
 | `hot` | Recently modified files |
 | `status` | Index size, store seq, and index state |
 | `symbol <name>` | Where a symbol is defined, all matches (`--body` for source) |
-| `callers <name>` | Every call site of a symbol |
+| `callers <name>` | Exact call sites of a symbol with honest totals |
 | `deps <path>` | Dependency graph (`--depends-on`, `--transitive`, `--max-depth N`) |
 | `glob <pattern>` | Match indexed paths by glob |
 | `ls [path]` | List a directory's indexed children |
 | `file <fuzzy-name>` | Fuzzy file-name search |
 | `context <task...>` | Task-shaped orientation bundle |
-| `compass <task...>` | Intent-shaped overview / define / callers tunnel (`--intent`, `--body`, `--max-files`, `--more`, `--mode`, `--format`) |
+| `compass <task...>` | First-touch overview / define / callers / blast-radius tunnel (`--intent`, `--mode summary|minimal`, `--body`, `--max-files`, `--more`, `--format`) |
 | `serve` | HTTP daemon on :7719 |
 | `mcp` | JSON-RPC/MCP server over stdio |
 | `update` | Disabled — rebuild from source with `zig build` |

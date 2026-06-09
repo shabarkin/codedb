@@ -244,6 +244,16 @@ pub const SearchResult = struct {
     score: f32 = 0.0,
 };
 
+pub const DepthDependent = struct {
+    path: []const u8,
+    depth: u32,
+};
+
+pub const WordLineHit = struct {
+    path: []const u8,
+    line: u32,
+};
+
 pub const SearchOptions = struct {
     max_results: usize,
     max_per_file: ?usize = null,
@@ -430,7 +440,7 @@ pub const DependencyGraph = struct {
         }
     }
 
-    pub fn getTransitiveDependents(self: *const DependencyGraph, path: []const u8, allocator: std.mem.Allocator, max_depth: ?u32) ![]const []const u8 {
+    pub fn getTransitiveDependentsWithDepth(self: *const DependencyGraph, path: []const u8, allocator: std.mem.Allocator, max_depth: ?u32) ![]const DepthDependent {
         const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
 
         var visited = std.StringHashMap(void).init(allocator);
@@ -444,9 +454,9 @@ pub const DependencyGraph = struct {
             try enqueueTraversalKey(allocator, &visited, &queue, basename, 0);
         }
 
-        var result: std.ArrayList([]const u8) = .empty;
+        var result: std.ArrayList(DepthDependent) = .empty;
         errdefer {
-            for (result.items) |p| allocator.free(p);
+            for (result.items) |item| allocator.free(item.path);
             result.deinit(allocator);
         }
 
@@ -463,15 +473,39 @@ pub const DependencyGraph = struct {
                 while (rev_iter.next()) |key_ptr| {
                     const dep = key_ptr.*;
                     if (!visited.contains(dep)) {
+                        try result.ensureUnusedCapacity(allocator, 1);
                         const dep_copy = try allocator.dupe(u8, dep);
-                        try result.append(allocator, dep_copy);
-                        try enqueueTraversalPathAndBasename(allocator, &visited, &queue, dep, item.depth + 1);
+                        const next_depth = item.depth + 1;
+                        result.appendAssumeCapacity(.{ .path = dep_copy, .depth = next_depth });
+                        try enqueueTraversalPathAndBasename(allocator, &visited, &queue, dep, next_depth);
                     }
                 }
             }
         }
 
+        std.mem.sort(DepthDependent, result.items, {}, struct {
+            fn lessThan(_: void, a: DepthDependent, b: DepthDependent) bool {
+                if (a.depth != b.depth) return a.depth < b.depth;
+                return std.mem.order(u8, a.path, b.path) == .lt;
+            }
+        }.lessThan);
+
         return result.toOwnedSlice(allocator);
+    }
+
+    pub fn getTransitiveDependents(self: *const DependencyGraph, path: []const u8, allocator: std.mem.Allocator, max_depth: ?u32) ![]const []const u8 {
+        const with_depth = try self.getTransitiveDependentsWithDepth(path, allocator, max_depth);
+        errdefer {
+            for (with_depth) |item| allocator.free(item.path);
+            allocator.free(with_depth);
+        }
+
+        const result = try allocator.alloc([]const u8, with_depth.len);
+        for (with_depth, 0..) |item, i| {
+            result[i] = item.path;
+        }
+        allocator.free(with_depth);
+        return result;
     }
 
     pub fn getTransitiveDependencies(self: *const DependencyGraph, path: []const u8, allocator: std.mem.Allocator, max_depth: ?u32) ![]const []const u8 {
@@ -3282,10 +3316,13 @@ pub const Explorer = struct {
     /// filter used by the codedb_context callers section.
     fn isLikelyTestPath(path: []const u8) bool {
         return std.mem.startsWith(u8, path, "tests/") or
+            std.mem.startsWith(u8, path, "tests.") or
             std.mem.startsWith(u8, path, "test/") or
             std.mem.indexOf(u8, path, "/test") != null or
             std.mem.indexOf(u8, path, "_test.") != null or
+            std.mem.indexOf(u8, path, "_tests.") != null or
             std.mem.indexOf(u8, path, ".test.") != null or
+            std.mem.indexOf(u8, path, ".tests.") != null or
             std.mem.indexOf(u8, path, ".spec.") != null or
             std.mem.indexOf(u8, path, "/__tests__/") != null or
             std.mem.indexOf(u8, path, "/spec/") != null or
@@ -4336,6 +4373,46 @@ pub const Explorer = struct {
         return self.word_index.searchDeduped(word, allocator);
     }
 
+    /// Search for a word and return deterministic caller-owned path:line hits.
+    pub fn searchWordLines(self: *Explorer, word: []const u8, allocator: std.mem.Allocator) ![]const WordLineHit {
+        self.mu.lockShared();
+        const needs_rebuild = !self.word_index_complete and
+            (self.contents.len() > 0 or (self.io != null and self.root_dir != null));
+        self.mu.unlockShared();
+        if (needs_rebuild) {
+            try self.rebuildWordIndex();
+        }
+
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const hits = try self.word_index.searchDeduped(word, allocator);
+        defer allocator.free(hits);
+
+        var result: std.ArrayList(WordLineHit) = .empty;
+        errdefer {
+            for (result.items) |item| allocator.free(item.path);
+            result.deinit(allocator);
+        }
+        try result.ensureTotalCapacity(allocator, hits.len);
+        for (hits) |hit| {
+            const path = self.word_index.hitPath(hit);
+            if (path.len == 0) continue;
+            result.appendAssumeCapacity(.{
+                .path = try allocator.dupe(u8, path),
+                .line = hit.line_num,
+            });
+        }
+        std.mem.sort(WordLineHit, result.items, {}, struct {
+            fn lessThan(_: void, a: WordLineHit, b: WordLineHit) bool {
+                const order = std.mem.order(u8, a.path, b.path);
+                if (order != .eq) return order == .lt;
+                return a.line < b.line;
+            }
+        }.lessThan);
+        return result.toOwnedSlice(allocator);
+    }
+
     /// Format a word-index lookup directly from the posting list. The indexer
     /// already stores at most one hit per (word, file, line), so the MCP word
     /// path does not need to allocate and dedupe a temporary result slice.
@@ -4621,6 +4698,12 @@ pub const Explorer = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
         return self.dep_graph.getTransitiveDependents(path, allocator, max_depth);
+    }
+
+    pub fn getTransitiveDependentsWithDepth(self: *Explorer, path: []const u8, allocator: std.mem.Allocator, max_depth: ?u32) ![]const DepthDependent {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        return self.dep_graph.getTransitiveDependentsWithDepth(path, allocator, max_depth);
     }
 
     pub fn getTransitiveDependencies(self: *Explorer, path: []const u8, allocator: std.mem.Allocator, max_depth: ?u32) ![]const []const u8 {
@@ -5724,12 +5807,27 @@ pub const Explorer = struct {
         try self.dep_graph.setOwnedDeps(path, deps);
     }
 
-    fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline, had_prior: bool) void {
+    pub fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline, had_prior: bool) void {
         // removeSymbolIndexFor scans the entire global symbol index, so calling
         // it per file makes a cold scan O(files * total_symbols). A brand-new
         // path has no prior entries to evict, so skip the scan entirely — only
         // re-indexed (already-present) files need the removal.
         if (had_prior) self.removeSymbolIndexFor(path);
+        self.appendSymbolIndexFor(path, outline, true);
+    }
+
+    pub fn restoreSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline) void {
+        self.appendSymbolIndexFor(path, outline, false);
+    }
+
+    pub fn sortSymbolIndex(self: *Explorer) void {
+        var iter = self.symbol_index.valueIterator();
+        while (iter.next()) |locs| {
+            sortSymbolLocations(locs.items);
+        }
+    }
+
+    fn appendSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline, sort_each: bool) void {
         for (outline.symbols.items) |sym| {
             const gop = self.symbol_index.getOrPut(sym.name) catch continue;
             if (!gop.found_existing) {
@@ -5741,7 +5839,7 @@ pub const Explorer = struct {
                 .line_start = sym.line_start,
                 .line_end = sym.line_end,
             }) catch {};
-            sortSymbolLocations(gop.value_ptr.items);
+            if (sort_each) sortSymbolLocations(gop.value_ptr.items);
         }
     }
 
@@ -5865,6 +5963,26 @@ pub const Explorer = struct {
         scope_start: u32 = 0,
         scope_end: u32 = 0,
     };
+
+    pub const EnclosingScope = struct {
+        name: []const u8,
+        kind: SymbolKind,
+        line_start: u32,
+        line_end: u32,
+    };
+
+    /// Return caller-owned info for the smallest enclosing symbol at path:line.
+    pub fn findEnclosingSymbolInfo(self: *Explorer, path: []const u8, line_num: u32, allocator: std.mem.Allocator) !?EnclosingScope {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        const scope = self.findEnclosingSymbolLocked(path, line_num) orelse return null;
+        return .{
+            .name = try allocator.dupe(u8, scope.name),
+            .kind = scope.kind,
+            .line_start = scope.line_start,
+            .line_end = scope.line_end,
+        };
+    }
 
     /// Search content and annotate results with the enclosing symbol scope.
     pub fn searchContentWithScope(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const ScopedSearchResult {

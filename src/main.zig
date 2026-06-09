@@ -1000,6 +1000,22 @@ fn mainImpl() !void {
         }
     }
 
+    // Machine-readable output goes to stdout and must parse cleanly, so the
+    // snapshot-load / cold-index status banners would corrupt it. When the
+    // requested format is JSON (currently only `compass --format json`),
+    // route those banners to stderr — same spirit as the MCP stdout guard
+    // above. TEXT mode keeps the banners on stdout exactly as before.
+    const json_status_to_stderr = std.mem.eql(u8, cmd, "compass") and blk_fmt: {
+        for (args[cmd_args_start..], 0..) |a, idx| {
+            if (std.mem.eql(u8, a, "--format=json")) break :blk_fmt true;
+            if (std.mem.eql(u8, a, "--format")) {
+                const next = cmd_args_start + idx + 1;
+                if (next < args.len and std.mem.eql(u8, args[next], "json")) break :blk_fmt true;
+            }
+        }
+        break :blk_fmt false;
+    };
+
     // Handle --version early (no root needed)
     if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v") or std.mem.eql(u8, cmd, "version")) {
         out.p("codedb {s}\n", .{release_info.semver});
@@ -1126,7 +1142,7 @@ fn mainImpl() !void {
         // built + persisted for `index` (so a later `mcp` can load it) and for
         // `mcp` itself (so ranked/NL search works in the running server).
         const needs_word_index = std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine") or
-            std.mem.eql(u8, cmd, "index") or std.mem.eql(u8, cmd, "mcp");
+            std.mem.eql(u8, cmd, "index") or std.mem.eql(u8, cmd, "mcp") or std.mem.eql(u8, cmd, "compass");
         if (snapshot_loaded) {
             if (std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "bench-engine") or std.mem.eql(u8, cmd, "cli-daemon")) {
                 // The cli-daemon serves proxied `search`/`callers`; warm the
@@ -1141,7 +1157,7 @@ fn mainImpl() !void {
                     explorer.trigram_index.writeToDisk(io, data_dir, git_head) catch {};
                 }
             }
-            if (std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine") or std.mem.eql(u8, cmd, "cli-daemon")) {
+            if (std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine") or std.mem.eql(u8, cmd, "cli-daemon") or std.mem.eql(u8, cmd, "compass")) {
                 loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
                 // word/bench-engine want a guaranteed-ready index — rebuild + persist
                 // if the on-disk one was missing/stale. The cli-daemon stays lean: if
@@ -1154,6 +1170,10 @@ fn mainImpl() !void {
             }
             if (cio.posixGetenv("CODEDB_QUIET") == null) {
                 var dur_buf: [64]u8 = undefined;
+                if (json_status_to_stderr) {
+                    out.flush();
+                    out.file = cio.File.stderr();
+                }
                 out.p("{s}\xe2\x9c\x93{s} {s}loaded snapshot{s}  {s}{d} files{s}  {s}{s}{s}\n", .{
                     s.green,                                        s.reset,
                     s.bold,                                         s.reset,
@@ -1161,6 +1181,10 @@ fn mainImpl() !void {
                     s.reset,                                        sty.durationColor(s, snapshot_elapsed),
                     sty.formatDuration(&dur_buf, snapshot_elapsed), s.reset,
                 });
+                if (json_status_to_stderr) {
+                    out.flush();
+                    out.file = stdout;
+                }
             }
         } else {
             const disk_hdr = TrigramIndex.readDiskHeader(io, data_dir, allocator) catch null;
@@ -1207,12 +1231,20 @@ fn mainImpl() !void {
             }
             const scan_elapsed = cio.nanoTimestamp() - t_scan;
             var dur_buf: [64]u8 = undefined;
+            if (json_status_to_stderr) {
+                out.flush();
+                out.file = cio.File.stderr();
+            }
             out.p("{s}\xe2\x9c\x93{s} {s}indexed{s}  {s}{s}{s}\n", .{
                 s.green,                            s.reset,
                 s.dim,                              s.reset,
                 sty.durationColor(s, scan_elapsed), sty.formatDuration(&dur_buf, scan_elapsed),
                 s.reset,
             });
+            if (json_status_to_stderr) {
+                out.flush();
+                out.file = stdout;
+            }
 
             var release_contents_after_cache = false;
             if (heads_match) {
@@ -1655,18 +1687,9 @@ fn mainImpl() !void {
             mcp_server.setScanState(.loading_snapshot);
             watch_thread = try std.Thread.spawn(.{}, watcherDeferredLoop, .{&deferred});
         } else {
-            const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
             mcp_server.setScanState(.loading_snapshot);
-            const snapshot_loaded = loadBestSnapshot(io, &explorer, &store, abs_root, data_dir, git_head, allocator);
-            var scan_done = std.atomic.Value(bool).init(snapshot_loaded);
-            if (!snapshot_loaded) {
-                mcp_server.setScanState(.walking);
-                scan_thread = try std.Thread.spawn(.{}, scanBg, .{ io, &store, &explorer, root, allocator, &scan_done, &shutdown, data_dir, abs_root });
-            } else {
-                loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
-                compactMcpReadyMemory(io, &explorer, data_dir, git_head, allocator);
-                mcp_server.setScanState(.ready);
-            }
+            var scan_done = std.atomic.Value(bool).init(false);
+            scan_thread = try std.Thread.spawn(.{}, loadSnapshotOrScanBg, .{ io, &store, &explorer, root, allocator, &scan_done, &shutdown, data_dir, abs_root });
             watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ io, &store, &explorer, queue, root, &shutdown, &scan_done });
         }
 
@@ -2241,7 +2264,7 @@ fn printUsage(out: *Out, s: sty.Style) void {
         \\    {s}ls{s}  [path]                list a directory's indexed children
         \\    {s}file{s}  <fuzzy-name>        fuzzy file-name search
         \\    {s}context{s}  <task...>        task-shaped orientation bundle
-        \\    {s}compass{s}  <task...>        intent-shaped overview / define / callers tunnel
+        \\    {s}compass{s}  <task...>        first-touch overview / define / callers / blast-radius tunnel
         \\    {s}serve{s}                     HTTP daemon on :7719
         \\    {s}mcp{s}                       JSON-RPC/MCP server over stdio
         \\    {s}update{s}                    disabled; rebuild from source with zig build
@@ -2290,6 +2313,26 @@ fn reapLoop(agents: *AgentRegistry, shutdown: *std.atomic.Value(bool)) void {
         }
         agents.reapStale(30_000);
     }
+}
+
+fn loadSnapshotOrScanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allocator: std.mem.Allocator, scan_done: *std.atomic.Value(bool), shutdown: *std.atomic.Value(bool), data_dir: []const u8, abs_root: []const u8) void {
+    const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
+    mcp_server.setScanState(.loading_snapshot);
+    if (loadBestSnapshot(io, explorer, store, abs_root, data_dir, git_head, allocator)) {
+        if (!shutdown.load(.acquire)) {
+            loadTrigramFromDiskIfPresent(io, explorer, data_dir, allocator);
+            compactMcpReadyMemory(io, explorer, data_dir, git_head, allocator);
+        }
+        scan_done.store(true, .release);
+        mcp_server.setScanState(.ready);
+        return;
+    }
+    if (shutdown.load(.acquire)) {
+        scan_done.store(true, .release);
+        mcp_server.setScanState(.ready);
+        return;
+    }
+    scanBg(io, store, explorer, root, allocator, scan_done, shutdown, data_dir, abs_root);
 }
 
 fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allocator: std.mem.Allocator, scan_done: *std.atomic.Value(bool), shutdown: *std.atomic.Value(bool), data_dir: []const u8, abs_root: []const u8) void {

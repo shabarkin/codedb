@@ -17,6 +17,7 @@ const root_policy = @import("root_policy.zig");
 const edit_mod = @import("edit.zig");
 const snapshot_mod = @import("snapshot.zig");
 const watcher = @import("watcher.zig");
+const project_paths = @import("project_paths.zig");
 const WordIndex = @import("index.zig").WordIndex;
 const TrigramIndex = @import("index.zig").TrigramIndex;
 const SparseNgramIndex = @import("index.zig").SparseNgramIndex;
@@ -225,7 +226,7 @@ test "nuke: commandTargetsBinary only matches the current install path" {
         "/private/var/folders/example/codedb",
     ));
     try testing.expect(!nuke_mod.commandTargetsBinary(
-        "/Users/rachpradhan/bin/codedb --mcp",
+        "/Users/dev/bin/codedb --mcp",
         "/tmp/codedb-test/bin/codedb",
     ));
 }
@@ -1483,6 +1484,25 @@ test "compass: tools/list advertises codedb_compass" {
     for (tools.items) |tool| {
         if (std.mem.eql(u8, tool.object.get("name").?.string, "codedb_compass")) {
             saw_compass = true;
+            const props = tool.object.get("inputSchema").?.object.get("properties").?.object;
+            const intent_values = props.get("intent").?.object.get("enum").?.array;
+            const mode_values = props.get("mode").?.object.get("enum").?.array;
+            var saw_blast = false;
+            for (intent_values.items) |value| {
+                if (std.mem.eql(u8, value.string, "blast_radius")) saw_blast = true;
+            }
+            var saw_minimal = false;
+            var saw_evidence = false;
+            var saw_raw = false;
+            for (mode_values.items) |value| {
+                if (std.mem.eql(u8, value.string, "minimal")) saw_minimal = true;
+                if (std.mem.eql(u8, value.string, "evidence")) saw_evidence = true;
+                if (std.mem.eql(u8, value.string, "raw")) saw_raw = true;
+            }
+            try testing.expect(saw_blast);
+            try testing.expect(saw_minimal);
+            try testing.expect(!saw_evidence);
+            try testing.expect(!saw_raw);
             break;
         }
     }
@@ -2011,6 +2031,213 @@ test "compass: MCP dispatch returns routed overview output" {
     try testing.expect(!std.mem.startsWith(u8, out.items, "error:"));
 }
 
+test "compass: MCP dispatch supports minimal, JSON, and blast_radius" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var explorer = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(aa);
+    var agents = AgentRegistry.init(aa);
+    defer agents.deinit();
+
+    try explorer.indexFile("src/render.zig", "pub fn render() void {}\n");
+    try explorer.indexFile("src/page.zig", "const render_mod = @import(\"render.zig\");\npub fn renderPage() void { render(); }\n");
+    try explorer.indexFile("src/app.zig", "const page = @import(\"page.zig\");\npub fn app() void { page.renderPage(); }\n");
+
+    var bench_ctx = mcp_mod.BenchContext.init(aa, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, aa,
+            \\{"task":"definition of renderPage","intent":"define","mode":"minimal"}
+        , .{});
+        defer parsed.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        bench_ctx.runDispatch(io, aa, .codedb_compass, &parsed.value.object, &out, &store, &explorer, &agents);
+        try testing.expect(std.mem.indexOf(u8, out.items, "## DEFS") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "## COVERAGE") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "## ROUTE") == null);
+    }
+
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, aa,
+            \\{"task":"blast radius renderPage","intent":"blast_radius","target":"renderPage"}
+        , .{});
+        defer parsed.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        bench_ctx.runDispatch(io, aa, .codedb_compass, &parsed.value.object, &out, &store, &explorer, &agents);
+        try testing.expect(std.mem.indexOf(u8, out.items, "## TARGET") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "## RIPPLE") != null);
+    }
+
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, aa,
+            \\{"task":"what calls render","intent":"callers","format":"json"}
+        , .{});
+        defer parsed.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        bench_ctx.runDispatch(io, aa, .codedb_compass, &parsed.value.object, &out, &store, &explorer, &agents);
+        const json = try std.json.parseFromSlice(std.json.Value, aa, out.items, .{});
+        defer json.deinit();
+        try testing.expect(json.value.object.get("coverage") != null);
+        try testing.expect(json.value.object.get("text") != null);
+    }
+}
+
+test "issue-C09: MCP compass rejects reserved modes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var explorer = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(aa);
+    var agents = AgentRegistry.init(aa);
+    defer agents.deinit();
+
+    try explorer.indexFile("src/render.zig", "pub fn render() void {}\n");
+
+    var bench_ctx = mcp_mod.BenchContext.init(aa, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    inline for (.{ "evidence", "raw" }) |mode| {
+        const request = try std.fmt.allocPrint(aa,
+            \\{{"task":"definition of render","intent":"define","mode":"{s}"}}
+        , .{mode});
+        const parsed = try std.json.parseFromSlice(std.json.Value, aa, request, .{});
+        defer parsed.deinit();
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        bench_ctx.runDispatch(io, aa, .codedb_compass, &parsed.value.object, &out, &store, &explorer, &agents);
+        try testing.expectEqualStrings("error: mode not yet implemented", out.items);
+    }
+}
+
+test "issue-C18: MCP compass dispatch covers codex-shaped fixture, replay, ambiguity, and demotion" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPathFile(io, ".", &tmp_buf);
+    const tmp_path = tmp_buf[0..tmp_path_len];
+
+    const data_dir = try project_paths.projectDataDir(testing.allocator, tmp_path);
+    defer testing.allocator.free(data_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, data_dir) catch {};
+
+    var explorer = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(aa);
+    var agents = AgentRegistry.init(aa);
+    defer agents.deinit();
+
+    try explorer.indexFile("core/src/foo.rs",
+        \\pub fn shared_symbol() {}
+        \\pub fn route_widget() {
+        \\    shared_symbol();
+        \\}
+        \\pub fn build_widget() {
+        \\    route_widget();
+        \\}
+    );
+    try explorer.indexFile("core/src/alt.rs",
+        \\pub fn shared_symbol() {}
+        \\pub fn other_widget() {
+        \\    shared_symbol();
+        \\}
+    );
+    try explorer.indexFile("core/src/foo_tests.rs",
+        \\fn test_case() {
+        \\    route_widget();
+        \\}
+    );
+    try explorer.indexFile("core/src/api.pb.rs",
+        \\pub fn route_widget_generated() {
+        \\    route_widget();
+        \\}
+    );
+    try explorer.indexFile("core/src/cache_generated.rs",
+        \\pub fn route_widget_cache() {
+        \\    route_widget();
+        \\}
+    );
+
+    var bench_ctx = mcp_mod.BenchContext.init(aa, tmp_path, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, aa,
+            \\{"task":"route widget overview","intent":"overview","target":"route_widget","mode":"minimal","format":"json","max_files":1}
+        , .{});
+        defer parsed.deinit();
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        bench_ctx.runDispatch(io, aa, .codedb_compass, &parsed.value.object, &out, &store, &explorer, &agents);
+
+        const json = try std.json.parseFromSlice(std.json.Value, aa, out.items, .{});
+        defer json.deinit();
+        const text = json.value.object.get("text").?.string;
+        try testing.expect(std.mem.indexOf(u8, text, "core/src/foo.rs") != null);
+        try testing.expect(json.value.object.get("more").? == .string);
+        const token = json.value.object.get("more").?.string;
+
+        const replay_request = try std.fmt.allocPrint(aa,
+            \\{{"more":"{s}","format":"json"}}
+        , .{token});
+        const replay_parsed = try std.json.parseFromSlice(std.json.Value, aa, replay_request, .{});
+        defer replay_parsed.deinit();
+
+        var replay_out: std.ArrayList(u8) = .empty;
+        defer replay_out.deinit(aa);
+        bench_ctx.runDispatch(io, aa, .codedb_compass, &replay_parsed.value.object, &replay_out, &store, &explorer, &agents);
+        try testing.expect(std.mem.indexOf(u8, replay_out.items, "overflow request mismatch") == null);
+
+        const replay_json = try std.json.parseFromSlice(std.json.Value, aa, replay_out.items, .{});
+        defer replay_json.deinit();
+        try testing.expect(replay_json.value.object.get("more").? == .null);
+        const replay_text = replay_json.value.object.get("text").?.string;
+        const source_pos = std.mem.indexOf(u8, replay_text, "core/src/foo.rs") orelse return error.TestUnexpectedResult;
+        const generated_pos = std.mem.indexOf(u8, replay_text, "core/src/api.pb.rs") orelse return error.TestUnexpectedResult;
+        try testing.expect(source_pos < generated_pos);
+        const limits = replay_json.value.object.get("limits").?.array;
+        var saw_test_exclusion = false;
+        for (limits.items) |limit| {
+            if (std.mem.indexOf(u8, limit.string, "test-like files excluded from FILES/SITES") != null) {
+                saw_test_exclusion = true;
+            }
+        }
+        try testing.expect(saw_test_exclusion);
+    }
+
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, aa,
+            \\{"task":"definition of shared_symbol","intent":"define","target":"shared_symbol","format":"json"}
+        , .{});
+        defer parsed.deinit();
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        bench_ctx.runDispatch(io, aa, .codedb_compass, &parsed.value.object, &out, &store, &explorer, &agents);
+        const json = try std.json.parseFromSlice(std.json.Value, aa, out.items, .{});
+        defer json.deinit();
+        const limits = json.value.object.get("limits").?.array;
+        var saw_ambiguity = false;
+        for (limits.items) |limit| {
+            if (std.mem.indexOf(u8, limit.string, "multiple exact definitions share this name (2)") != null) {
+                saw_ambiguity = true;
+            }
+        }
+        try testing.expect(saw_ambiguity);
+    }
+}
+
 // ── #528: CLI parsing / validation / exit-code regressions ──────────────────
 
 test "issue-528: parseLineRange accepts valid ranges and EOF sentinel" {
@@ -2098,4 +2325,10 @@ test "issue-528: finishCli maps error-prefixed handler output to exit 1" {
     var empty_out: std.ArrayList(u8) = .empty;
     defer empty_out.deinit(alloc);
     try testing.expectEqual(@as(u8, 0), mcp_mod.finishCli(&empty_out, 0));
+}
+
+test "compass replay token validator accepts only lowercase hex" {
+    // Generator emits lowercase ({x:0>16}); uppercase hex must be rejected.
+    try testing.expect(mcp_mod.isCompassReplayTokenForTest("0123456789abcdef"));
+    try testing.expect(!mcp_mod.isCompassReplayTokenForTest("0123456789ABCDEF"));
 }

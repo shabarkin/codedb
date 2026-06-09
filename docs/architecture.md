@@ -147,9 +147,9 @@ JSON-RPC 2.0 over stdio with Content-Length framing. Implements the Model Contex
 | `codedb_symbol` | Symbol lookup |
 | `codedb_search` | Full-text search (trigram, regex, scoped) |
 | `codedb_word` | Word index lookup |
-| `codedb_callers` | Heuristic call-site finder (word index ∩ outline scope) |
+| `codedb_callers` | Exact call-site finder (word index candidates ∩ outline scope, honest totals) |
 | `codedb_context` | Task-shaped composer: NL task → keywords + defs + ranked files + snippets |
-| `codedb_compass` | Intent-shaped navigation tunnel (overview / define / callers) |
+| `codedb_compass` | First-touch navigation tunnel (overview / define / callers / blast_radius, callees, honest coverage) |
 | `codedb_hot` | Hot files |
 | `codedb_deps` | Reverse dependencies |
 | `codedb_read` | Read file content (line ranges, hash caching) |
@@ -169,11 +169,12 @@ JSON-RPC 2.0 over stdio with Content-Length framing. Implements the Model Contex
 
 ### `compass.zig` — Intent-Shaped Navigation
 
-Collapses multi-step navigation (find → search → symbol → callers) into one in-process call against the warm `Explorer`. Exposed as the `codedb_compass` MCP tool, the `compass` CLI command, and `POST /compass` over HTTP.
+Collapses first-touch navigation (find → search → symbol → callers → dependency orientation) into one in-process call against the warm `Explorer`. Exposed as the `codedb_compass` MCP tool, the `compass` CLI command, and `POST /compass` over HTTP. For exact follow-ups where the path or symbol is already known, prefer narrower primitives such as `codedb_callers`, `codedb_search`, `codedb_read`, or `codedb_query`.
 
-- **Intents:** `overview` (keywords, definitions, ranked files, callers), `define` (definitions + fallback sites), `callers` (call sites of a symbol). Declared explicitly or routed from the natural-language task by a rule-based scorer.
-- **Modes:** `summary` (default), `evidence`, `raw`; output `format` is `text` or `json`.
+- **Intents:** `overview` (keywords, definitions, ranked files, callers, callees), `define` (definitions + fallback sites), `callers` (exact call sites of a symbol), `blast_radius` (target, direct callers, import-graph ripple). Declared explicitly or routed from the natural-language task by a rule-based scorer.
+- **Modes:** `summary` (default), `minimal` (path/coverage-focused agent output); output `format` is `text` or `json`.
 - **Coverage:** results report "X of N" — truncation is always explicit. When a reduced view truncates, the full result persists as an overflow artifact recoverable via `more`.
+- **Honesty:** caller totals are computed from uncapped word-index candidate lines before display truncation; import/type-only, case-variant, definition, substring-only, and non-call-site rejects are disclosed.
 - **Tuning:** `.codedbrc` keys `compass_max_files` (default 5), `compass_body` (default false), `compass_overflow_keep` (default 50).
 
 Shared request/render types live in `compass_shared.zig` and `compass_render.zig`; per-project artifact paths in `project_paths.zig`.

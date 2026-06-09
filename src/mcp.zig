@@ -603,7 +603,7 @@ pub const tools_list =
     \\{"name":"codedb_word","description":"Identifier/sub-token lookup via inverted index — O(1) access to one token and its occurrences. Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Identifier or sub-token to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
     \\{"name":"codedb_callers","description":"Heuristic call-site finder for a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum likely call sites to return (default: 30, max: 10000)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
     \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
-    \\{"name":"codedb_compass","description":"Intent-shaped navigation tunnel. Pass a task and optional intent (overview, define, callers); codedb routes and gathers one lean answer with explicit coverage counts and optional overflow recovery via more.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars)."},"intent":{"type":"string","enum":["overview","define","callers"],"description":"Optional explicit intent override."},"target":{"type":"string","description":"Optional explicit target identifier or path hint."},"body":{"type":"boolean","description":"Include larger definition bodies when available (default: false)."},"max_files":{"type":"integer","description":"Maximum files to surface in the reduced view (default: 5)."},"mode":{"type":"string","enum":["summary","evidence","raw"],"description":"Optional reduction mode."},"format":{"type":"string","enum":["text","json"],"description":"Response format (default: text)."},"more":{"type":"string","description":"Overflow handle returned by a prior truncated response."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
+    \\{"name":"codedb_compass","description":"First-touch navigation tunnel for broad intent, compact definitions, callers, callees, and blast-radius orientation. Prefer narrower codedb_callers/search/read/query follow-ups when you already know the exact path or symbol and need the cheaper primitive. Pass a task and optional intent (overview, define, callers, blast_radius); codedb routes and gathers one lean answer with explicit coverage counts and optional overflow recovery via more.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars)."},"intent":{"type":"string","enum":["overview","define","callers","blast_radius"],"description":"Optional explicit intent override."},"target":{"type":"string","description":"Optional explicit target identifier or path hint."},"body":{"type":"boolean","description":"Include larger definition bodies when available (default: false)."},"max_files":{"type":"integer","description":"Maximum files to surface in the reduced view (default: 5)."},"mode":{"type":"string","enum":["summary","minimal"],"description":"Optional reduction mode."},"format":{"type":"string","enum":["text","json"],"description":"Response format (default: text)."},"more":{"type":"string","description":"Overflow handle returned by a prior truncated response."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_hot","description":"Most recently modified files in the project, newest first.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Dependency graph: who imports a file (default) or what a file imports (direction=depends_on). Set transitive=true for the full BFS blast radius.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"direction":{"type":"string","enum":["imported_by","depends_on"],"description":"imported_by (default): who imports this file. depends_on: what this file imports."},"transitive":{"type":"boolean","description":"Follow dependency chain transitively (default: false)"},"max_depth":{"type":"integer","description":"Max traversal depth for transitive queries (default: unlimited)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_read","description":"Read file contents, optionally a line range. Run codedb_outline first to pick the range — large files burn tokens fast. Pass if_hash to skip re-reads when the file is unchanged.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"line_start":{"type":"integer","description":"Start line (1-indexed, inclusive). Omit for full file."},"line_end":{"type":"integer","description":"End line (1-indexed, inclusive). Omit to read to EOF."},"if_hash":{"type":"string","description":"Previous content hash. If unchanged, returns short 'unchanged:HASH' response."},"compact":{"type":"boolean","description":"Skip comment and blank lines (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
@@ -1304,7 +1304,7 @@ fn dispatch(
         waitForScanReady(scan_wait_timeout_ms);
     }
 
-    if (tool == .codedb_word or tool == .codedb_context or tool == .codedb_compass or (tool == .codedb_search and shouldLoadWordIndexForSearch(args))) {
+    if (tool == .codedb_word or tool == .codedb_context or tool == .codedb_callers or tool == .codedb_compass or (tool == .codedb_search and shouldLoadWordIndexForSearch(args))) {
         const effective_project = project_path orelse cache.default_path;
         loadProjectWordIndexFromDiskIfPresent(io, ctx.explorer, effective_project, alloc);
     }
@@ -1856,67 +1856,27 @@ fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
     // counts in real codebases; rare hot symbols can still request more.
     const max_results: usize = if (getInt(args, "max_results")) |n| @intCast(@max(1, @min(n, 10000))) else 30;
 
-    const defs = explorer.findAllSymbols(name, alloc) catch {
-        out.appendSlice(alloc, "error: symbol lookup failed") catch {};
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = compass_mod.gatherCallersExact(explorer, arena.allocator(), name, 50_000) catch {
+        out.appendSlice(alloc, "error: caller search failed") catch {};
         return;
     };
-    defer {
-        for (defs) |d| {
-            alloc.free(d.path);
-            alloc.free(d.symbol.name);
-            if (d.symbol.detail) |dd| alloc.free(dd);
-        }
-        alloc.free(defs);
-    }
-
-    const results = explorer.searchContentWithScope(name, alloc, max_results) catch {
-        out.appendSlice(alloc, "error: search failed") catch {};
-        return;
-    };
-    defer {
-        for (results) |r| {
-            alloc.free(r.line_text);
-            alloc.free(r.path);
-            if (r.scope_name) |n2| alloc.free(n2);
-        }
-        alloc.free(results);
-    }
-
-    var shown: usize = 0;
-    for (results) |r| {
-        if (!langHasCallSites(explore_mod.detectLanguage(r.path))) continue;
-        var is_def = false;
-        for (defs) |d| {
-            if (r.line_num == d.symbol.line_start and std.mem.eql(u8, r.path, d.path)) {
-                is_def = true;
-                break;
-            }
-        }
-        if (is_def) continue;
-        if (!hasWholeWordMatch(r.line_text, name)) continue;
-        shown += 1;
-    }
 
     const w = cio.listWriter(out, alloc);
-    w.print("{d} call sites for '{s}':\n", .{ shown, name }) catch {};
-    for (results) |r| {
-        if (!langHasCallSites(explore_mod.detectLanguage(r.path))) continue;
-        var is_def = false;
-        for (defs) |d| {
-            if (r.line_num == d.symbol.line_start and std.mem.eql(u8, r.path, d.path)) {
-                is_def = true;
-                break;
-            }
-        }
-        if (is_def) continue;
-        if (!hasWholeWordMatch(r.line_text, name)) continue;
+    const shown = @min(result.callers.len, max_results);
+    w.print("{d} call sites for '{s}' (showing {d}):\n", .{ result.callers.len, name, shown }) catch {};
+    for (result.callers[0..shown]) |r| {
         if (r.scope_name) |sn| {
             w.print("  {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
-                r.path, r.line_num, r.line_text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
+                r.path, r.line, r.text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
             }) catch {};
         } else {
-            w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+            w.print("  {s}:{d}: {s}\n", .{ r.path, r.line, r.text }) catch {};
         }
+    }
+    if (result.gather_capped) {
+        w.print("lower bound: gather capped at {d} of {d} candidate lines\n", .{ result.callers.len + result.def_rejects + result.substring_rejects + result.non_call_site_rejects + result.case_variant_rejects + result.import_type_rejects + result.comment_string_rejects + result.type_position_rejects + result.stale_line_rejects, result.candidate_lines }) catch {};
     }
 }
 
@@ -2306,6 +2266,7 @@ fn handleCompass(
     project_root: []const u8,
 ) void {
     var req: compass_mod.CompassRequest = .{};
+    var mode_explicit = false;
     if (getStr(args, "task")) |task| req.task = task;
     if (getStr(args, "target")) |target| req.target = target;
     if (getStr(args, "more")) |more| req.more = more;
@@ -2324,8 +2285,10 @@ fn handleCompass(
         };
     }
     if (getStr(args, "mode")) |mode_raw| {
-        req.mode = compass_mod.parseMode(mode_raw) orelse {
-            out.appendSlice(alloc, "error: invalid mode") catch {};
+        mode_explicit = true;
+        req.mode_explicit = true;
+        req.mode = parseCompassSurfaceMode(mode_raw) catch |err| {
+            appendCompassModeError(alloc, out, err);
             return;
         };
     }
@@ -2347,7 +2310,62 @@ fn handleCompass(
         return;
     };
     defer alloc.free(data_dir);
+    if (req.more != null and !mode_explicit) {
+        if (storedCompassReplayMode(io, alloc, data_dir, req.more.?)) |mode| {
+            req.mode = mode;
+        }
+    }
     compass_mod.run(io, alloc, req, explorer, store, data_dir, compass_mod.default_settings, out);
+}
+
+const CompassModeError = error{ InvalidMode, ReservedMode };
+
+fn parseCompassSurfaceMode(mode_raw: []const u8) CompassModeError!compass_mod.Mode {
+    if (std.mem.eql(u8, mode_raw, "summary")) return .summary;
+    if (std.mem.eql(u8, mode_raw, "minimal")) return .minimal;
+    if (std.mem.eql(u8, mode_raw, "evidence") or std.mem.eql(u8, mode_raw, "raw")) return error.ReservedMode;
+    return error.InvalidMode;
+}
+
+fn appendCompassModeError(alloc: std.mem.Allocator, out: *std.ArrayList(u8), err: CompassModeError) void {
+    out.appendSlice(alloc, switch (err) {
+        error.ReservedMode => "error: mode not yet implemented",
+        error.InvalidMode => "error: invalid mode",
+    }) catch {};
+}
+
+fn isCompassReplayToken(token: []const u8) bool {
+    if (token.len != 16) return false;
+    for (token) |c| {
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return false;
+    }
+    return true;
+}
+
+pub fn isCompassReplayTokenForTest(token: []const u8) bool {
+    return isCompassReplayToken(token);
+}
+
+fn storedCompassReplayMode(io: std.Io, alloc: std.mem.Allocator, data_dir: []const u8, token: []const u8) ?compass_mod.Mode {
+    if (!isCompassReplayToken(token)) return null;
+    var root_dir = std.Io.Dir.cwd().openDir(io, data_dir, .{}) catch return null;
+    defer root_dir.close(io);
+    var compass_dir = root_dir.openDir(io, "compass", .{}) catch return null;
+    defer compass_dir.close(io);
+
+    var file_name_buf: [32]u8 = undefined;
+    const file_name = std.fmt.bufPrint(&file_name_buf, "{s}.json", .{token}) catch return null;
+    const raw = compass_dir.readFileAlloc(io, file_name, alloc, .limited(4 * 1024 * 1024)) catch return null;
+    defer alloc.free(raw);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const manifest = parsed.value.object.get("manifest") orelse return null;
+    if (manifest != .object) return null;
+    const mode_value = manifest.object.get("mode") orelse return null;
+    if (mode_value != .string) return null;
+    return parseCompassSurfaceMode(mode_value.string) catch null;
 }
 
 fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
@@ -3537,7 +3555,9 @@ pub fn runCliTool(
         handleContext(io, alloc, &m, out, explorer, root);
         return finishCli(out, out_start);
     } else if (std.mem.eql(u8, cmd, "compass")) {
+        const compass_cli_usage = "compass [--intent overview|define|callers|blast_radius] [--mode summary|minimal] [--body] [--max-files N] [--more TOKEN] <task...>";
         var req: compass_mod.CompassRequest = .{};
+        var mode_explicit = false;
         var task: std.ArrayList(u8) = .empty;
         defer task.deinit(alloc);
         var i = cmd_args_start;
@@ -3548,45 +3568,55 @@ pub fn runCliTool(
                 continue;
             }
             if (std.mem.eql(u8, arg, "--intent")) {
-                if (i + 1 >= args.len) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                if (i + 1 >= args.len) return cliUsage(alloc, out, compass_cli_usage);
                 i += 1;
-                req.intent = compass_mod.parseIntent(args[i]) orelse return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                req.intent = compass_mod.parseIntent(args[i]) orelse return cliUsage(alloc, out, compass_cli_usage);
                 continue;
             }
             if (std.mem.eql(u8, arg, "--max-files")) {
-                if (i + 1 >= args.len) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                if (i + 1 >= args.len) return cliUsage(alloc, out, compass_cli_usage);
                 i += 1;
-                const parsed = std.fmt.parseInt(u32, args[i], 10) catch return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                const parsed = std.fmt.parseInt(u32, args[i], 10) catch return cliUsage(alloc, out, compass_cli_usage);
                 req.max_files = parsed;
                 continue;
             }
             if (std.mem.eql(u8, arg, "--more")) {
-                if (i + 1 >= args.len) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                if (i + 1 >= args.len) return cliUsage(alloc, out, compass_cli_usage);
                 i += 1;
                 req.more = args[i];
                 continue;
             }
             if (std.mem.eql(u8, arg, "--format")) {
-                if (i + 1 >= args.len) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                if (i + 1 >= args.len) return cliUsage(alloc, out, compass_cli_usage);
                 i += 1;
-                req.format = compass_mod.parseFormat(args[i]) orelse return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                req.format = compass_mod.parseFormat(args[i]) orelse return cliUsage(alloc, out, compass_cli_usage);
                 continue;
             }
             if (std.mem.eql(u8, arg, "--mode")) {
-                if (i + 1 >= args.len) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                if (i + 1 >= args.len) return cliUsage(alloc, out, compass_cli_usage);
                 i += 1;
-                req.mode = compass_mod.parseMode(args[i]) orelse return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+                mode_explicit = true;
+                req.mode_explicit = true;
+                req.mode = parseCompassSurfaceMode(args[i]) catch |err| {
+                    appendCompassModeError(alloc, out, err);
+                    return 1;
+                };
                 continue;
             }
             if (task.items.len > 0) task.append(alloc, ' ') catch {};
             task.appendSlice(alloc, arg) catch {};
         }
         req.task = task.items;
-        if (req.more == null and req.task.len == 0) return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+        if (req.more == null and req.task.len == 0) return cliUsage(alloc, out, compass_cli_usage);
         loadProjectWordIndexFromDiskIfPresent(io, explorer, root, alloc);
         loadProjectTrigramFromDiskIfPresent(io, explorer, root, alloc);
-        const data_dir = project_paths.ensureProjectDataDir(io, alloc, root) catch return cliUsage(alloc, out, "compass [--intent overview|define|callers] [--body] [--max-files N] [--more TOKEN] <task...>");
+        const data_dir = project_paths.ensureProjectDataDir(io, alloc, root) catch return cliUsage(alloc, out, compass_cli_usage);
         defer alloc.free(data_dir);
+        if (req.more != null and !mode_explicit) {
+            if (storedCompassReplayMode(io, alloc, data_dir, req.more.?)) |mode| {
+                req.mode = mode;
+            }
+        }
         compass_mod.run(io, alloc, req, explorer, store, data_dir, compass_mod.default_settings, out);
         return finishCli(out, out_start);
     }

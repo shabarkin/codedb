@@ -1300,6 +1300,60 @@ test "dep-graph: transitive dependents via BFS" {
     try testing.expectEqualStrings("store.zig", shallow[0]);
 }
 
+test "dep-graph: transitive dependents with depth limit and sorted order" {
+    var graph = DependencyGraph.init(testing.allocator);
+    defer graph.deinit();
+
+    // Chain: a.zig -> b.zig -> c.zig -> d.zig
+    var deps_a: std.ArrayList([]const u8) = .empty;
+    try deps_a.append(testing.allocator, "b.zig");
+    try graph.setDeps("a.zig", deps_a);
+
+    var deps_b: std.ArrayList([]const u8) = .empty;
+    try deps_b.append(testing.allocator, "c.zig");
+    try graph.setDeps("b.zig", deps_b);
+
+    var deps_c: std.ArrayList([]const u8) = .empty;
+    try deps_c.append(testing.allocator, "d.zig");
+    try graph.setDeps("c.zig", deps_c);
+
+    var deps_z: std.ArrayList([]const u8) = .empty;
+    try deps_z.append(testing.allocator, "d.zig");
+    try graph.setDeps("z.zig", deps_z);
+
+    var deps_aa: std.ArrayList([]const u8) = .empty;
+    try deps_aa.append(testing.allocator, "d.zig");
+    try graph.setDeps("aa.zig", deps_aa);
+
+    const with_depth = try graph.getTransitiveDependentsWithDepth("d.zig", testing.allocator, 2);
+    defer {
+        for (with_depth) |item| testing.allocator.free(item.path);
+        testing.allocator.free(with_depth);
+    }
+
+    try testing.expectEqual(@as(usize, 4), with_depth.len);
+    try testing.expectEqualStrings("aa.zig", with_depth[0].path);
+    try testing.expectEqual(@as(u32, 1), with_depth[0].depth);
+    try testing.expectEqualStrings("c.zig", with_depth[1].path);
+    try testing.expectEqual(@as(u32, 1), with_depth[1].depth);
+    try testing.expectEqualStrings("z.zig", with_depth[2].path);
+    try testing.expectEqual(@as(u32, 1), with_depth[2].depth);
+    try testing.expectEqualStrings("b.zig", with_depth[3].path);
+    try testing.expectEqual(@as(u32, 2), with_depth[3].depth);
+
+    const flat = try graph.getTransitiveDependents("d.zig", testing.allocator, 2);
+    defer {
+        for (flat) |p| testing.allocator.free(p);
+        testing.allocator.free(flat);
+    }
+
+    try testing.expectEqual(@as(usize, 4), flat.len);
+    try testing.expectEqualStrings("aa.zig", flat[0]);
+    try testing.expectEqualStrings("c.zig", flat[1]);
+    try testing.expectEqualStrings("z.zig", flat[2]);
+    try testing.expectEqualStrings("b.zig", flat[3]);
+}
+
 test "dep-graph: transitive dependencies (forward BFS)" {
     var graph = DependencyGraph.init(testing.allocator);
     defer graph.deinit();
@@ -2326,4 +2380,37 @@ test "resolveCallees: resolves call sites in a function body to their definition
     }
     try testing.expect(saw_helper);
     try testing.expect(saw_other);
+}
+
+test "issue-C05: snapshot load rebuilds symbol_index for resolveCallees" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fs.path.join(a, &.{ dir_path, "snap.codedb" });
+
+    var exp = Explorer.init(a, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("util.zig", "pub fn helper() void {}\n");
+    try exp.indexFile("main.zig",
+        \\pub fn run() void {
+        \\    helper();
+        \\}
+        \\
+    );
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, a);
+
+    var loaded = Explorer.init(a, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &loaded, &store, a));
+
+    const callees = try loaded.resolveCallees("main.zig", 1, 3, a, 8);
+    try testing.expectEqual(@as(usize, 1), callees.len);
+    try testing.expectEqualStrings("helper", callees[0].name);
+    try testing.expectEqualStrings("util.zig", callees[0].path);
 }

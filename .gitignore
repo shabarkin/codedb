@@ -32,3 +32,6 @@ socials/
 # Benchmark / dev output dirs
 logs/
 wasm/
+
+# Compass overflow artifacts
+/compass/

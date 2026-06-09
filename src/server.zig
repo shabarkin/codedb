@@ -518,10 +518,16 @@ fn handleConnection(
             };
         }
         if (jsonString(body_obj, "mode")) |mode_raw| {
-            req.mode = compass_mod.parseMode(mode_raw) orelse {
+            const mode = compass_mod.parseMode(mode_raw) orelse {
                 respondJson(&conn, "400 Bad Request", "{\"error\":\"invalid mode\"}");
                 return;
             };
+            if (mode == .evidence or mode == .raw) {
+                respondJson(&conn, "400 Bad Request", "{\"error\":\"mode not yet implemented\"}");
+                return;
+            }
+            req.mode = mode;
+            req.mode_explicit = true;
         }
         if (jsonString(body_obj, "format")) |format_raw| {
             req.format = compass_mod.parseFormat(format_raw) orelse {

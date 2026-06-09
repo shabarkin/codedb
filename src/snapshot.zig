@@ -812,6 +812,7 @@ fn insertRestoredFile(
     if (outline_gop.found_existing) return error.InvalidData;
     outline_gop.key_ptr.* = path;
     outline_gop.value_ptr.* = restored_outline;
+    explorer.restoreSymbolIndexFor(outline_gop.key_ptr.*, outline_gop.value_ptr);
 
     try explorer.contents.put(path, content);
 
@@ -955,6 +956,7 @@ fn loadSnapshotFast(
 
     if (outline_states.count() != 0) return false;
 
+    if (restored_file_count > 0) explorer.sortSymbolIndex();
     if (restored_file_count > 0) explorer.markTrigramIndexPartial();
     explorer.markWordIndexIncomplete(word_index_can_load_from_disk);
 

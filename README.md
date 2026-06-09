@@ -135,9 +135,9 @@ zig-out/bin/codedb /path/to/project compass "how does incremental indexing work"
 | `codedb_symbol` | Find where a symbol is defined across the codebase |
 | `codedb_search` | Trigram-accelerated full-text search (supports regex, scoped results) |
 | `codedb_word` | O(1) inverted index lookup for identifiers and their sub-tokens |
-| `codedb_callers` | Heuristic call-site finder — word index ∩ outline scope, in one round-trip |
+| `codedb_callers` | Exact call-site finder with honest totals — word index candidates ∩ outline scope, in one round-trip |
 | `codedb_context` | Task-shaped composer — pass a NL task, get keywords + symbol defs + ranked files + top snippets in one block (replaces 3–5 sequential calls) |
-| `codedb_compass` | Intent-shaped navigation tunnel — route one task into overview / define / callers with explicit coverage and optional `more` recovery |
+| `codedb_compass` | First-touch navigation tunnel — overview / define / callers / blast radius with callees, explicit coverage, minimal mode, and optional `more` recovery |
 | `codedb_hot` | Most recently modified files |
 | `codedb_deps` | Dependency graph: `imported_by` (default) or `depends_on`; `transitive=true` for full BFS |
 | `codedb_read` | Read file content (line ranges, `if_hash` skip-unchanged, `compact` mode) |

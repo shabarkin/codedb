@@ -22,6 +22,12 @@ pub fn looksLikeContextIdentifier(tok: []const u8) bool {
     }
     if (all_upper) return tok.len <= 8;
 
+    if (tok[0] >= 'A' and tok[0] <= 'Z') {
+        for (tok[1..]) |c| {
+            if (c >= 'a' and c <= 'z') return true;
+        }
+    }
+
     var i: usize = 1;
     while (i < tok.len) : (i += 1) {
         const prev_lower = tok[i - 1] >= 'a' and tok[i - 1] <= 'z';
@@ -80,7 +86,9 @@ pub fn isTestLikePath(path: []const u8) bool {
         std.mem.startsWith(u8, path, "test/") or
         std.mem.indexOf(u8, path, "/test") != null or
         std.mem.indexOf(u8, path, "_test.") != null or
+        std.mem.indexOf(u8, path, "_tests.") != null or
         std.mem.indexOf(u8, path, ".test.") != null or
+        std.mem.indexOf(u8, path, ".tests.") != null or
         std.mem.indexOf(u8, path, "/__tests__/") != null or
         std.mem.indexOf(u8, path, "/spec/") != null or
         std.mem.indexOf(u8, path, "/fixtures/") != null;
